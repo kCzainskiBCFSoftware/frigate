@@ -3,6 +3,8 @@ import { useApiHost } from "@/api";
 import useSWR from "swr";
 import { FrigateConfig } from "@/types/frigateConfig";
 import { Recording } from "@/types/record";
+import useRecordingPlaybackPreference from "@/hooks/use-recording-playback-preference";
+import RecordingPlaybackPreferenceSelect from "@/components/player/RecordingPlaybackPreferenceSelect";
 import { Preview } from "@/types/preview";
 import PreviewPlayer, { PreviewController } from "../PreviewPlayer";
 import { DynamicVideoController } from "./DynamicVideoController";
@@ -174,12 +176,18 @@ export default function DynamicVideoPlayer({
 
   // state of playback player
 
+  const {
+    preference: playbackPreference,
+    setPreference: setPlaybackPreference,
+    variantForApi: playbackVariant,
+  } = useRecordingPlaybackPreference(camera);
   const recordingParams = useMemo(
     () => ({
       before: timeRange.before,
       after: timeRange.after,
+      variant: playbackVariant,
     }),
-    [timeRange],
+    [timeRange, playbackVariant],
   );
   const { data: recordings } = useSWR<Recording[]>(
     [`${camera}/recordings`, recordingParams],
@@ -211,7 +219,7 @@ export default function DynamicVideoPlayer({
     }
 
     setSource({
-      playlist: `${apiHost}vod/${camera}/start/${recordingParams.after}/end/${recordingParams.before}/master.m3u8`,
+      playlist: `${apiHost}vod/${camera}/start/${recordingParams.after}/end/${recordingParams.before}/master.m3u8?variant=${playbackVariant}`,
       startPosition,
     });
 
@@ -334,6 +342,14 @@ export default function DynamicVideoPlayer({
       {!isScrubbing && !isLoading && noRecording && (
         <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
           {t("noRecordingsFoundForThisTime")}
+        </div>
+      )}
+      {!isScrubbing && (
+        <div className="absolute right-2 top-2 z-10">
+          <RecordingPlaybackPreferenceSelect
+            value={playbackPreference}
+            onChange={setPlaybackPreference}
+          />
         </div>
       )}
     </>

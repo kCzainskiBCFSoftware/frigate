@@ -12,6 +12,13 @@
     "desc": "No frames have been received on the {{cameraName}} <code>detect</code> stream, check error logs"
   },
   "cameraDisabled": "Camera is disabled",
+  "playbackVariant": {
+    "label": "Recording stream",
+    "auto": "Auto",
+    "main": "Main (HD)",
+    "sub": "Sub (SD)",
+    "tooltip": "Choose which recording stream to play. Sub is lower bandwidth and faster to load."
+  },
   "stats": {
     "streamType": {
       "title": "Stream Type:",

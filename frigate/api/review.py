@@ -599,6 +599,9 @@ def motion_activity(
 
     clauses = [(Recordings.start_time > after) & (Recordings.end_time < before)]
     clauses.append((Recordings.motion > 0))
+    # Motion data is camera-level (same value across variants); pick a single
+    # variant to avoid double-counting when both main and sub are recorded.
+    clauses.append((Recordings.variant == "main"))
 
     if cameras != "all":
         requested = set(cameras.split(","))

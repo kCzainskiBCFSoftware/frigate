@@ -183,6 +183,48 @@ class CameraConfig(FrigateBaseModel):
             return self.friendly_name
         return self.name.replace("_", " ").title() if self.name else ""
 
+    def get_record_variants(self) -> list[str]:
+        """Return the list of record_variant labels configured for this camera.
+
+        Always includes the default "main" variant even when no inputs declare
+        the record role, so legacy recordings can still be reasoned about.
+        """
+        variants = [
+            ffmpeg_input.record_variant
+            for ffmpeg_input in self.ffmpeg.inputs
+            if "record" in ffmpeg_input.roles
+        ]
+        if not variants:
+            return ["main"]
+        # de-dup while preserving order
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for v in variants:
+            if v not in seen:
+                seen.add(v)
+                ordered.append(v)
+        return ordered
+
+    def get_variant_retain_days(self, variant: str) -> Optional[float]:
+        """Return the per-input retain_days override for a variant, or None."""
+        for ffmpeg_input in self.ffmpeg.inputs:
+            if (
+                "record" in ffmpeg_input.roles
+                and ffmpeg_input.record_variant == variant
+            ):
+                return ffmpeg_input.retain_days
+        return None
+
+    def get_detect_variant(self) -> str:
+        """Return the record_variant of the input that owns the detect role.
+
+        Falls back to "main" if no input has both detect and record roles.
+        """
+        for ffmpeg_input in self.ffmpeg.inputs:
+            if "detect" in ffmpeg_input.roles and "record" in ffmpeg_input.roles:
+                return ffmpeg_input.record_variant
+        return "main"
+
     def create_ffmpeg_cmds(self):
         if "_ffmpeg_cmds" in self:
             return
@@ -218,9 +260,12 @@ class CameraConfig(FrigateBaseModel):
                 or self.ffmpeg.output_args.record
             )
 
+            cache_prefix = os.path.join(CACHE_DIR, self.name)
             ffmpeg_output_args = (
                 record_args
-                + [f"{os.path.join(CACHE_DIR, self.name)}@{CACHE_SEGMENT_FORMAT}.mp4"]
+                + [
+                    f"{cache_prefix}@{ffmpeg_input.record_variant}@{CACHE_SEGMENT_FORMAT}.mp4"
+                ]
                 + ffmpeg_output_args
             )
 

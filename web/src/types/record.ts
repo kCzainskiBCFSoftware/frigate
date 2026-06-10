@@ -1,6 +1,12 @@
 import { ReviewSeverity } from "./review";
 import { TimelineType } from "./timeline";
 
+export type RecordingVariant = "main" | "sub";
+
+export type RecordingPlaybackPreference = "auto" | "main" | "sub";
+
+export const RECORDING_PLAYBACK_DEFAULT: RecordingPlaybackPreference = "sub";
+
 export type Recording = {
   id: string;
   camera: string;
@@ -12,6 +18,11 @@ export type Recording = {
   motion: number;
   objects: number;
   dBFS: number;
+  variant?: RecordingVariant | string;
+  codec_name?: string | null;
+  width?: number | null;
+  height?: number | null;
+  bitrate?: number | null;
 };
 
 export type RecordingSegment = {
@@ -22,6 +33,11 @@ export type RecordingSegment = {
   objects: number;
   segment_size: number;
   duration: number;
+  variant?: RecordingVariant | string;
+  codec_name?: string | null;
+  width?: number | null;
+  height?: number | null;
+  bitrate?: number | null;
 };
 
 export type RecordingActivity = {

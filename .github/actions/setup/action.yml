@@ -1,13 +1,19 @@
 name: 'Setup'
-description: 'Set up QEMU and Buildx'
+description: 'Set up Buildx and authenticate to AWS ECR'
 inputs:
-  GITHUB_TOKEN:
+  aws-role-arn:
+    required: true
+  aws-region:
+    required: true
+  ecr-registry:
+    required: true
+  ecr-repository:
     required: true
 outputs:
   image-name:
-    value: ghcr.io/${{ steps.lowercaseRepo.outputs.lowercase }}:${{ steps.create-short-sha.outputs.SHORT_SHA }}
+    value: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:${{ steps.create-short-sha.outputs.SHORT_SHA }}
   cache-name:
-    value: ghcr.io/${{ steps.lowercaseRepo.outputs.lowercase }}:cache
+    value: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:cache
 runs:
   using: "composite"
   steps:
@@ -28,20 +34,15 @@ runs:
     - name: Start docker
       run: sudo systemctl start docker
       shell: bash
-    - id: lowercaseRepo
-      uses: ASzc/change-string-case-action@v5
-      with:
-        string: ${{ github.repository }}
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v3
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-    - name: Log in to the Container registry
-      uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
       with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ inputs.GITHUB_TOKEN }}
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+    - name: Log in to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
     - name: Create version file
       run: make version
       shell: bash

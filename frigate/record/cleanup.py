@@ -7,6 +7,7 @@ import os
 import threading
 from multiprocessing.synchronize import Event as MpEvent
 from pathlib import Path
+from typing import Optional
 
 from playhouse.sqlite_ext import SqliteExtDatabase
 
@@ -106,12 +107,23 @@ class RecordingCleanup(threading.Thread):
         motion_expire_date: float,
         config: CameraConfig,
         reviews: ReviewSegment,
-    ) -> None:
-        """Delete recordings for existing camera based on retention config."""
+        variant: Optional[str] = None,
+        hard_cap_date: Optional[float] = None,
+    ) -> list[tuple[float, float]]:
+        """Delete recordings for existing camera based on retention config.
+
+        When ``variant`` is provided, only recordings with that variant are
+        considered. When ``hard_cap_date`` is provided, recordings older than
+        that timestamp are deleted unconditionally regardless of motion/event
+        overlap — this implements the per-variant retain_days hard ceiling.
+
+        Returns the list of (start_time, end_time) tuples that were kept so
+        the caller can decide which previews to retain.
+        """
         # Get the timestamp for cutoff of retained days
 
         # Get recordings to check for expiration
-        recordings: Recordings = (
+        query = (
             Recordings.select(
                 Recordings.id,
                 Recordings.start_time,
@@ -121,20 +133,20 @@ class RecordingCleanup(threading.Thread):
                 Recordings.motion,
                 Recordings.dBFS,
             )
-            .where(
-                (Recordings.camera == config.name)
-                & (
-                    (
-                        (Recordings.end_time < continuous_expire_date)
-                        & (Recordings.motion == 0)
-                        & (Recordings.dBFS == 0)
-                    )
-                    | (Recordings.end_time < motion_expire_date)
-                )
+            .where(Recordings.camera == config.name)
+        )
+        if variant is not None:
+            query = query.where(Recordings.variant == variant)
+        query = query.where(
+            (
+                (Recordings.end_time < continuous_expire_date)
+                & (Recordings.motion == 0)
+                & (Recordings.dBFS == 0)
             )
-            .order_by(Recordings.start_time)
-            .namedtuples()
-            .iterator()
+            | (Recordings.end_time < motion_expire_date)
+        )
+        recordings: Recordings = (
+            query.order_by(Recordings.start_time).namedtuples().iterator()
         )
 
         # loop over recordings and see if they overlap with any non-expired reviews
@@ -144,6 +156,13 @@ class RecordingCleanup(threading.Thread):
         kept_recordings: list[tuple[float, float]] = []
         recording: Recordings
         for recording in recordings:
+            # Hard cap: per-variant retain_days deletes anything older than the
+            # cap regardless of motion or event overlap.
+            if hard_cap_date is not None and recording.end_time < hard_cap_date:
+                Path(recording.path).unlink(missing_ok=True)
+                deleted_recordings.add(recording.id)
+                continue
+
             keep = False
             mode = None
             # Now look for a reason to keep this recording segment
@@ -206,6 +225,16 @@ class RecordingCleanup(threading.Thread):
                 Recordings.id << deleted_recordings_list[i : i + max_deletes]
             ).execute()
 
+        return kept_recordings
+
+    def expire_camera_previews(
+        self,
+        continuous_expire_date: float,
+        motion_expire_date: float,
+        config: CameraConfig,
+        kept_recordings: list[tuple[float, float]],
+    ) -> None:
+        """Delete previews for a camera that no longer overlap a kept recording."""
         previews: list[Previews] = (
             Previews.select(
                 Previews.id,
@@ -224,6 +253,7 @@ class RecordingCleanup(threading.Thread):
         )
 
         # expire previews
+        kept_recordings = sorted(kept_recordings)
         recording_start = 0
         deleted_previews = set()
         for preview in previews:
@@ -312,19 +342,53 @@ class RecordingCleanup(threading.Thread):
             now = datetime.datetime.now()
 
             self.expire_review_segments(config, now)
-            continuous_expire_date = (
-                now - datetime.timedelta(days=config.record.continuous.days)
-            ).timestamp()
-            motion_expire_date = (
-                now
-                - datetime.timedelta(
-                    days=max(
-                        config.record.motion.days, config.record.continuous.days
-                    )  # can't keep motion for less than continuous
-                )
-            ).timestamp()
 
-            # Get all the reviews to check against
+            base_continuous_days = config.record.continuous.days
+            base_motion_days = max(
+                config.record.motion.days, config.record.continuous.days
+            )
+
+            variants = config.get_record_variants()
+            # Per-variant retain_days override REPLACES continuous.days; motion
+            # extension still applies (bounded by retain_days as hard ceiling).
+            variant_dates: list[
+                tuple[str, float, float, Optional[float]]
+            ] = []
+            for variant in variants:
+                override = config.get_variant_retain_days(variant)
+                continuous_days = (
+                    override if override is not None else base_continuous_days
+                )
+                motion_days = (
+                    min(base_motion_days, override)
+                    if override is not None
+                    else base_motion_days
+                )
+                continuous_expire_date_v = (
+                    now - datetime.timedelta(days=continuous_days)
+                ).timestamp()
+                motion_expire_date_v = (
+                    now - datetime.timedelta(days=motion_days)
+                ).timestamp()
+                hard_cap_date_v: Optional[float] = (
+                    (now - datetime.timedelta(days=override)).timestamp()
+                    if override is not None
+                    else None
+                )
+                variant_dates.append(
+                    (
+                        variant,
+                        continuous_expire_date_v,
+                        motion_expire_date_v,
+                        hard_cap_date_v,
+                    )
+                )
+
+            # Reviews are camera-wide. Pull them once based on the widest motion
+            # window across variants so per-variant decisions all have data.
+            widest_motion_expire_date = min(
+                motion_date for (_, _, motion_date, _) in variant_dates
+            )
             reviews: ReviewSegment = (
                 ReviewSegment.select(
                     ReviewSegment.start_time,
@@ -335,14 +399,41 @@ class RecordingCleanup(threading.Thread):
                     ReviewSegment.camera == camera,
                     # need to ensure segments for all reviews starting
                     # before the expire date are included
-                    ReviewSegment.start_time < motion_expire_date,
+                    ReviewSegment.start_time < widest_motion_expire_date,
                 )
                 .order_by(ReviewSegment.start_time)
                 .namedtuples()
             )
+            # Materialize reviews so per-variant loops can iterate multiple times
+            reviews = list(reviews)
 
-            self.expire_existing_camera_recordings(
-                continuous_expire_date, motion_expire_date, config, reviews
+            all_kept: list[tuple[float, float]] = []
+            for (
+                variant,
+                continuous_expire_date_v,
+                motion_expire_date_v,
+                hard_cap_date_v,
+            ) in variant_dates:
+                kept = self.expire_existing_camera_recordings(
+                    continuous_expire_date_v,
+                    motion_expire_date_v,
+                    config,
+                    reviews,
+                    variant=variant,
+                    hard_cap_date=hard_cap_date_v,
+                )
+                all_kept.extend(kept)
+
+            # Previews are camera-wide (not per-variant); use the widest window
+            # so a preview is kept if any variant still retains an overlapping segment.
+            widest_continuous_expire_date = min(
+                cont_date for (_, cont_date, _, _) in variant_dates
+            )
+            self.expire_camera_previews(
+                widest_continuous_expire_date,
+                widest_motion_expire_date,
+                config,
+                all_kept,
             )
             logger.debug(f"End camera: {camera}.")
 

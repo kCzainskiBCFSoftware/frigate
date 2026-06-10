@@ -571,6 +571,68 @@ class TestConfig(unittest.TestCase):
         }
         self.assertRaises(ValidationError, lambda: FrigateConfig(**config))
 
+    def test_duplicate_record_variant_throws_error(self):
+        config = {
+            "mqtt": {"host": "mqtt"},
+            "cameras": {
+                "back": {
+                    "ffmpeg": {
+                        "inputs": [
+                            {
+                                "path": "rtsp://10.0.0.1:554/video",
+                                "roles": ["detect", "record"],
+                            },
+                            {
+                                "path": "rtsp://10.0.0.1:554/video2",
+                                "roles": ["record"],
+                            },
+                        ]
+                    },
+                    "detect": {
+                        "height": 1080,
+                        "width": 1920,
+                        "fps": 5,
+                    },
+                }
+            },
+        }
+        self.assertRaises(ValidationError, lambda: FrigateConfig(**config))
+
+    def test_dual_record_distinct_variants_ok(self):
+        config = {
+            "mqtt": {"host": "mqtt"},
+            "cameras": {
+                "back": {
+                    "ffmpeg": {
+                        "inputs": [
+                            {
+                                "path": "rtsp://10.0.0.1:554/video",
+                                "roles": ["detect", "record"],
+                                "record_variant": "main",
+                            },
+                            {
+                                "path": "rtsp://10.0.0.1:554/video2",
+                                "roles": ["record"],
+                                "record_variant": "sub",
+                                "retain_days": 30,
+                            },
+                        ]
+                    },
+                    "detect": {
+                        "height": 1080,
+                        "width": 1920,
+                        "fps": 5,
+                    },
+                }
+            },
+        }
+        frigate_config = FrigateConfig(**config)
+        inputs = frigate_config.cameras["back"].ffmpeg.inputs
+        self.assertEqual(inputs[0].record_variant, "main")
+        self.assertIsNone(inputs[0].retain_days)
+        self.assertEqual(inputs[1].record_variant, "sub")
+        self.assertEqual(inputs[1].retain_days, 30)
+
     def test_zone_matching_camera_name_throws_error(self):
         config = {
             "mqtt": {"host": "mqtt"},

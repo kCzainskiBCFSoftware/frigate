@@ -1,9 +1,9 @@
 from enum import Enum
-from typing import Union
+from typing import Optional, Union
 
 from pydantic import Field, field_validator
 
-from frigate.const import DEFAULT_FFMPEG_VERSION, INCLUDED_FFMPEG_VERSIONS
+from frigate.const import DEFAULT_FFMPEG_VERSION, INCLUDED_FFMPEG_VERSIONS, REGEX_CAMERA_NAME
 
 from ..base import FrigateBaseModel
 from ..env import EnvString
@@ -94,6 +94,9 @@ class CameraRoleEnum(str, Enum):
     detect = "detect"
 
 
+DEFAULT_RECORD_VARIANT = "main"
+
+
 class CameraInput(FrigateBaseModel):
     path: EnvString = Field(title="Camera input path.")
     roles: list[CameraRoleEnum] = Field(title="Roles assigned to this input.")
@@ -106,6 +109,17 @@ class CameraInput(FrigateBaseModel):
     input_args: Union[str, list[str]] = Field(
         default_factory=list, title="FFmpeg input arguments."
     )
+    record_variant: str = Field(
+        default=DEFAULT_RECORD_VARIANT,
+        pattern=REGEX_CAMERA_NAME,
+        max_length=20,
+        title="Recording variant label for this input (only used when 'record' role is assigned).",
+    )
+    retain_days: Optional[float] = Field(
+        default=None,
+        ge=0,
+        title="Override continuous retention days for this variant (only used when 'record' role is assigned).",
+    )
 
 
 class CameraFfmpegConfig(FfmpegConfig):
@@ -114,12 +128,27 @@ class CameraFfmpegConfig(FfmpegConfig):
     @field_validator("inputs")
     @classmethod
     def validate_roles(cls, v):
-        roles = [role for input in v for role in input.roles]
+        non_record_roles = [
+            role
+            for input in v
+            for role in input.roles
+            if role != CameraRoleEnum.record
+        ]
 
-        if len(roles) != len(set(roles)):
-            raise ValueError("Each input role may only be used once.")
+        if len(non_record_roles) != len(set(non_record_roles)):
+            raise ValueError(
+                "Each non-record input role may only be used once per camera."
+            )
 
-        if "detect" not in roles:
+        if CameraRoleEnum.detect not in non_record_roles:
             raise ValueError("The detect role is required.")
+
+        record_variants = [
+            input.record_variant for input in v if CameraRoleEnum.record in input.roles
+        ]
+        if len(record_variants) != len(set(record_variants)):
+            raise ValueError(
+                "Each record_variant may only be used once per camera (assign distinct record_variant values to record inputs)."
+            )
 
         return v

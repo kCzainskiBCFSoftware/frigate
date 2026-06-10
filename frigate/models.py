@@ -78,6 +78,17 @@ class Recordings(Model):
     dBFS = IntegerField(null=True)
     segment_size = FloatField(default=0)  # this should be stored as MB
     regions = IntegerField(null=True)
+    variant = CharField(default="main", index=True, max_length=20)
+    codec_name = CharField(null=True, max_length=50)
+    width = IntegerField(null=True)
+    height = IntegerField(null=True)
+    bitrate = IntegerField(null=True)
+    transcoded_from_main = BooleanField(default=False)
+
+    class Meta:
+        indexes = (
+            (("camera", "variant", "start_time", "end_time"), False),
+        )
 
 
 class Export(Model):
