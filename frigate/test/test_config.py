@@ -633,6 +633,54 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(inputs[1].record_variant, "sub")
         self.assertEqual(inputs[1].retain_days, 30)
 
+    def test_unknown_record_variant_throws_error(self):
+        config = {
+            "mqtt": {"host": "mqtt"},
+            "cameras": {
+                "back": {
+                    "ffmpeg": {
+                        "inputs": [
+                            {
+                                "path": "rtsp://10.0.0.1:554/video",
+                                "roles": ["detect", "record"],
+                                "record_variant": "hd",
+                            },
+                        ]
+                    },
+                    "detect": {
+                        "height": 1080,
+                        "width": 1920,
+                        "fps": 5,
+                    },
+                }
+            },
+        }
+        self.assertRaises(ValidationError, lambda: FrigateConfig(**config))
+
+    def test_record_without_main_variant_throws_error(self):
+        config = {
+            "mqtt": {"host": "mqtt"},
+            "cameras": {
+                "back": {
+                    "ffmpeg": {
+                        "inputs": [
+                            {
+                                "path": "rtsp://10.0.0.1:554/video",
+                                "roles": ["detect", "record"],
+                                "record_variant": "sub",
+                            },
+                        ]
+                    },
+                    "detect": {
+                        "height": 1080,
+                        "width": 1920,
+                        "fps": 5,
+                    },
+                }
+            },
+        }
+        self.assertRaises(ValidationError, lambda: FrigateConfig(**config))
+
     def test_zone_matching_camera_name_throws_error(self):
         config = {
             "mqtt": {"host": "mqtt"},

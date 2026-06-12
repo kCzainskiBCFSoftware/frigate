@@ -44,22 +44,33 @@ class StorageMaintainer(threading.Thread):
                     )
                 }
 
-                # calculate MB/hr from last 100 segments
+                # calculate MB/hr from last 100 segments of each variant; the
+                # camera's disk write rate is the SUM of its variants' rates
                 try:
-                    # Subquery to get last 100 segments, then average their bandwidth
-                    last_100 = (
-                        Recordings.select(bandwidth_equation.alias("bw"))
-                        .where(Recordings.camera == camera, Recordings.segment_size > 0)
-                        .order_by(Recordings.start_time.desc())
-                        .limit(100)
-                        .alias("recent")
-                    )
+                    bandwidth = 0.0
+                    for variant in self.config.cameras[camera].get_record_variants():
+                        last_100 = (
+                            Recordings.select(bandwidth_equation.alias("bw"))
+                            .where(
+                                Recordings.camera == camera,
+                                Recordings.variant == variant,
+                                Recordings.segment_size > 0,
+                            )
+                            .order_by(Recordings.start_time.desc())
+                            .limit(100)
+                            .alias("recent")
+                        )
 
-                    bandwidth = round(
-                        Recordings.select(fn.AVG(SQL("bw"))).from_(last_100).scalar()
-                        * 3600,
-                        2,
-                    )
+                        variant_bandwidth = (
+                            Recordings.select(fn.AVG(SQL("bw")))
+                            .from_(last_100)
+                            .scalar()
+                        )
+
+                        if variant_bandwidth is not None:
+                            bandwidth += variant_bandwidth * 3600
+
+                    bandwidth = round(bandwidth, 2)
 
                     if bandwidth > MAX_CALCULATED_BANDWIDTH:
                         logger.warning(

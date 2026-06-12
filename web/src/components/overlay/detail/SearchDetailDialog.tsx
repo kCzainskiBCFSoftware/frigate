@@ -69,6 +69,7 @@ import { TransformComponent, TransformWrapper } from "react-zoom-pan-pinch";
 import useImageLoaded from "@/hooks/use-image-loaded";
 import ImageLoadingIndicator from "@/components/indicators/ImageLoadingIndicator";
 import { GenericVideoPlayer } from "@/components/player/GenericVideoPlayer";
+import useRecordingPlaybackPreference from "@/hooks/use-recording-playback-preference";
 import {
   Popover,
   PopoverContent,
@@ -1860,13 +1861,16 @@ type VideoTabProps = {
 };
 
 export function VideoTab({ search }: VideoTabProps) {
+  const { variantForApi: playbackVariant } = useRecordingPlaybackPreference(
+    search.camera,
+  );
   const clipTimeRange = useMemo(() => {
     const startTime = search.start_time - REVIEW_PADDING;
     const endTime = (search.end_time ?? Date.now() / 1000) + REVIEW_PADDING;
     return `start/${startTime}/end/${endTime}`;
   }, [search]);
 
-  const source = `${baseUrl}vod/${search.camera}/${clipTimeRange}/index.m3u8`;
+  const source = `${baseUrl}vod/${search.camera}/${clipTimeRange}/index.m3u8?variant=${playbackVariant}`;
 
   return (
     <>

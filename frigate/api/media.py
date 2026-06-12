@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from functools import reduce
 from pathlib import Path as FilePath
-from typing import Any, List
+from typing import Any, List, Literal
 from urllib.parse import unquote
 
 import cv2
@@ -47,6 +47,13 @@ from frigate.const import (
     RECORD_DIR,
 )
 from frigate.models import Event, Previews, Recordings, Regions, ReviewSegment
+from frigate.record.variants import (
+    DEFAULT_PLAYBACK_VARIANT,
+    DEFAULT_SNAPSHOT_VARIANT,
+    OTHER_VARIANT,
+    apply_variant_filter,
+    resolve_playback_variant,
+)
 from frigate.track.object_processing import TrackedObjectProcessor
 from frigate.util.file import get_event_thumbnail_bytes
 from frigate.util.image import get_image_from_recording
@@ -59,75 +66,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=[Tags.media])
 
 
-RECORDING_VARIANT_MAIN = "main"
-RECORDING_VARIANT_SUB = "sub"
-RECORDING_VARIANT_ALL = "all"
-
-DEFAULT_PLAYBACK_VARIANT = RECORDING_VARIANT_SUB
-DEFAULT_SNAPSHOT_VARIANT = RECORDING_VARIANT_MAIN
-
-_OTHER_VARIANT = {
-    RECORDING_VARIANT_MAIN: RECORDING_VARIANT_SUB,
-    RECORDING_VARIANT_SUB: RECORDING_VARIANT_MAIN,
-}
-
-
-def _apply_variant_filter(query, variant: str):
-    """Apply a variant filter to a Recordings query. 'all' is a no-op."""
-    if variant and variant != RECORDING_VARIANT_ALL:
-        return query.where(Recordings.variant == variant)
-    return query
-
-
-def _variant_has_overlapping_recording(
-    camera_name: str, variant: str, start_ts: float, end_ts: float
-) -> bool:
-    """Quickly check whether the given variant has at least one recording
-    overlapping the requested time range for the given camera."""
-    return (
-        Recordings.select(Recordings.id)
-        .where(
-            Recordings.camera == camera_name,
-            Recordings.variant == variant,
-            (
-                Recordings.start_time.between(start_ts, end_ts)
-                | Recordings.end_time.between(start_ts, end_ts)
-                | (
-                    (start_ts > Recordings.start_time)
-                    & (end_ts < Recordings.end_time)
-                )
-            ),
-        )
-        .limit(1)
-        .count()
-        > 0
-    )
-
-
-def _resolve_playback_variant(
-    camera_name: str, variant: str, start_ts: float, end_ts: float
-) -> str:
-    """Return the variant to actually serve. If the requested variant has no
-    overlapping recording in the time range, fall back to the other variant.
-    'all' is returned as-is (no fallback)."""
-    if variant == RECORDING_VARIANT_ALL:
-        return variant
-    fallback = _OTHER_VARIANT.get(variant)
-    if fallback is None:
-        return variant
-    if _variant_has_overlapping_recording(camera_name, variant, start_ts, end_ts):
-        return variant
-    if _variant_has_overlapping_recording(camera_name, fallback, start_ts, end_ts):
-        logger.debug(
-            "Falling back to variant '%s' for %s because no '%s' recordings exist between %s and %s",
-            fallback,
-            camera_name,
-            variant,
-            start_ts,
-            end_ts,
-        )
-        return fallback
-    return variant
+# str values of these Literals must match frigate.record.variants constants
+VariantParam = Literal["main", "sub"]
+VariantListParam = Literal["main", "sub", "all"]
 
 
 @router.get("/{camera_name}", dependencies=[Depends(require_camera_access)])
@@ -324,7 +265,7 @@ async def get_snapshot_from_recording(
     frame_time: float,
     format: str = Path(enum=["png", "jpg"]),
     height: int = None,
-    variant: str = DEFAULT_SNAPSHOT_VARIANT,
+    variant: VariantParam = DEFAULT_SNAPSHOT_VARIANT,
 ):
     if camera_name not in request.app.frigate_config.cameras:
         return JSONResponse(
@@ -343,7 +284,7 @@ async def get_snapshot_from_recording(
                 & (time_value <= Recordings.end_time)
             )
         ).where(Recordings.camera == camera_name)
-        query = _apply_variant_filter(query, variant_filter)
+        query = apply_variant_filter(query, variant_filter)
         try:
             return (
                 query.order_by(Recordings.start_time.desc()).limit(1).get()
@@ -358,8 +299,8 @@ async def get_snapshot_from_recording(
         if recording is not None:
             frame_time = rounded
     # variant fallback: try the other variant if nothing found
-    if recording is None and variant in _OTHER_VARIANT:
-        fallback = _OTHER_VARIANT[variant]
+    if recording is None and variant in OTHER_VARIANT:
+        fallback = OTHER_VARIANT[variant]
         recording = _lookup(frame_time, fallback)
         if recording is None:
             rounded = math.ceil(frame_time)
@@ -405,7 +346,7 @@ async def submit_recording_snapshot_to_plus(
     request: Request,
     camera_name: str,
     frame_time: str,
-    variant: str = DEFAULT_SNAPSHOT_VARIANT,
+    variant: VariantParam = DEFAULT_SNAPSHOT_VARIANT,
 ):
     if camera_name not in request.app.frigate_config.cameras:
         return JSONResponse(
@@ -414,7 +355,10 @@ async def submit_recording_snapshot_to_plus(
         )
 
     frame_time = float(frame_time)
-    recording_query = _apply_variant_filter(
+    # fall back to the other variant if the requested one has no segment
+    # covering this timestamp
+    variant = resolve_playback_variant(camera_name, variant, frame_time, frame_time)
+    recording_query = apply_variant_filter(
         Recordings.select(
             Recordings.path,
             Recordings.start_time,
@@ -578,11 +522,17 @@ def all_recordings_summary(
 async def recordings_summary(
     camera_name: str,
     timezone: str = "utc",
-    variant: str = DEFAULT_PLAYBACK_VARIANT,
+    variant: VariantListParam = DEFAULT_PLAYBACK_VARIANT,
 ):
     """Returns hourly summary for recordings of given camera"""
 
-    time_range_query = _apply_variant_filter(
+    # fall back to the other variant when the requested one has no recordings at
+    # all (single-stream cameras and pre-upgrade history only have "main" rows)
+    variant = resolve_playback_variant(
+        camera_name, variant, 0, datetime.now().timestamp()
+    )
+
+    time_range_query = apply_variant_filter(
         Recordings.select(
             fn.MIN(Recordings.start_time).alias("min_time"),
             fn.MAX(Recordings.start_time).alias("max_time"),
@@ -608,7 +558,7 @@ async def recordings_summary(
         period_hour_modifier = f"{hours_offset} hour"
         period_minute_modifier = f"{minutes_offset} minute"
 
-        recording_groups = _apply_variant_filter(
+        recording_groups = apply_variant_filter(
             Recordings.select(
                 fn.strftime(
                     "%Y-%m-%d %H",
@@ -692,9 +642,12 @@ async def recordings(
     camera_name: str,
     after: float = (datetime.now() - timedelta(hours=1)).timestamp(),
     before: float = datetime.now().timestamp(),
-    variant: str = DEFAULT_PLAYBACK_VARIANT,
+    variant: VariantListParam = DEFAULT_PLAYBACK_VARIANT,
 ):
     """Return specific camera recordings between the given 'after'/'end' times. If not provided the last hour will be used"""
+    # fall back to the other variant when the requested one has no recordings in
+    # the window (single-stream cameras and pre-upgrade history only have "main")
+    variant = resolve_playback_variant(camera_name, variant, after, before)
     query = (
         Recordings.select(
             Recordings.id,
@@ -716,7 +669,7 @@ async def recordings(
             Recordings.start_time <= before,
         )
     )
-    query = _apply_variant_filter(query, variant)
+    query = apply_variant_filter(query, variant)
     recordings = (
         query.order_by(Recordings.start_time).dicts().iterator()
     )
@@ -819,7 +772,7 @@ async def recording_clip(
     camera_name: str,
     start_ts: float,
     end_ts: float,
-    variant: str = DEFAULT_PLAYBACK_VARIANT,
+    variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
     def run_download(ffmpeg_cmd: list[str], file_path: str):
         with sp.Popen(
@@ -841,11 +794,11 @@ async def recording_clip(
                         FilePath(file_path).unlink(missing_ok=True)
                     break
 
-    selected_variant = _resolve_playback_variant(
+    selected_variant = resolve_playback_variant(
         camera_name, variant, start_ts, end_ts
     )
 
-    recordings = _apply_variant_filter(
+    recordings = apply_variant_filter(
         Recordings.select(
             Recordings.path,
             Recordings.start_time,
@@ -932,7 +885,7 @@ async def vod_ts(
     start_ts: float,
     end_ts: float,
     force_discontinuity: bool = False,
-    variant: str = DEFAULT_PLAYBACK_VARIANT,
+    variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
     logger.debug(
         "VOD: Generating VOD for %s from %s to %s variant=%s force_discontinuity=%s",
@@ -942,10 +895,10 @@ async def vod_ts(
         variant,
         force_discontinuity,
     )
-    selected_variant = _resolve_playback_variant(
+    selected_variant = resolve_playback_variant(
         camera_name, variant, start_ts, end_ts
     )
-    recordings = _apply_variant_filter(
+    recordings = apply_variant_filter(
         Recordings.select(
             Recordings.path,
             Recordings.duration,
@@ -1078,7 +1031,7 @@ async def vod_hour_no_timezone(
     day: int,
     hour: int,
     camera_name: str,
-    variant: str = DEFAULT_PLAYBACK_VARIANT,
+    variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
     """VOD for specific hour. Uses the default timezone (UTC)."""
     return await vod_hour(
@@ -1102,7 +1055,7 @@ async def vod_hour(
     hour: int,
     camera_name: str,
     tz_name: str,
-    variant: str = DEFAULT_PLAYBACK_VARIANT,
+    variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
     parts = year_month.split("-")
     start_date = (
@@ -1125,7 +1078,7 @@ async def vod_event(
     request: Request,
     event_id: str,
     padding: int = Query(0, description="Padding to apply to the vod."),
-    variant: str = DEFAULT_PLAYBACK_VARIANT,
+    variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
     try:
         event: Event = Event.get(Event.id == event_id)
@@ -1171,7 +1124,7 @@ async def vod_clip(
     camera_name: str,
     start_ts: float,
     end_ts: float,
-    variant: str = DEFAULT_PLAYBACK_VARIANT,
+    variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
     return await vod_ts(
         camera_name, start_ts, end_ts, force_discontinuity=True, variant=variant

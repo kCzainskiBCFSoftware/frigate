@@ -17,7 +17,7 @@
     "auto": "Auto",
     "main": "Main (HD)",
     "sub": "Sub (SD)",
-    "tooltip": "Choose which recording stream to play. Sub is lower bandwidth and faster to load."
+    "tooltip": "Choose which recording stream to play. Auto plays Sub (lower bandwidth, faster to load) and automatically falls back to Main where Sub has no recordings."
   },
   "stats": {
     "streamType": {

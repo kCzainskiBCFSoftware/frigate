@@ -215,16 +215,6 @@ class CameraConfig(FrigateBaseModel):
                 return ffmpeg_input.retain_days
         return None
 
-    def get_detect_variant(self) -> str:
-        """Return the record_variant of the input that owns the detect role.
-
-        Falls back to "main" if no input has both detect and record roles.
-        """
-        for ffmpeg_input in self.ffmpeg.inputs:
-            if "detect" in ffmpeg_input.roles and "record" in ffmpeg_input.roles:
-                return ffmpeg_input.record_variant
-        return "main"
-
     def create_ffmpeg_cmds(self):
         if "_ffmpeg_cmds" in self:
             return

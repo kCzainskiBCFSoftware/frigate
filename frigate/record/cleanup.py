@@ -424,6 +424,37 @@ class RecordingCleanup(threading.Thread):
                 )
                 all_kept.extend(kept)
 
+            # Sweep rows whose variant is no longer configured for this camera
+            # (e.g. camera switched from dual-stream back to single-stream);
+            # without this they would never be visited by the per-variant loop
+            # above and would accumulate forever.
+            base_expire_date = (
+                now - datetime.timedelta(days=base_motion_days)
+            ).timestamp()
+            orphan_recordings = (
+                Recordings.select(Recordings.id, Recordings.path)
+                .where(
+                    Recordings.camera == config.name,
+                    Recordings.variant.not_in(variants),
+                    Recordings.end_time < base_expire_date,
+                )
+                .namedtuples()
+                .iterator()
+            )
+            orphan_ids = []
+            for recording in orphan_recordings:
+                Path(recording.path).unlink(missing_ok=True)
+                orphan_ids.append(recording.id)
+            if orphan_ids:
+                logger.debug(
+                    f"Expiring {len(orphan_ids)} recordings with unconfigured variants for {camera}"
+                )
+                max_deletes = 100000
+                for i in range(0, len(orphan_ids), max_deletes):
+                    Recordings.delete().where(
+                        Recordings.id << orphan_ids[i : i + max_deletes]
+                    ).execute()
+
             # Previews are camera-wide (not per-variant); use the widest window
             # so a preview is kept if any variant still retains an overlapping segment.
             widest_continuous_expire_date = min(

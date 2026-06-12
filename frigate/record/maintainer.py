@@ -115,7 +115,9 @@ class RecordingMaintainer(threading.Thread):
         self.stop_event = stop_event
         self.object_recordings_info: dict[str, list] = defaultdict(list)
         self.audio_recordings_info: dict[str, list] = defaultdict(list)
-        self.end_time_cache: dict[str, Tuple[datetime.datetime, float]] = {}
+        self.end_time_cache: dict[
+            str, Tuple[datetime.datetime, float, dict[str, Any]]
+        ] = {}
         self.unexpected_cache_files_logged: bool = False
 
     async def move_files(self) -> None:
@@ -225,12 +227,18 @@ class RecordingMaintainer(threading.Thread):
             )
 
         # delete all cached files past the most recent MAX_SEGMENTS_IN_CACHE
-        keep_count = MAX_SEGMENTS_IN_CACHE
         for camera in grouped_recordings.keys():
             # sort based on start time
             grouped_recordings[camera] = sorted(
                 grouped_recordings[camera], key=lambda s: s["start_time"]
             )
+
+            # the cache holds one segment list per (camera, variant); scale the
+            # cap so a dual-stream camera gets the same wall-clock backlog
+            variant_count = max(
+                1, len({r["variant"] for r in grouped_recordings[camera]})
+            )
+            keep_count = MAX_SEGMENTS_IN_CACHE * variant_count
 
             camera_info = self.object_recordings_info[camera]
             most_recently_processed_frame_time = (
@@ -360,7 +368,7 @@ class RecordingMaintainer(threading.Thread):
 
         media_info: dict[str, Any] = {}
         if cache_path in self.end_time_cache:
-            end_time, duration = self.end_time_cache[cache_path]
+            end_time, duration, media_info = self.end_time_cache[cache_path]
         else:
             segment_info = await get_video_properties(
                 self.config.ffmpeg, cache_path, get_duration=True
@@ -383,7 +391,7 @@ class RecordingMaintainer(threading.Thread):
             # ensure duration is within expected length
             if 0 < duration < MAX_SEGMENT_DURATION:
                 end_time = start_time + datetime.timedelta(seconds=duration)
-                self.end_time_cache[cache_path] = (end_time, duration)
+                self.end_time_cache[cache_path] = (end_time, duration, media_info)
             else:
                 if duration == -1:
                     logger.warning(f"Failed to probe corrupt segment {cache_path}")

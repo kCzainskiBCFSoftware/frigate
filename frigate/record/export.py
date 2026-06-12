@@ -28,6 +28,7 @@ from frigate.ffmpeg_presets import (
     parse_preset_hardware_acceleration_encode,
 )
 from frigate.models import Export, Previews, Recordings
+from frigate.record.variants import DEFAULT_PLAYBACK_VARIANT
 from frigate.util.time import is_current_hour
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,7 @@ class RecordingExporter(threading.Thread):
         end_time: int,
         playback_factor: PlaybackFactorEnum,
         playback_source: PlaybackSourceEnum,
+        variant: str = DEFAULT_PLAYBACK_VARIANT,
     ) -> None:
         super().__init__()
         self.config = config
@@ -75,6 +77,7 @@ class RecordingExporter(threading.Thread):
         self.end_time = end_time
         self.playback_factor = playback_factor
         self.playback_source = playback_source
+        self.variant = variant
 
         # ensure export thumb dir
         Path(os.path.join(CLIPS_DIR, "export")).mkdir(exist_ok=True)
@@ -181,14 +184,15 @@ class RecordingExporter(threading.Thread):
 
     def get_record_export_command(self, video_path: str) -> list[str]:
         if (self.end_time - self.start_time) <= MAX_PLAYLIST_SECONDS:
-            playlist_lines = f"http://127.0.0.1:5000/vod/{self.camera}/start/{self.start_time}/end/{self.end_time}/index.m3u8"
+            playlist_lines = f"http://127.0.0.1:5000/vod/{self.camera}/start/{self.start_time}/end/{self.end_time}/index.m3u8?variant={self.variant}"
             ffmpeg_input = (
                 f"-y -protocol_whitelist pipe,file,http,tcp -i {playlist_lines}"
             )
         else:
             playlist_lines = []
 
-            # get full set of recordings
+            # get full set of recordings; must be filtered to a single variant so
+            # page boundary time ranges don't overlap on dual-stream cameras
             export_recordings = (
                 Recordings.select(
                     Recordings.start_time,
@@ -202,7 +206,10 @@ class RecordingExporter(threading.Thread):
                         & (self.end_time < Recordings.end_time)
                     )
                 )
-                .where(Recordings.camera == self.camera)
+                .where(
+                    Recordings.camera == self.camera,
+                    Recordings.variant == self.variant,
+                )
                 .order_by(Recordings.start_time.asc())
             )
 
@@ -213,7 +220,7 @@ class RecordingExporter(threading.Thread):
             for page in range(1, num_pages + 1):
                 playlist = export_recordings.paginate(page, page_size)
                 playlist_lines.append(
-                    f"file 'http://127.0.0.1:5000/vod/{self.camera}/start/{float(playlist[0].start_time)}/end/{float(playlist[-1].end_time)}/index.m3u8'"
+                    f"file 'http://127.0.0.1:5000/vod/{self.camera}/start/{float(playlist[0].start_time)}/end/{float(playlist[-1].end_time)}/index.m3u8?variant={self.variant}'"
                 )
 
             ffmpeg_input = "-y -protocol_whitelist pipe,file,http,tcp -f concat -safe 0 -i /dev/stdin"

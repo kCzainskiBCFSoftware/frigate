@@ -4,7 +4,7 @@ import logging
 import random
 import string
 from pathlib import Path
-from typing import List
+from typing import List, Literal
 
 import psutil
 from fastapi import APIRouter, Depends, Request
@@ -34,6 +34,11 @@ from frigate.record.export import (
     PlaybackFactorEnum,
     PlaybackSourceEnum,
     RecordingExporter,
+)
+from frigate.record.variants import (
+    DEFAULT_PLAYBACK_VARIANT,
+    apply_variant_filter,
+    resolve_playback_variant,
 )
 from frigate.util.time import is_current_hour
 
@@ -79,6 +84,7 @@ def export_recording(
     start_time: float,
     end_time: float,
     body: ExportRecordingsBody,
+    variant: Literal["main", "sub"] = DEFAULT_PLAYBACK_VARIANT,
 ):
     if not camera_name or not request.app.frigate_config.cameras.get(camera_name):
         return JSONResponse(
@@ -93,6 +99,10 @@ def export_recording(
     friendly_name = body.name
     existing_image = sanitize_filepath(body.image_path) if body.image_path else None
 
+    # resolve once so the precheck and the exporter agree on the variant even
+    # when the requested one has a gap in this range
+    variant = resolve_playback_variant(camera_name, variant, start_time, end_time)
+
     # Ensure that existing_image is a valid path
     if existing_image and not existing_image.startswith(CLIPS_DIR):
         return JSONResponse(
@@ -102,14 +112,16 @@ def export_recording(
 
     if playback_source == "recordings":
         recordings_count = (
-            Recordings.select()
-            .where(
-                Recordings.start_time.between(start_time, end_time)
-                | Recordings.end_time.between(start_time, end_time)
-                | (
-                    (start_time > Recordings.start_time)
-                    & (end_time < Recordings.end_time)
-                )
+            apply_variant_filter(
+                Recordings.select().where(
+                    Recordings.start_time.between(start_time, end_time)
+                    | Recordings.end_time.between(start_time, end_time)
+                    | (
+                        (start_time > Recordings.start_time)
+                        & (end_time < Recordings.end_time)
+                    )
+                ),
+                variant,
             )
             .where(Recordings.camera == camera_name)
             .count()
@@ -161,6 +173,7 @@ def export_recording(
             if playback_source in PlaybackSourceEnum.__members__.values()
             else PlaybackSourceEnum.recordings
         ),
+        variant,
     )
     exporter.start()
     return JSONResponse(

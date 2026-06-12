@@ -29,6 +29,7 @@ import { getLifecycleItemDescription } from "@/utils/lifecycleUtil";
 import { useTranslation } from "react-i18next";
 import { getTranslatedLabel } from "@/utils/i18n";
 import { resolveZoneName } from "@/hooks/use-zone-friendly-name";
+import useRecordingPlaybackPreference from "@/hooks/use-recording-playback-preference";
 import { Badge } from "@/components/ui/badge";
 import { HiDotsHorizontal } from "react-icons/hi";
 import axios from "axios";
@@ -90,6 +91,10 @@ export function TrackingDetails({
 
   const { data: config } = useSWR<FrigateConfig>("config");
 
+  const { variantForApi: playbackVariant } = useRecordingPlaybackPreference(
+    event.camera,
+  );
+
   // Fetch recording segments for the event's time range to handle motion-only gaps
   const eventStartRecord = useMemo(
     () => (event.start_time ?? 0) + annotationOffset / 1000,
@@ -107,6 +112,7 @@ export function TrackingDetails({
           {
             after: eventStartRecord - REVIEW_PADDING,
             before: eventEndRecord + REVIEW_PADDING,
+            variant: playbackVariant,
           },
         ]
       : null,
@@ -129,8 +135,8 @@ export function TrackingDetails({
       (event.end_time ?? Date.now() / 1000) +
       annotationOffset / 1000 +
       REVIEW_PADDING;
-    return `vod/clip/${event.camera}/start/${startTime}/end/${endTime}`;
-  }, [event, annotationOffset]);
+    return `vod/clip/${event.camera}/start/${startTime}/end/${endTime}?variant=${playbackVariant}`;
+  }, [event, annotationOffset, playbackVariant]);
 
   const { data: vodManifest } = useSWR<VodManifest>(vodManifestUrl, null, {
     revalidateOnFocus: false,
@@ -499,13 +505,13 @@ export function TrackingDetails({
       (event.end_time ?? Date.now() / 1000) + annotationOffset / 1000;
     const startTime = eventStartRecord - REVIEW_PADDING;
     const endTime = eventEndRecord + REVIEW_PADDING;
-    const playlist = `${baseUrl}vod/clip/${event.camera}/start/${startTime}/end/${endTime}/index.m3u8`;
+    const playlist = `${baseUrl}vod/clip/${event.camera}/start/${startTime}/end/${endTime}/index.m3u8?variant=${playbackVariant}`;
 
     return {
       playlist,
       startPosition: 0,
     };
-  }, [event, annotationOffset]);
+  }, [event, annotationOffset, playbackVariant]);
 
   // Determine camera aspect ratio category
   const cameraAspect = useMemo(() => {

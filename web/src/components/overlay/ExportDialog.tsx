@@ -31,6 +31,7 @@ import { baseUrl } from "@/api/baseUrl";
 import { cn } from "@/lib/utils";
 import { GenericVideoPlayer } from "../player/GenericVideoPlayer";
 import { useTranslation } from "react-i18next";
+import useRecordingPlaybackPreference from "@/hooks/use-recording-playback-preference";
 
 const EXPORT_OPTIONS = [
   "1",
@@ -67,6 +68,8 @@ export default function ExportDialog({
 }: ExportDialogProps) {
   const { t } = useTranslation(["components/dialog"]);
   const [name, setName] = useState("");
+  const { variantForApi: playbackVariant } =
+    useRecordingPlaybackPreference(camera);
 
   const onStartExport = useCallback(() => {
     if (!range) {
@@ -85,7 +88,7 @@ export default function ExportDialog({
 
     axios
       .post(
-        `export/${camera}/start/${Math.round(range.after)}/end/${Math.round(range.before)}`,
+        `export/${camera}/start/${Math.round(range.after)}/end/${Math.round(range.before)}?variant=${playbackVariant}`,
         {
           playback: "realtime",
           name,
@@ -118,7 +121,7 @@ export default function ExportDialog({
           { position: "top-center" },
         );
       });
-  }, [camera, name, range, setRange, setName, setMode, t]);
+  }, [camera, name, range, setRange, setName, setMode, t, playbackVariant]);
 
   const handleCancel = useCallback(() => {
     setName("");
@@ -597,11 +600,13 @@ export function ExportPreviewDialog({
   setShowPreview,
 }: ExportPreviewDialogProps) {
   const { t } = useTranslation(["components/dialog"]);
+  const { variantForApi: playbackVariant } =
+    useRecordingPlaybackPreference(camera);
   if (!range) {
     return null;
   }
 
-  const source = `${baseUrl}vod/${camera}/start/${range.after}/end/${range.before}/index.m3u8`;
+  const source = `${baseUrl}vod/${camera}/start/${range.after}/end/${range.before}/index.m3u8?variant=${playbackVariant}`;
 
   return (
     <Dialog open={showPreview} onOpenChange={setShowPreview}>

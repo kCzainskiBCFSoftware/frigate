@@ -1,9 +1,9 @@
 from enum import Enum
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 from pydantic import Field, field_validator
 
-from frigate.const import DEFAULT_FFMPEG_VERSION, INCLUDED_FFMPEG_VERSIONS, REGEX_CAMERA_NAME
+from frigate.const import DEFAULT_FFMPEG_VERSION, INCLUDED_FFMPEG_VERSIONS
 
 from ..base import FrigateBaseModel
 from ..env import EnvString
@@ -96,6 +96,10 @@ class CameraRoleEnum(str, Enum):
 
 DEFAULT_RECORD_VARIANT = "main"
 
+# Plain strings (not an Enum) so f-string interpolation into cache filenames
+# and DB rows stays "main"/"sub" on all Python versions.
+RecordVariant = Literal["main", "sub"]
+
 
 class CameraInput(FrigateBaseModel):
     path: EnvString = Field(title="Camera input path.")
@@ -109,10 +113,8 @@ class CameraInput(FrigateBaseModel):
     input_args: Union[str, list[str]] = Field(
         default_factory=list, title="FFmpeg input arguments."
     )
-    record_variant: str = Field(
+    record_variant: RecordVariant = Field(
         default=DEFAULT_RECORD_VARIANT,
-        pattern=REGEX_CAMERA_NAME,
-        max_length=20,
         title="Recording variant label for this input (only used when 'record' role is assigned).",
     )
     retain_days: Optional[float] = Field(
@@ -149,6 +151,14 @@ class CameraFfmpegConfig(FfmpegConfig):
         if len(record_variants) != len(set(record_variants)):
             raise ValueError(
                 "Each record_variant may only be used once per camera (assign distinct record_variant values to record inputs)."
+            )
+
+        # legacy recordings and pre-existing DB rows are variant=main; requiring a
+        # main record input guarantees they keep being retained/expired and that
+        # main/sub fallback always has a target
+        if record_variants and DEFAULT_RECORD_VARIANT not in record_variants:
+            raise ValueError(
+                "One record input must use record_variant 'main' (it is the fallback and legacy variant)."
             )
 
         return v
