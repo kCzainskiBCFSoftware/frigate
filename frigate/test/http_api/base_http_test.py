@@ -237,6 +237,9 @@ class BaseTestHttp(unittest.TestCase):
         start_time: float | None = None,
         end_time: float | None = None,
         motion: int = 0,
+        camera: str = "front_door",
+        variant: str = "main",
+        path: str | None = None,
     ) -> Event:
         """Inserts a recording model with a given id."""
         if start_time is None:
@@ -246,10 +249,11 @@ class BaseTestHttp(unittest.TestCase):
 
         return Recordings.insert(
             id=id,
-            path=id,
-            camera="front_door",
+            path=path if path is not None else id,
+            camera=camera,
             start_time=start_time,
             end_time=end_time,
             duration=end_time - start_time,
             motion=motion,
+            variant=variant,
         ).execute()

@@ -219,7 +219,7 @@ export default function DynamicVideoPlayer({
     }
 
     setSource({
-      playlist: `${apiHost}vod/${camera}/start/${recordingParams.after}/end/${recordingParams.before}/master.m3u8?variant=${playbackVariant}`,
+      playlist: `${apiHost}vod/${camera}/start/${recordingParams.after}/end/${recordingParams.before}/${playbackVariant}/master.m3u8`,
       startPosition,
     });
 

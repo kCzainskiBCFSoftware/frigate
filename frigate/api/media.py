@@ -876,9 +876,14 @@ async def recording_clip(
 
 
 @router.get(
+    "/vod/{camera_name}/start/{start_ts}/end/{end_ts}/{variant}",
+    dependencies=[Depends(require_camera_access)],
+    description="Path-form variant selector. nginx-vod-module does not forward the query string to the mapping subrequest, so HLS playback through nginx must encode the variant in the path. Append /master.m3u8 or /index.m3u8 for HLS playback.",
+)
+@router.get(
     "/vod/{camera_name}/start/{start_ts}/end/{end_ts}",
     dependencies=[Depends(require_camera_access)],
-    description="Returns an HLS playlist for the specified timestamp-range on the specified camera. Append /master.m3u8 or /index.m3u8 for HLS playback.",
+    description="Returns an HLS playlist for the specified timestamp-range on the specified camera. Append /master.m3u8 or /index.m3u8 for HLS playback. NOTE: ?variant= only reaches this endpoint when called directly; through nginx HLS playback use the /{variant} path form.",
 )
 async def vod_ts(
     camera_name: str,
@@ -1047,7 +1052,7 @@ async def vod_hour_no_timezone(
 @router.get(
     "/vod/{year_month}/{day}/{hour}/{camera_name}/{tz_name}",
     dependencies=[Depends(require_camera_access)],
-    description="Returns an HLS playlist for the specified date-time (with timezone) on the specified camera. Append /master.m3u8 or /index.m3u8 for HLS playback.",
+    description="Returns an HLS playlist for the specified date-time (with timezone) on the specified camera. Append /master.m3u8 or /index.m3u8 for HLS playback. The trailing segment may instead be a variant ('main'/'sub'), in which case the local timezone is used — required for variant selection through nginx HLS playback, which drops query strings.",
 )
 async def vod_hour(
     year_month: str,
@@ -1057,6 +1062,13 @@ async def vod_hour(
     tz_name: str,
     variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
+    # this path slot is shared between timezone and variant (a {variant} suffix
+    # route would be ambiguous with {tz_name}); IANA timezone names can never
+    # be "main"/"sub" so dispatch on the value
+    if tz_name in ("main", "sub"):
+        variant = tz_name
+        tz_name = get_localzone_name().replace("/", ",")
+
     parts = year_month.split("-")
     start_date = (
         datetime(int(parts[0]), int(parts[1]), day, hour, tzinfo=timezone.utc)
@@ -1069,6 +1081,11 @@ async def vod_hour(
     return await vod_ts(camera_name, start_ts, end_ts, variant=variant)
 
 
+@router.get(
+    "/vod/event/{event_id}/{variant}",
+    dependencies=[Depends(allow_any_authenticated())],
+    description="Path-form variant selector for HLS playback through nginx. Append /master.m3u8 or /index.m3u8.",
+)
 @router.get(
     "/vod/event/{event_id}",
     dependencies=[Depends(allow_any_authenticated())],
@@ -1115,6 +1132,11 @@ async def vod_event(
     return vod_response
 
 
+@router.get(
+    "/vod/clip/{camera_name}/start/{start_ts}/end/{end_ts}/{variant}",
+    dependencies=[Depends(require_camera_access)],
+    description="Path-form variant selector for HLS playback through nginx. Append /master.m3u8 or /index.m3u8.",
+)
 @router.get(
     "/vod/clip/{camera_name}/start/{start_ts}/end/{end_ts}",
     dependencies=[Depends(require_camera_access)],

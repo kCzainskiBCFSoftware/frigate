@@ -606,7 +606,7 @@ export function ExportPreviewDialog({
     return null;
   }
 
-  const source = `${baseUrl}vod/${camera}/start/${range.after}/end/${range.before}/index.m3u8?variant=${playbackVariant}`;
+  const source = `${baseUrl}vod/${camera}/start/${range.after}/end/${range.before}/${playbackVariant}/index.m3u8`;
 
   return (
     <Dialog open={showPreview} onOpenChange={setShowPreview}>

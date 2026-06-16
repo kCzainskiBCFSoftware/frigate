@@ -6,7 +6,7 @@ import pytz
 from fastapi import Request
 
 from frigate.api.auth import get_allowed_cameras_for_filter, get_current_user
-from frigate.models import Recordings
+from frigate.models import Event, Recordings
 from frigate.test.http_api.base_http_test import AuthTestClient, BaseTestHttp
 
 
@@ -403,3 +403,159 @@ class TestHttpMedia(BaseTestHttp):
             assert len(summary) == 1
             assert "2024-03-10" in summary
             assert summary["2024-03-10"] is True
+
+
+class TestHttpVodVariants(BaseTestHttp):
+    """Variant selection on vod and recordings endpoints (dual-stream)."""
+
+    # fixed, far-past window so cache/now logic is deterministic
+    T = 1700000000.0
+
+    def setUp(self):
+        super().setUp([Event, Recordings])
+        self.app = super().create_app()
+
+        async def mock_get_current_user(request: Request):
+            username = request.headers.get("remote-user")
+            role = request.headers.get("remote-role")
+            if not username or not role:
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    content={"message": "No authorization headers."}, status_code=401
+                )
+            return {"username": username, "role": role}
+
+        self.app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        async def mock_get_allowed_cameras_for_filter(request: Request):
+            return ["front_door"]
+
+        self.app.dependency_overrides[get_allowed_cameras_for_filter] = (
+            mock_get_allowed_cameras_for_filter
+        )
+
+    def tearDown(self):
+        self.app.dependency_overrides.clear()
+        super().tearDown()
+
+    def _insert_dual(self):
+        """One 20s segment per variant over the same wall-clock window."""
+        self.insert_mock_recording(
+            "rec-main", self.T, self.T + 20, variant="main", path="/rec/main/seg.mp4"
+        )
+        self.insert_mock_recording(
+            "rec-sub", self.T, self.T + 20, variant="sub", path="/rec/sub/seg.mp4"
+        )
+
+    @staticmethod
+    def _clip_paths(payload):
+        return [c["path"] for seq in payload["sequences"] for c in seq["clips"]]
+
+    def test_vod_path_form_selects_variant(self):
+        self._insert_dual()
+        with AuthTestClient(self.app) as client:
+            for variant, path in (("main", "/rec/main/seg.mp4"), ("sub", "/rec/sub/seg.mp4")):
+                response = client.get(
+                    f"/vod/front_door/start/{self.T}/end/{self.T + 20}/{variant}"
+                )
+                assert response.status_code == 200
+                assert self._clip_paths(response.json()) == [path]
+
+    def test_vod_query_form_equivalent_to_path_form(self):
+        self._insert_dual()
+        with AuthTestClient(self.app) as client:
+            path_resp = client.get(
+                f"/vod/front_door/start/{self.T}/end/{self.T + 20}/main"
+            )
+            query_resp = client.get(
+                f"/vod/front_door/start/{self.T}/end/{self.T + 20}",
+                params={"variant": "main"},
+            )
+            assert path_resp.status_code == query_resp.status_code == 200
+            assert self._clip_paths(path_resp.json()) == self._clip_paths(
+                query_resp.json()
+            )
+
+    def test_vod_falls_back_to_other_variant(self):
+        # only main rows exist (single-stream camera / legacy history)
+        self.insert_mock_recording(
+            "rec-main", self.T, self.T + 20, variant="main", path="/rec/main/seg.mp4"
+        )
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                f"/vod/front_door/start/{self.T}/end/{self.T + 20}/sub"
+            )
+            assert response.status_code == 200
+            assert self._clip_paths(response.json()) == ["/rec/main/seg.mp4"]
+
+    def test_vod_clip_path_form(self):
+        self._insert_dual()
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                f"/vod/clip/front_door/start/{self.T}/end/{self.T + 20}/main"
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["discontinuity"] is True
+            assert self._clip_paths(payload) == ["/rec/main/seg.mp4"]
+
+    def test_vod_event_path_form(self):
+        self._insert_dual()
+        self.insert_mock_event("ev1", start_time=self.T, end_time=self.T + 20)
+        with AuthTestClient(self.app) as client:
+            response = client.get("/vod/event/ev1/main")
+            assert response.status_code == 200
+            assert self._clip_paths(response.json()) == ["/rec/main/seg.mp4"]
+
+    def test_vod_hour_trailing_segment_dispatch(self):
+        # "main"/"sub" in the tz slot must be treated as a variant (and must not
+        # hit pytz with an invalid timezone); a real tz name must keep working.
+        with AuthTestClient(self.app) as client:
+            for trailing in ("main", "sub", "America,New_York"):
+                response = client.get(f"/vod/2024-03/10/13/front_door/{trailing}")
+                # no recordings inserted for that hour -> 404 from vod_ts, never
+                # a 500 (which an UnknownTimeZoneError would produce)
+                assert response.status_code == 404, (
+                    f"{trailing}: expected 404, got {response.status_code}"
+                )
+
+    def test_vod_invalid_variant_rejected(self):
+        self._insert_dual()
+        with AuthTestClient(self.app) as client:
+            for bad in ("hd", "all"):
+                path_resp = client.get(
+                    f"/vod/front_door/start/{self.T}/end/{self.T + 20}/{bad}"
+                )
+                assert path_resp.status_code == 422, f"path variant {bad}"
+                query_resp = client.get(
+                    f"/vod/front_door/start/{self.T}/end/{self.T + 20}",
+                    params={"variant": bad},
+                )
+                assert query_resp.status_code == 422, f"query variant {bad}"
+
+    def test_recordings_list_filters_by_variant(self):
+        self._insert_dual()
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                "/front_door/recordings",
+                params={"after": self.T - 5, "before": self.T + 25, "variant": "main"},
+            )
+            assert response.status_code == 200
+            rows = response.json()
+            assert [r["variant"] for r in rows] == ["main"]
+
+    def test_recordings_list_falls_back_for_single_variant_camera(self):
+        # only main rows; the default (sub) request must return them anyway
+        self.insert_mock_recording(
+            "rec-main", self.T, self.T + 20, variant="main", path="/rec/main/seg.mp4"
+        )
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                "/front_door/recordings",
+                params={"after": self.T - 5, "before": self.T + 25, "variant": "sub"},
+            )
+            assert response.status_code == 200
+            rows = response.json()
+            assert len(rows) == 1
+            assert rows[0]["variant"] == "main"

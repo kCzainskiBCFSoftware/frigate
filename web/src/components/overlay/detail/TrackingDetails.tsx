@@ -135,7 +135,7 @@ export function TrackingDetails({
       (event.end_time ?? Date.now() / 1000) +
       annotationOffset / 1000 +
       REVIEW_PADDING;
-    return `vod/clip/${event.camera}/start/${startTime}/end/${endTime}?variant=${playbackVariant}`;
+    return `vod/clip/${event.camera}/start/${startTime}/end/${endTime}/${playbackVariant}`;
   }, [event, annotationOffset, playbackVariant]);
 
   const { data: vodManifest } = useSWR<VodManifest>(vodManifestUrl, null, {
@@ -505,7 +505,7 @@ export function TrackingDetails({
       (event.end_time ?? Date.now() / 1000) + annotationOffset / 1000;
     const startTime = eventStartRecord - REVIEW_PADDING;
     const endTime = eventEndRecord + REVIEW_PADDING;
-    const playlist = `${baseUrl}vod/clip/${event.camera}/start/${startTime}/end/${endTime}/index.m3u8?variant=${playbackVariant}`;
+    const playlist = `${baseUrl}vod/clip/${event.camera}/start/${startTime}/end/${endTime}/${playbackVariant}/index.m3u8`;
 
     return {
       playlist,

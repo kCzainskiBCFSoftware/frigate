@@ -1870,7 +1870,7 @@ export function VideoTab({ search }: VideoTabProps) {
     return `start/${startTime}/end/${endTime}`;
   }, [search]);
 
-  const source = `${baseUrl}vod/${search.camera}/${clipTimeRange}/index.m3u8?variant=${playbackVariant}`;
+  const source = `${baseUrl}vod/${search.camera}/${clipTimeRange}/${playbackVariant}/index.m3u8`;
 
   return (
     <>
