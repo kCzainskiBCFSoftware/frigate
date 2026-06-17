@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from functools import reduce
 from pathlib import Path as FilePath
-from typing import Any, List, Literal
+from typing import Any, List, Literal, Optional
 from urllib.parse import unquote
 
 import cv2
@@ -434,23 +434,62 @@ def get_recordings_storage_usage(request: Request):
     return JSONResponse(content=camera_usages)
 
 
-@router.get("/recordings/summary", dependencies=[Depends(allow_any_authenticated())])
-def all_recordings_summary(
-    request: Request,
-    params: MediaRecordingsSummaryQueryParams = Depends(),
-    allowed_cameras: List[str] = Depends(get_allowed_cameras_for_filter),
-):
-    """Returns true/false by day indicating if recordings exist"""
+def _resolve_summary_camera_list(
+    cameras: str, allowed_cameras: List[str]
+) -> Optional[List[str]]:
+    """Resolve the ``cameras`` query param against the caller's allowed cameras.
 
-    cameras = params.cameras
+    Returns the list of cameras to query, or None when the selection is empty
+    (caller should return an empty result)."""
     if cameras != "all":
         requested = set(unquote(cameras).split(","))
         filtered = requested.intersection(allowed_cameras)
         if not filtered:
-            return JSONResponse(content={})
-        camera_list = list(filtered)
-    else:
-        camera_list = allowed_cameras
+            return None
+        return list(filtered)
+    return allowed_cameras
+
+
+# Loose ("skip") index scan: walk one recording per local day using the
+# (camera, start_time) index, jumping straight to the next day's first segment
+# instead of scanning every ~10s segment row. ``:off`` is the period's constant
+# UTC offset (seconds); the boundary expression is the UTC epoch of the next
+# local midnight after ``scan.ts``. Placeholders (in order): camera, period_start,
+# period_end, camera, period_end, off, off, hour_modifier, minute_modifier.
+RECORDINGS_SUMMARY_SCAN_SQL = """
+WITH RECURSIVE scan(ts) AS (
+    SELECT MIN(start_time) FROM recordings
+     WHERE camera = ? AND start_time BETWEEN ? AND ?
+  UNION ALL
+    SELECT (
+        SELECT MIN(start_time) FROM recordings
+         WHERE camera = ? AND start_time <= ?
+           AND start_time >= ((CAST((scan.ts + ?) / 86400 AS INT) + 1) * 86400 - ?)
+    )
+    FROM scan WHERE scan.ts IS NOT NULL
+)
+SELECT DISTINCT strftime('%Y-%m-%d', datetime(ts, 'unixepoch', ?, ?)) AS day
+FROM scan WHERE ts IS NOT NULL
+"""
+
+
+@router.get(
+    "/recordings/summary/legacy",
+    dependencies=[Depends(allow_any_authenticated())],
+)
+def all_recordings_summary_legacy(
+    request: Request,
+    params: MediaRecordingsSummaryQueryParams = Depends(),
+    allowed_cameras: List[str] = Depends(get_allowed_cameras_for_filter),
+):
+    """Returns true/false by day indicating if recordings exist.
+
+    Original full-scan implementation, kept as an A/B benchmark baseline and
+    fallback for the optimized handler on ``/recordings/summary``."""
+
+    camera_list = _resolve_summary_camera_list(params.cameras, allowed_cameras)
+    if not camera_list:
+        return JSONResponse(content={})
 
     time_range_query = (
         Recordings.select(
@@ -512,6 +551,76 @@ def all_recordings_summary(
 
         for g in period_query:
             days[g.day] = True
+
+    return JSONResponse(content=dict(sorted(days.items())))
+
+
+@router.get("/recordings/summary", dependencies=[Depends(allow_any_authenticated())])
+def all_recordings_summary(
+    request: Request,
+    params: MediaRecordingsSummaryQueryParams = Depends(),
+    allowed_cameras: List[str] = Depends(get_allowed_cameras_for_filter),
+):
+    """Returns true/false by day indicating if recordings exist.
+
+    Equivalent output to ``all_recordings_summary_legacy`` but, instead of
+    scanning and grouping every recording segment, performs a loose index scan
+    that touches roughly one row per day-with-recordings (see
+    ``RECORDINGS_SUMMARY_SCAN_SQL``)."""
+
+    camera_list = _resolve_summary_camera_list(params.cameras, allowed_cameras)
+    if not camera_list:
+        return JSONResponse(content={})
+
+    time_range_query = (
+        Recordings.select(
+            fn.MIN(Recordings.start_time).alias("min_time"),
+            fn.MAX(Recordings.start_time).alias("max_time"),
+        )
+        .where(Recordings.camera << camera_list)
+        .dicts()
+        .get()
+    )
+
+    min_time = time_range_query.get("min_time")
+    max_time = time_range_query.get("max_time")
+
+    if min_time is None or max_time is None:
+        return JSONResponse(content={})
+
+    dst_periods = get_dst_transitions(params.timezone, min_time, max_time)
+
+    days: dict[str, bool] = {}
+    database = Recordings._meta.database
+
+    for period_start, period_end, period_offset in dst_periods:
+        hours_offset = int(period_offset / 60 / 60)
+        minutes_offset = int(period_offset / 60 - hours_offset * 60)
+        period_hour_modifier = f"{hours_offset} hour"
+        period_minute_modifier = f"{minutes_offset} minute"
+        offset_seconds = int(period_offset)
+
+        # One loose index scan per camera guarantees the MIN/start_time index
+        # seek (an IN-list would not reliably trigger the min/max optimization).
+        # Each query runs its day-stepping recursion inside SQLite.
+        for camera in camera_list:
+            cursor = database.execute_sql(
+                RECORDINGS_SUMMARY_SCAN_SQL,
+                (
+                    camera,
+                    period_start,
+                    period_end,
+                    camera,
+                    period_end,
+                    offset_seconds,
+                    offset_seconds,
+                    period_hour_modifier,
+                    period_minute_modifier,
+                ),
+            )
+            for (day,) in cursor.fetchall():
+                if day is not None:
+                    days[day] = True
 
     return JSONResponse(content=dict(sorted(days.items())))
 

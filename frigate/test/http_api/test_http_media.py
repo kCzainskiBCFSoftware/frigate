@@ -404,6 +404,138 @@ class TestHttpMedia(BaseTestHttp):
             assert "2024-03-10" in summary
             assert summary["2024-03-10"] is True
 
+    def _get_summary(self, client, path, **params):
+        response = client.get(path, params=params)
+        assert response.status_code == 200
+        return response.json()
+
+    def test_recordings_summary_skips_gap_days(self):
+        """The loose index scan must return exactly the days that have
+        recordings, jumping over empty days without inventing any."""
+        base = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+        day = 86400
+
+        # recordings on Jun 1, Jun 5, Jun 6 (Jun 2-4 are empty)
+        for idx, offset_days in enumerate((0, 4, 5)):
+            start = base + offset_days * day
+            Recordings.insert(
+                id=f"gap_rec_{idx}",
+                path=f"/media/recordings/gap_{idx}.mp4",
+                camera="front_door",
+                start_time=start,
+                end_time=start + 30,
+                duration=30,
+                motion=1,
+                objects=0,
+            ).execute()
+
+        with AuthTestClient(self.app) as client:
+            summary = self._get_summary(
+                client, "/recordings/summary", timezone="utc", cameras="all"
+            )
+            assert sorted(summary.keys()) == [
+                "2024-06-01",
+                "2024-06-05",
+                "2024-06-06",
+            ]
+            assert all(v is True for v in summary.values())
+
+    def test_recordings_summary_matches_legacy(self):
+        """The optimized endpoint must return identical output to the legacy
+        full-scan implementation across cameras, gap days and a DST boundary."""
+        tz = pytz.timezone("America/New_York")
+        timestamps = {
+            "front_door": [
+                tz.localize(datetime(2024, 3, 8, 9, 0, 0)).timestamp(),
+                tz.localize(datetime(2024, 3, 10, 5, 0, 0)).timestamp(),  # after DST
+                tz.localize(datetime(2024, 3, 14, 23, 30, 0)).timestamp(),
+            ],
+            "back_door": [
+                tz.localize(datetime(2024, 3, 9, 0, 15, 0)).timestamp(),
+                tz.localize(datetime(2024, 3, 10, 12, 0, 0)).timestamp(),
+            ],
+        }
+
+        idx = 0
+        for camera, starts in timestamps.items():
+            for start in starts:
+                Recordings.insert(
+                    id=f"parity_{idx}",
+                    path=f"/media/recordings/parity_{idx}.mp4",
+                    camera=camera,
+                    start_time=start,
+                    end_time=start + 600,
+                    duration=600,
+                    motion=10,
+                    objects=1,
+                ).execute()
+                idx += 1
+
+        with AuthTestClient(self.app) as client:
+
+            async def both_cameras(_request: Request):
+                return ["front_door", "back_door"]
+
+            self.app.dependency_overrides[get_allowed_cameras_for_filter] = (
+                both_cameras
+            )
+
+            for cameras in ("all", "front_door", "front_door,back_door"):
+                new = self._get_summary(
+                    client,
+                    "/recordings/summary",
+                    timezone="America/New_York",
+                    cameras=cameras,
+                )
+                legacy = self._get_summary(
+                    client,
+                    "/recordings/summary/legacy",
+                    timezone="America/New_York",
+                    cameras=cameras,
+                )
+                assert new == legacy, (
+                    f"mismatch for cameras={cameras}: {new} != {legacy}"
+                )
+
+            async def reset_allowed_cameras(_request: Request):
+                return ["front_door"]
+
+            self.app.dependency_overrides[get_allowed_cameras_for_filter] = (
+                reset_allowed_cameras
+            )
+
+    def test_recordings_summary_sub_hour_offset_zone(self):
+        """Day boundaries must be correct for a zone with a :45 UTC offset."""
+        tz = pytz.timezone("Asia/Kathmandu")  # +05:45, no DST
+
+        # 23:50 local on Jun 1 and 00:10 local on Jun 2 -> two distinct local days
+        late = tz.localize(datetime(2024, 6, 1, 23, 50, 0)).timestamp()
+        early = tz.localize(datetime(2024, 6, 2, 0, 10, 0)).timestamp()
+        for idx, start in enumerate((late, early)):
+            Recordings.insert(
+                id=f"ktm_{idx}",
+                path=f"/media/recordings/ktm_{idx}.mp4",
+                camera="front_door",
+                start_time=start,
+                end_time=start + 60,
+                duration=60,
+                motion=1,
+                objects=0,
+            ).execute()
+
+        with AuthTestClient(self.app) as client:
+            new = self._get_summary(
+                client, "/recordings/summary", timezone="Asia/Kathmandu", cameras="all"
+            )
+            legacy = self._get_summary(
+                client,
+                "/recordings/summary/legacy",
+                timezone="Asia/Kathmandu",
+                cameras="all",
+            )
+            assert new == legacy
+            assert sorted(new.keys()) == ["2024-06-01", "2024-06-02"]
+
 
 class TestHttpVodVariants(BaseTestHttp):
     """Variant selection on vod and recordings endpoints (dual-stream)."""
