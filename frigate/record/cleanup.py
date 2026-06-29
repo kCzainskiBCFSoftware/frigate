@@ -359,8 +359,14 @@ class RecordingCleanup(threading.Thread):
                 continuous_days = (
                     override if override is not None else base_continuous_days
                 )
+                # The motion/outer window is the actual outer deletion bound
+                # (segments older than it are deleted regardless of motion), so
+                # it must reach at least the override for continuous retention to
+                # span the full override. The hard_cap_date below still clamps
+                # the ceiling when base_motion_days legitimately exceeds the
+                # override.
                 motion_days = (
-                    min(base_motion_days, override)
+                    max(base_motion_days, override)
                     if override is not None
                     else base_motion_days
                 )
