@@ -11,8 +11,8 @@ import { useMemo } from "react";
 function Sidebar() {
   const basePath = useMemo(() => new URL(baseUrl).pathname, []);
 
-  const isRootMatch = useMatch("/");
-  const isBasePathMatch = useMatch(basePath);
+  const isRootMatch = useMatch("/live");
+  const isBasePathMatch = useMatch(`${basePath}live`);
 
   const navbarLinks = useNavigation();
 
@@ -20,7 +20,7 @@ function Sidebar() {
     <aside className="scrollbar-container scrollbar-hidden absolute inset-y-0 left-0 z-10 flex w-[52px] flex-col justify-between overflow-y-auto border-r border-secondary-highlight bg-background_alt py-4">
       <span tabIndex={0} className="sr-only" />
       <div className="flex w-full flex-col items-center gap-0">
-        <Link to="/">
+        <Link to="/live">
           <Logo className="mb-6 h-8 w-8" />
         </Link>
         {navbarLinks.map((item) => {

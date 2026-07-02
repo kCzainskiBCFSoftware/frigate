@@ -24,7 +24,8 @@ export default function ProtectedRoute({
       !isRedirectingToLogin()
     ) {
       setRedirectingToLogin(true);
-      window.location.href = "/login";
+      const target = window.location.pathname + window.location.search;
+      window.location.href = `/login?redirect=${encodeURIComponent(target)}`;
     }
   }, [auth.isLoading, auth.isAuthenticated, auth.user]);
 

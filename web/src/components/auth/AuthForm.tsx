@@ -69,7 +69,18 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
         username: profileRes.data.username,
         role: profileRes.data.role || "viewer",
       });
-      window.location.href = baseUrl;
+
+      const redirectParam = new URLSearchParams(window.location.search).get(
+        "redirect",
+      );
+      const isSafeRedirect =
+        !!redirectParam &&
+        redirectParam.startsWith("/") &&
+        !redirectParam.startsWith("//") &&
+        !redirectParam.includes("://");
+      window.location.href = isSafeRedirect
+        ? window.location.origin + redirectParam
+        : baseUrl;
     } catch (error) {
       if (axios.isAxiosError(error)) {
         const err = error as AxiosError;

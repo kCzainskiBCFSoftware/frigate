@@ -8,6 +8,7 @@ import Statusbar from "./components/Statusbar";
 import Bottombar from "./components/navigation/Bottombar";
 import { Suspense, lazy } from "react";
 import { Redirect } from "./components/navigation/Redirect";
+import { IndexRedirect } from "./components/navigation/IndexRedirect";
 import { cn } from "./lib/utils";
 import { isPWA } from "./utils/isPWA";
 import ProtectedRoute from "@/components/auth/ProtectedRoute";
@@ -94,7 +95,8 @@ function DefaultAppView() {
                 )
               }
             >
-              <Route index element={<Live />} />
+              <Route index element={<IndexRedirect />} />
+              <Route path="/live" element={<Live />} />
               <Route path="/review" element={<Events />} />
               <Route path="/explore" element={<Explore />} />
               <Route path="/export" element={<Exports />} />

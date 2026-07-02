@@ -35,7 +35,7 @@ export default function useNavigation(
           variant,
           icon: FaVideo,
           title: "menu.live.title",
-          url: "/",
+          url: "/live",
         },
         {
           id: ID_REVIEW,
