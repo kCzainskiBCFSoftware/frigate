@@ -14,6 +14,7 @@ import { toast } from "sonner";
 import { LuCopy, LuSave } from "react-icons/lu";
 import { MdOutlineRestartAlt } from "react-icons/md";
 import RestartDialog from "@/components/overlay/dialog/RestartDialog";
+import { baseUrl } from "@/api/baseUrl";
 import { useTranslation } from "react-i18next";
 import { useRestart } from "@/api/ws";
 import { useResizeObserver } from "@/hooks/resize-observer";
@@ -323,6 +324,7 @@ function ConfigEditor() {
         isOpen={restartDialogOpen}
         onClose={() => setRestartDialogOpen(false)}
         onRestart={() => sendRestart("restart")}
+        redirectUrl={`${baseUrl}config`}
       />
     </div>
   );

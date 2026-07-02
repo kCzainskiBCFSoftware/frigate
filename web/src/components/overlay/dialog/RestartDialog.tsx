@@ -26,12 +26,14 @@ type RestartDialogProps = {
   isOpen: boolean;
   onClose: () => void;
   onRestart: () => void;
+  redirectUrl?: string; // where to reload after restart; defaults to app root
 };
 
 export default function RestartDialog({
   isOpen,
   onClose,
   onRestart,
+  redirectUrl = baseUrl,
 }: RestartDialogProps) {
   const { t } = useTranslation("components/dialog");
   const [restartDialogOpen, setRestartDialogOpen] = useState(isOpen);
@@ -64,9 +66,9 @@ export default function RestartDialog({
 
   useEffect(() => {
     if (countdown === 0) {
-      window.location.href = baseUrl;
+      window.location.href = redirectUrl;
     }
-  }, [countdown]);
+  }, [countdown, redirectUrl]);
 
   const handleRestart = () => {
     setRestartingSheetOpen(true);
@@ -74,7 +76,7 @@ export default function RestartDialog({
   };
 
   const handleForceReload = () => {
-    window.location.href = baseUrl;
+    window.location.href = redirectUrl;
   };
 
   return (
