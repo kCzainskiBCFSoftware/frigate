@@ -2,6 +2,7 @@
 
 import logging
 
+from frigate.const import MAX_SEGMENT_DURATION
 from frigate.models import Recordings
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,22 @@ def apply_variant_filter(query, variant: str):
     return query
 
 
+def recordings_overlap_clause(start_ts: float, end_ts: float):
+    """Predicate matching recordings that overlap [start_ts, end_ts].
+
+    Interval overlap is simply start_time <= end_ts AND end_time >= start_ts.
+    The extra lower bound on start_time is implied for any segment shorter
+    than MAX_SEGMENT_DURATION, but it gives SQLite a two-sided start_time
+    range so the (camera, variant, start_time, end_time) index can seek the
+    window instead of scanning the camera's entire retained history.
+    """
+    return (
+        (Recordings.start_time <= end_ts)
+        & (Recordings.end_time >= start_ts)
+        & (Recordings.start_time >= start_ts - MAX_SEGMENT_DURATION)
+    )
+
+
 def variant_has_overlapping_recording(
     camera_name: str, variant: str, start_ts: float, end_ts: float
 ) -> bool:
@@ -36,11 +53,7 @@ def variant_has_overlapping_recording(
         .where(
             Recordings.camera == camera_name,
             Recordings.variant == variant,
-            (
-                Recordings.start_time.between(start_ts, end_ts)
-                | Recordings.end_time.between(start_ts, end_ts)
-                | ((start_ts > Recordings.start_time) & (end_ts < Recordings.end_time))
-            ),
+            recordings_overlap_clause(start_ts, end_ts),
         )
         .exists()
     )

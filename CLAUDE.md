@@ -97,6 +97,9 @@ own retention. **`fork-changes.md` (repo root) is the canonical changelog — re
 list.** Key pieces:
 - `frigate/record/variants.py` — variant constants (`main`/`sub`/`all`) and query helpers (incl.
   `resolve_playback_variant` fallback). Defaults: playback uses `sub`, snapshots use `main`.
+  Time-window queries on `Recordings` MUST use `recordings_overlap_clause()` — the index-seekable
+  overlap form; hand-written `BETWEEN`-OR overlap predicates regress to full-history scans
+  (guarded by an `EXPLAIN QUERY PLAN` test in `frigate/test/http_api/test_http_media.py`).
 - Config: `record_variant` and per-variant `retain_days` override on `CameraInput`
   (`frigate/config/camera/ffmpeg.py`); accessors `get_record_variants()` /
   `get_variant_retain_days()` on `CameraConfig` (`frigate/config/camera/camera.py`).

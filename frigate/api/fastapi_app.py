@@ -25,6 +25,7 @@ from frigate.api import (
     review,
 )
 from frigate.api.auth import get_jwt_secret, limiter, require_admin_by_default
+from frigate.api.perf import setup_api_perf_logging
 from frigate.comms.event_metadata_updater import (
     EventMetadataPublisher,
 )
@@ -65,6 +66,7 @@ def create_fastapi_app(
     enforce_default_admin: bool = True,
 ):
     logger.info("Starting FastAPI app")
+    setup_api_perf_logging(frigate_config.database.path)
     app = FastAPI(
         debug=False,
         swagger_ui_parameters={"apisSorter": "alpha", "operationsSorter": "alpha"},

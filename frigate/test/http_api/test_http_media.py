@@ -6,7 +6,9 @@ import pytz
 from fastapi import Request
 
 from frigate.api.auth import get_allowed_cameras_for_filter, get_current_user
+from frigate.const import MAX_SEGMENT_DURATION
 from frigate.models import Event, Recordings
+from frigate.record.variants import apply_variant_filter, recordings_overlap_clause
 from frigate.test.http_api.base_http_test import AuthTestClient, BaseTestHttp
 
 
@@ -476,9 +478,7 @@ class TestHttpMedia(BaseTestHttp):
             async def both_cameras(_request: Request):
                 return ["front_door", "back_door"]
 
-            self.app.dependency_overrides[get_allowed_cameras_for_filter] = (
-                both_cameras
-            )
+            self.app.dependency_overrides[get_allowed_cameras_for_filter] = both_cameras
 
             for cameras in ("all", "front_door", "front_door,back_door"):
                 new = self._get_summary(
@@ -587,7 +587,10 @@ class TestHttpVodVariants(BaseTestHttp):
     def test_vod_path_form_selects_variant(self):
         self._insert_dual()
         with AuthTestClient(self.app) as client:
-            for variant, path in (("main", "/rec/main/seg.mp4"), ("sub", "/rec/sub/seg.mp4")):
+            for variant, path in (
+                ("main", "/rec/main/seg.mp4"),
+                ("sub", "/rec/sub/seg.mp4"),
+            ):
                 response = client.get(
                     f"/vod/front_door/start/{self.T}/end/{self.T + 20}/{variant}"
                 )
@@ -691,3 +694,132 @@ class TestHttpVodVariants(BaseTestHttp):
             rows = response.json()
             assert len(rows) == 1
             assert rows[0]["variant"] == "main"
+
+    def test_recordings_list_window_boundaries(self):
+        # inclusive edge semantics of the seekable overlap predicate must match
+        # the legacy OR-of-BETWEENs it replaced
+        T = self.T
+        specs = {
+            "b-spans-window": (T - 30, T + 130),
+            "b-ends-at-start": (T - 20, T),
+            "b-inside": (T + 40, T + 60),
+            "b-starts-at-end": (T + 100, T + 120),
+            "b-before": (T - 50, T - 1),
+            "b-after": (T + 101, T + 120),
+        }
+        for rec_id, (start, end) in specs.items():
+            self.insert_mock_recording(
+                rec_id, start, end, variant="main", path=f"/{rec_id}"
+            )
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                "/front_door/recordings",
+                params={"after": T, "before": T + 100, "variant": "main"},
+            )
+            assert response.status_code == 200
+            assert [r["id"] for r in response.json()] == [
+                "b-spans-window",
+                "b-ends-at-start",
+                "b-inside",
+                "b-starts-at-end",
+            ]
+
+            # a window in a recording gap returns empty, not an error
+            gap = client.get(
+                "/front_door/recordings",
+                params={"after": T + 10000, "before": T + 10100, "variant": "main"},
+            )
+            assert gap.status_code == 200
+            assert gap.json() == []
+
+
+class TestRecordingsOverlapQuery(BaseTestHttp):
+    """DB-level guarantees for the seekable recordings overlap predicate."""
+
+    T = 1700000000.0
+
+    def setUp(self):
+        super().setUp([Event, Recordings])
+
+    def _legacy_overlap(self, start_ts: float, end_ts: float):
+        # the pre-034 predicate shape, kept here as the semantic reference
+        return (
+            Recordings.start_time.between(start_ts, end_ts)
+            | Recordings.end_time.between(start_ts, end_ts)
+            | ((start_ts > Recordings.start_time) & (end_ts < Recordings.end_time))
+        )
+
+    def _ids(self, clause) -> set[str]:
+        return {
+            r.id
+            for r in Recordings.select(Recordings.id).where(
+                clause, Recordings.camera == "front_door"
+            )
+        }
+
+    def test_matches_legacy_overlap_predicate(self):
+        T = self.T
+        n = 0
+        for start_off in (-650, -600, -30, -20, 0, 40, 99, 100, 101, 150):
+            for duration in (10, 20, 100, MAX_SEGMENT_DURATION):
+                n += 1
+                self.insert_mock_recording(
+                    f"eq-{n}",
+                    T + start_off,
+                    T + start_off + duration,
+                    variant="main",
+                    path=f"/eq/{n}",
+                )
+        windows = [
+            (T, T + 100),
+            (T - MAX_SEGMENT_DURATION, T),
+            (T + 100, T + 100),
+            (T - 1000, T - 700),
+            (T + 500, T + 600),
+        ]
+        for start_ts, end_ts in windows:
+            legacy = self._ids(self._legacy_overlap(start_ts, end_ts))
+            seekable = self._ids(recordings_overlap_clause(start_ts, end_ts))
+            assert seekable == legacy, (
+                f"window ({start_ts - T}, {end_ts - T}): difference {seekable ^ legacy}"
+            )
+
+    def test_overlong_segment_outside_seek_bound_is_excluded(self):
+        # segments are duration-capped at MAX_SEGMENT_DURATION by the recorder;
+        # a pathological longer row that started more than MAX_SEGMENT_DURATION
+        # before the window is intentionally no longer matched — the price of
+        # the two-sided start_time bound that makes the query an index seek
+        T = self.T
+        self.insert_mock_recording(
+            "overlong",
+            T - MAX_SEGMENT_DURATION - 50,
+            T + 50,
+            variant="main",
+            path="/overlong",
+        )
+        assert self._ids(recordings_overlap_clause(T, T + 100)) == set()
+
+    def test_query_plan_seeks_composite_index(self):
+        # regression guard: the playback query shape must range-seek the
+        # (camera, variant, start_time, end_time) index, not walk the whole
+        # camera+variant partition
+        self.insert_mock_recording(
+            "qp-1", self.T, self.T + 20, variant="sub", path="/qp/1"
+        )
+        query = apply_variant_filter(
+            Recordings.select(Recordings.id).where(
+                Recordings.camera == "front_door",
+                recordings_overlap_clause(self.T, self.T + 100),
+            ),
+            "sub",
+        ).order_by(Recordings.start_time)
+        sql, params = query.sql()
+        plan = " ".join(
+            str(row)
+            for row in self.db.execute_sql(
+                "EXPLAIN QUERY PLAN " + sql, params
+            ).fetchall()
+        )
+        assert "recordings_camera_variant_start_time_end_time" in plan, plan
+        # a two-sided start_time range in the plan detail proves the seek
+        assert "start_time<" in plan and "start_time>" in plan, plan

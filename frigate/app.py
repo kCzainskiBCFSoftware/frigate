@@ -227,6 +227,12 @@ class FrigateApp:
         else:
             vacuum_db(migrate_db)
 
+        # refresh query-planner statistics; without them SQLite can pick a
+        # low-selectivity index and scan large fractions of the recordings
+        # table on playback queries (analysis_limit keeps this sub-second)
+        migrate_db.execute_sql("PRAGMA analysis_limit=1000;")
+        migrate_db.execute_sql("ANALYZE;")
+
         migrate_db.close()
 
     def init_go2rtc(self) -> None:
@@ -267,6 +273,7 @@ class FrigateApp:
             pragmas={
                 "auto_vacuum": "FULL",  # Does not defragment database
                 "cache_size": -512 * 1000,  # 512MB of cache,
+                "journal_mode": "wal",  # required for synchronous=NORMAL to be crash-safe
                 "synchronous": "NORMAL",  # Safe when using WAL https://www.sqlite.org/pragma.html#pragma_synchronous
             },
             timeout=max(

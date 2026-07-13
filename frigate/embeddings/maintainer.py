@@ -106,6 +106,7 @@ class EmbeddingMaintainer(threading.Thread):
             pragmas={
                 "auto_vacuum": "FULL",  # Does not defragment database
                 "cache_size": -512 * 1000,  # 512MB of cache
+                "journal_mode": "wal",  # required for synchronous=NORMAL to be crash-safe
                 "synchronous": "NORMAL",  # Safe when using WAL https://www.sqlite.org/pragma.html#pragma_synchronous
             },
             timeout=max(

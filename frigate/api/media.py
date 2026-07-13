@@ -36,6 +36,7 @@ from frigate.api.defs.query.media_query_parameters import (
     MediaRecordingsSummaryQueryParams,
 )
 from frigate.api.defs.tags import Tags
+from frigate.api.perf import log_api_perf
 from frigate.camera.state import CameraState
 from frigate.config import FrigateConfig
 from frigate.const import (
@@ -52,6 +53,7 @@ from frigate.record.variants import (
     DEFAULT_SNAPSHOT_VARIANT,
     OTHER_VARIANT,
     apply_variant_filter,
+    recordings_overlap_clause,
     resolve_playback_variant,
 )
 from frigate.track.object_processing import TrackedObjectProcessor
@@ -275,20 +277,19 @@ async def get_snapshot_from_recording(
     recording: Recordings | None = None
 
     def _lookup(time_value: float, variant_filter: str) -> Recordings | None:
-        query = Recordings.select(
-            Recordings.path,
-            Recordings.start_time,
-        ).where(
-            (
-                (time_value >= Recordings.start_time)
-                & (time_value <= Recordings.end_time)
+        # point-in-interval lookup; the overlap clause bounds start_time on
+        # both sides so a miss doesn't scan the camera's whole history
+        query = (
+            Recordings.select(
+                Recordings.path,
+                Recordings.start_time,
             )
-        ).where(Recordings.camera == camera_name)
+            .where(recordings_overlap_clause(time_value, time_value))
+            .where(Recordings.camera == camera_name)
+        )
         query = apply_variant_filter(query, variant_filter)
         try:
-            return (
-                query.order_by(Recordings.start_time.desc()).limit(1).get()
-            )
+            return query.order_by(Recordings.start_time.desc()).limit(1).get()
         except DoesNotExist:
             return None
 
@@ -358,20 +359,24 @@ async def submit_recording_snapshot_to_plus(
     # fall back to the other variant if the requested one has no segment
     # covering this timestamp
     variant = resolve_playback_variant(camera_name, variant, frame_time, frame_time)
-    recording_query = apply_variant_filter(
-        Recordings.select(
-            Recordings.path,
-            Recordings.start_time,
-        )
-        .where(
-            (
-                (frame_time >= Recordings.start_time)
-                & (frame_time <= Recordings.end_time)
+    recording_query = (
+        apply_variant_filter(
+            Recordings.select(
+                Recordings.path,
+                Recordings.start_time,
             )
+            .where(
+                (
+                    (frame_time >= Recordings.start_time)
+                    & (frame_time <= Recordings.end_time)
+                )
+            )
+            .where(Recordings.camera == camera_name),
+            variant,
         )
-        .where(Recordings.camera == camera_name),
-        variant,
-    ).order_by(Recordings.start_time.desc()).limit(1)
+        .order_by(Recordings.start_time.desc())
+        .limit(1)
+    )
 
     try:
         config: FrigateConfig = request.app.frigate_config
@@ -645,8 +650,7 @@ async def recordings_summary(
         Recordings.select(
             fn.MIN(Recordings.start_time).alias("min_time"),
             fn.MAX(Recordings.start_time).alias("max_time"),
-        )
-        .where(Recordings.camera == camera_name),
+        ).where(Recordings.camera == camera_name),
         variant,
     )
     time_range_query = time_range_query.dicts().get()
@@ -681,8 +685,7 @@ async def recordings_summary(
                 fn.SUM(Recordings.duration).alias("duration"),
                 fn.SUM(Recordings.motion).alias("motion"),
                 fn.SUM(Recordings.objects).alias("objects"),
-            )
-            .where(
+            ).where(
                 (Recordings.camera == camera_name)
                 & (Recordings.end_time >= period_start)
                 & (Recordings.start_time <= period_end)
@@ -757,31 +760,25 @@ async def recordings(
     # fall back to the other variant when the requested one has no recordings in
     # the window (single-stream cameras and pre-upgrade history only have "main")
     variant = resolve_playback_variant(camera_name, variant, after, before)
-    query = (
-        Recordings.select(
-            Recordings.id,
-            Recordings.start_time,
-            Recordings.end_time,
-            Recordings.segment_size,
-            Recordings.motion,
-            Recordings.objects,
-            Recordings.duration,
-            Recordings.variant,
-            Recordings.codec_name,
-            Recordings.width,
-            Recordings.height,
-            Recordings.bitrate,
-        )
-        .where(
-            Recordings.camera == camera_name,
-            Recordings.end_time >= after,
-            Recordings.start_time <= before,
-        )
+    query = Recordings.select(
+        Recordings.id,
+        Recordings.start_time,
+        Recordings.end_time,
+        Recordings.segment_size,
+        Recordings.motion,
+        Recordings.objects,
+        Recordings.duration,
+        Recordings.variant,
+        Recordings.codec_name,
+        Recordings.width,
+        Recordings.height,
+        Recordings.bitrate,
+    ).where(
+        Recordings.camera == camera_name,
+        recordings_overlap_clause(after, before),
     )
     query = apply_variant_filter(query, variant)
-    recordings = (
-        query.order_by(Recordings.start_time).dicts().iterator()
-    )
+    recordings = query.order_by(Recordings.start_time).dicts().iterator()
 
     return JSONResponse(content=list(recordings))
 
@@ -807,14 +804,11 @@ async def no_recordings(
     else:
         cameras = allowed_cameras
 
-    before = params.before or datetime.datetime.now().timestamp()
-    after = (
-        params.after
-        or (datetime.datetime.now() - datetime.timedelta(hours=1)).timestamp()
-    )
+    before = params.before or datetime.now().timestamp()
+    after = params.after or (datetime.now() - timedelta(hours=1)).timestamp()
     scale = params.scale
 
-    clauses = [(Recordings.end_time >= after) & (Recordings.start_time <= before)]
+    clauses = [recordings_overlap_clause(after, before)]
     if cameras != "all":
         camera_list = cameras.split(",")
         clauses.append((Recordings.camera << camera_list))
@@ -883,46 +877,82 @@ async def recording_clip(
     end_ts: float,
     variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
+    request_start = time.monotonic()
+    perf = {
+        "endpoint": "clip.mp4",
+        "camera": camera_name,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "window_s": round(end_ts - start_ts, 1),
+    }
+
     def run_download(ffmpeg_cmd: list[str], file_path: str):
-        with sp.Popen(
-            ffmpeg_cmd,
-            stderr=sp.PIPE,
-            stdout=sp.PIPE,
-            text=False,
-        ) as ffmpeg:
-            while True:
-                data = ffmpeg.stdout.read(8192)
-                if data is not None and len(data) > 0:
-                    yield data
-                else:
-                    if ffmpeg.returncode and ffmpeg.returncode != 0:
-                        logger.error(
-                            f"Failed to generate clip, ffmpeg logs: {ffmpeg.stderr.read()}"
-                        )
+        stream_start = time.monotonic()
+        bytes_sent = 0
+        perf["status"] = "ok"
+        try:
+            with sp.Popen(
+                ffmpeg_cmd,
+                stderr=sp.PIPE,
+                stdout=sp.PIPE,
+                text=False,
+            ) as ffmpeg:
+                while True:
+                    data = ffmpeg.stdout.read(8192)
+                    if data is not None and len(data) > 0:
+                        if bytes_sent == 0:
+                            # spawn + concat open + first mux output
+                            perf["ffmpeg_first_byte_ms"] = (
+                                time.monotonic() - stream_start
+                            ) * 1000
+                        bytes_sent += len(data)
+                        yield data
                     else:
-                        FilePath(file_path).unlink(missing_ok=True)
-                    break
+                        if ffmpeg.returncode and ffmpeg.returncode != 0:
+                            perf["status"] = "ffmpeg_error"
+                            logger.error(
+                                f"Failed to generate clip, ffmpeg logs: {ffmpeg.stderr.read()}"
+                            )
+                        else:
+                            FilePath(file_path).unlink(missing_ok=True)
+                        break
+        except GeneratorExit:
+            perf["status"] = "client_aborted"
+            raise
+        finally:
+            # ffmpeg reads/muxes and the client download overlap (pipe with
+            # backpressure), so stream_ms covers both combined
+            perf["stream_ms"] = (time.monotonic() - stream_start) * 1000
+            perf["bytes"] = bytes_sent
+            perf["total_ms"] = (time.monotonic() - request_start) * 1000
+            log_api_perf(perf)
 
-    selected_variant = resolve_playback_variant(
-        camera_name, variant, start_ts, end_ts
+    t = time.monotonic()
+    selected_variant = resolve_playback_variant(camera_name, variant, start_ts, end_ts)
+    perf["variant"] = selected_variant
+    perf["resolve_variant_ms"] = (time.monotonic() - t) * 1000
+
+    # materialize once: peewee's .count() would re-execute the query
+    t = time.monotonic()
+    recordings = list(
+        apply_variant_filter(
+            Recordings.select(
+                Recordings.path,
+                Recordings.start_time,
+                Recordings.end_time,
+            )
+            .where(recordings_overlap_clause(start_ts, end_ts))
+            .where(Recordings.camera == camera_name),
+            selected_variant,
+        ).order_by(Recordings.start_time.asc())
     )
+    perf["sql_ms"] = (time.monotonic() - t) * 1000
+    perf["segments"] = len(recordings)
 
-    recordings = apply_variant_filter(
-        Recordings.select(
-            Recordings.path,
-            Recordings.start_time,
-            Recordings.end_time,
-        )
-        .where(
-            (Recordings.start_time.between(start_ts, end_ts))
-            | (Recordings.end_time.between(start_ts, end_ts))
-            | ((start_ts > Recordings.start_time) & (end_ts < Recordings.end_time))
-        )
-        .where(Recordings.camera == camera_name),
-        selected_variant,
-    ).order_by(Recordings.start_time.asc())
-
-    if recordings.count() == 0:
+    if len(recordings) == 0:
+        perf["status"] = "no_recordings"
+        perf["total_ms"] = (time.monotonic() - request_start) * 1000
+        log_api_perf(perf)
         return JSONResponse(
             content={
                 "success": False,
@@ -931,6 +961,7 @@ async def recording_clip(
             status_code=400,
         )
 
+    t = time.monotonic()
     file_name = sanitize_filename(f"playlist_{camera_name}_{start_ts}-{end_ts}.txt")
     file_path = os.path.join(CACHE_DIR, file_name)
     with open(file_path, "w") as file:
@@ -945,8 +976,12 @@ async def recording_clip(
             # if this is the ending clip, add an outpoint
             if clip.end_time > end_ts:
                 file.write(f"outpoint {int(end_ts - clip.start_time)}\n")
+    perf["playlist_ms"] = (time.monotonic() - t) * 1000
 
     if len(file_name) > 1000:
+        perf["status"] = "filename_too_long"
+        perf["total_ms"] = (time.monotonic() - request_start) * 1000
+        log_api_perf(perf)
         return JSONResponse(
             content={
                 "success": False,
@@ -1009,24 +1044,38 @@ async def vod_ts(
         variant,
         force_discontinuity,
     )
-    selected_variant = resolve_playback_variant(
-        camera_name, variant, start_ts, end_ts
+    request_start = time.monotonic()
+    perf = {
+        "endpoint": "vod",
+        "camera": camera_name,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "window_s": round(end_ts - start_ts, 1),
+    }
+
+    t = time.monotonic()
+    selected_variant = resolve_playback_variant(camera_name, variant, start_ts, end_ts)
+    perf["variant"] = selected_variant
+    perf["resolve_variant_ms"] = (time.monotonic() - t) * 1000
+
+    loop_start = time.monotonic()
+    keyframe_probe_ms = 0.0
+    keyframe_probes = 0
+    recordings = (
+        apply_variant_filter(
+            Recordings.select(
+                Recordings.path,
+                Recordings.duration,
+                Recordings.end_time,
+                Recordings.start_time,
+            )
+            .where(recordings_overlap_clause(start_ts, end_ts))
+            .where(Recordings.camera == camera_name),
+            selected_variant,
+        )
+        .order_by(Recordings.start_time.asc())
+        .iterator()
     )
-    recordings = apply_variant_filter(
-        Recordings.select(
-            Recordings.path,
-            Recordings.duration,
-            Recordings.end_time,
-            Recordings.start_time,
-        )
-        .where(
-            Recordings.start_time.between(start_ts, end_ts)
-            | Recordings.end_time.between(start_ts, end_ts)
-            | ((start_ts > Recordings.start_time) & (end_ts < Recordings.end_time))
-        )
-        .where(Recordings.camera == camera_name),
-        selected_variant,
-    ).order_by(Recordings.start_time.asc()).iterator()
 
     clips = []
     durations = []
@@ -1066,7 +1115,10 @@ async def vod_ts(
         # segment. Snap clipFrom back to the preceding keyframe so the
         # segment always starts with a decodable frame.
         if "clipFrom" in clip:
+            t = time.monotonic()
             keyframe_ms = get_keyframe_before(recording.path, clip["clipFrom"])
+            keyframe_probe_ms += (time.monotonic() - t) * 1000
+            keyframe_probes += 1
             if keyframe_ms is not None:
                 gained = clip["clipFrom"] - keyframe_ms
                 clip["clipFrom"] = keyframe_ms
@@ -1110,10 +1162,21 @@ async def vod_ts(
         else:
             logger.warning(f"Recording clip is missing or empty: {recording.path}")
 
+    # the DB iterator is consumed by the loop above, so subtract the ffprobe
+    # keyframe probes to isolate query time from segment probing
+    loop_ms = (time.monotonic() - loop_start) * 1000
+    perf["sql_ms"] = loop_ms - keyframe_probe_ms
+    perf["keyframe_probe_ms"] = keyframe_probe_ms
+    perf["keyframe_probes"] = keyframe_probes
+    perf["segments"] = len(clips)
+
     if not clips:
         logger.error(
             f"No recordings found for {camera_name} during the requested time range"
         )
+        perf["status"] = "no_recordings"
+        perf["total_ms"] = (time.monotonic() - request_start) * 1000
+        log_api_perf(perf)
         return JSONResponse(
             content={
                 "success": False,
@@ -1123,9 +1186,16 @@ async def vod_ts(
         )
 
     hour_ago = datetime.now() - timedelta(hours=1)
+    mapping_cacheable = hour_ago.timestamp() > start_ts
+    perf["status"] = "ok"
+    # non-cacheable mappings (recent windows) are re-requested by nginx-vod
+    # throughout playback, so a slow request here repeats per segment
+    perf["nginx_cacheable"] = mapping_cacheable
+    perf["total_ms"] = (time.monotonic() - request_start) * 1000
+    log_api_perf(perf)
     return JSONResponse(
         content={
-            "cache": hour_ago.timestamp() > start_ts,
+            "cache": mapping_cacheable,
             "discontinuity": force_discontinuity,
             "consistentSequenceMediaInfo": True,
             "durations": durations,

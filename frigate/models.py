@@ -68,7 +68,10 @@ class Regions(Model):
 
 class Recordings(Model):
     id = CharField(null=False, primary_key=True, max_length=30)
-    camera = CharField(index=True, max_length=20)
+    # camera/variant deliberately not single-column indexed (migration 034):
+    # the composite indexes lead with camera, and a 2-value variant index is a
+    # query-planner trap plus write amplification on the segment hot path
+    camera = CharField(max_length=20)
     path = CharField(unique=True)
     start_time = DateTimeField()
     end_time = DateTimeField()
@@ -78,7 +81,7 @@ class Recordings(Model):
     dBFS = IntegerField(null=True)
     segment_size = FloatField(default=0)  # this should be stored as MB
     regions = IntegerField(null=True)
-    variant = CharField(default="main", index=True, max_length=20)
+    variant = CharField(default="main", max_length=20)
     codec_name = CharField(null=True, max_length=50)
     width = IntegerField(null=True)
     height = IntegerField(null=True)
@@ -86,9 +89,7 @@ class Recordings(Model):
     transcoded_from_main = BooleanField(default=False)
 
     class Meta:
-        indexes = (
-            (("camera", "variant", "start_time", "end_time"), False),
-        )
+        indexes = ((("camera", "variant", "start_time", "end_time"), False),)
 
 
 class Export(Model):

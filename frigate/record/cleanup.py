@@ -62,6 +62,19 @@ class RecordingCleanup(threading.Thread):
             db.execute_sql("PRAGMA wal_checkpoint(TRUNCATE);")
             db.close()
 
+    def refresh_recordings_stats(self) -> None:
+        """Re-sample query-planner statistics for the recordings table.
+
+        The table churns one row per camera per variant per segment, so
+        stale or missing sqlite_stat1 entries can steer the planner onto a
+        low-selectivity index and turn playback queries into large scans.
+        analysis_limit keeps the re-sample cheap enough to run hourly.
+        """
+        db = SqliteExtDatabase(self.config.database.path)
+        db.execute_sql("PRAGMA analysis_limit=1000;")
+        db.execute_sql("ANALYZE recordings;")
+        db.close()
+
     def expire_review_segments(self, config: CameraConfig, now: datetime) -> None:
         """Delete review segments that are expired"""
         alert_expire_date = (
@@ -123,18 +136,15 @@ class RecordingCleanup(threading.Thread):
         # Get the timestamp for cutoff of retained days
 
         # Get recordings to check for expiration
-        query = (
-            Recordings.select(
-                Recordings.id,
-                Recordings.start_time,
-                Recordings.end_time,
-                Recordings.path,
-                Recordings.objects,
-                Recordings.motion,
-                Recordings.dBFS,
-            )
-            .where(Recordings.camera == config.name)
-        )
+        query = Recordings.select(
+            Recordings.id,
+            Recordings.start_time,
+            Recordings.end_time,
+            Recordings.path,
+            Recordings.objects,
+            Recordings.motion,
+            Recordings.dBFS,
+        ).where(Recordings.camera == config.name)
         if variant is not None:
             query = query.where(Recordings.variant == variant)
         query = query.where(
@@ -351,9 +361,7 @@ class RecordingCleanup(threading.Thread):
             variants = config.get_record_variants()
             # Per-variant retain_days override REPLACES continuous.days; motion
             # extension still applies (bounded by retain_days as hard ceiling).
-            variant_dates: list[
-                tuple[str, float, float, Optional[float]]
-            ] = []
+            variant_dates: list[tuple[str, float, float, Optional[float]]] = []
             for variant in variants:
                 override = config.get_variant_retain_days(variant)
                 continuous_days = (
@@ -508,3 +516,4 @@ class RecordingCleanup(threading.Thread):
                 self.expire_recordings()
                 remove_empty_directories(RECORD_DIR)
                 self.truncate_wal()
+                self.refresh_recordings_stats()

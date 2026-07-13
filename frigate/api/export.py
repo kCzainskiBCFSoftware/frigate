@@ -38,6 +38,7 @@ from frigate.record.export import (
 from frigate.record.variants import (
     DEFAULT_PLAYBACK_VARIANT,
     apply_variant_filter,
+    recordings_overlap_clause,
     resolve_playback_variant,
 )
 from frigate.util.time import is_current_hour
@@ -114,12 +115,7 @@ def export_recording(
         recordings_count = (
             apply_variant_filter(
                 Recordings.select().where(
-                    Recordings.start_time.between(start_time, end_time)
-                    | Recordings.end_time.between(start_time, end_time)
-                    | (
-                        (start_time > Recordings.start_time)
-                        & (end_time < Recordings.end_time)
-                    )
+                    recordings_overlap_clause(start_time, end_time)
                 ),
                 variant,
             )

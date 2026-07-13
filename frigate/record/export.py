@@ -28,7 +28,10 @@ from frigate.ffmpeg_presets import (
     parse_preset_hardware_acceleration_encode,
 )
 from frigate.models import Export, Previews, Recordings
-from frigate.record.variants import DEFAULT_PLAYBACK_VARIANT
+from frigate.record.variants import (
+    DEFAULT_PLAYBACK_VARIANT,
+    recordings_overlap_clause,
+)
 from frigate.util.time import is_current_hour
 
 logger = logging.getLogger(__name__)
@@ -200,14 +203,7 @@ class RecordingExporter(threading.Thread):
                     Recordings.start_time,
                     Recordings.end_time,
                 )
-                .where(
-                    Recordings.start_time.between(self.start_time, self.end_time)
-                    | Recordings.end_time.between(self.start_time, self.end_time)
-                    | (
-                        (self.start_time > Recordings.start_time)
-                        & (self.end_time < Recordings.end_time)
-                    )
-                )
+                .where(recordings_overlap_clause(self.start_time, self.end_time))
                 .where(
                     Recordings.camera == self.camera,
                     Recordings.variant == self.variant,
