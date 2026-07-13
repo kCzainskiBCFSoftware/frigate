@@ -577,18 +577,20 @@ def all_recordings_summary(
     if not camera_list:
         return JSONResponse(content={})
 
-    time_range_query = (
-        Recordings.select(
-            fn.MIN(Recordings.start_time).alias("min_time"),
-            fn.MAX(Recordings.start_time).alias("max_time"),
-        )
+    # Keep these as two separate queries: SQLite only applies its MIN/MAX index
+    # optimization when a SELECT contains a single min()/max() aggregate. Asking
+    # for both at once silently degrades to a full walk of the index range for
+    # every camera (seconds on a multi-million-row recordings table).
+    min_time = (
+        Recordings.select(fn.MIN(Recordings.start_time))
         .where(Recordings.camera << camera_list)
-        .dicts()
-        .get()
+        .scalar()
     )
-
-    min_time = time_range_query.get("min_time")
-    max_time = time_range_query.get("max_time")
+    max_time = (
+        Recordings.select(fn.MAX(Recordings.start_time))
+        .where(Recordings.camera << camera_list)
+        .scalar()
+    )
 
     if min_time is None or max_time is None:
         return JSONResponse(content={})
