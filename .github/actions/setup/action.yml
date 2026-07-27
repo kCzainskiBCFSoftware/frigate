@@ -1,5 +1,5 @@
 name: 'Setup'
-description: 'Set up Buildx and authenticate to AWS ECR'
+description: 'Maximize build space, set up Buildx, authenticate to AWS ECR, and generate version files'
 inputs:
   aws-role-arn:
     required: true
@@ -10,10 +10,27 @@ inputs:
   ecr-repository:
     required: true
 outputs:
-  image-name:
-    value: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:${{ steps.create-short-sha.outputs.SHORT_SHA }}
+  short-sha:
+    description: '7-character commit sha, baked into the image and used in every tag'
+    value: ${{ steps.version.outputs.short-sha }}
+  version:
+    description: 'Base version read from the Makefile, e.g. 0.17.1'
+    value: ${{ steps.version.outputs.version }}
+  version-tag:
+    description: 'Release tag, e.g. <registry>/<repo>:0.17.1-abc1234'
+    value: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:${{ steps.version.outputs.version }}-${{ steps.version.outputs.short-sha }}
+  sha-tag:
+    description: 'Per-commit tag published by every branch; the retag source for release.yml'
+    value: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:sha-${{ steps.version.outputs.short-sha }}
+  latest-tag:
+    description: 'Moving tag pulled by the QNAP; only published from the release branch'
+    value: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:latest
   cache-name:
+    description: 'Shared buildx registry cache, written only by the release branch'
     value: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:cache
+  branch-cache-name:
+    description: 'Per-branch buildx cache, so feature branches cannot poison the shared one'
+    value: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:cache-${{ steps.version.outputs.branch-slug }}
 runs:
   using: "composite"
   steps:
@@ -24,7 +41,7 @@ runs:
     # This creates a virtual volume at /var/lib/docker to maximize the size
     # As of 2/14/2024, this results in 97G for docker images
     - name: Maximize build space
-      uses: easimon/maximize-build-space@master
+      uses: easimon/maximize-build-space@v10
       with:
         remove-dotnet: 'true'
         remove-android: 'true'
@@ -43,9 +60,31 @@ runs:
         aws-region: ${{ inputs.aws-region }}
     - name: Log in to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v2
-    - name: Create version file
-      run: make version
-      shell: bash
-    - id: create-short-sha
-      run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+    # Deliberately not `make version`: that uses git's abbreviated hash (8 chars in this
+    # repo) while the image tags use ${GITHUB_SHA::7}, so the version baked into the image
+    # would not match its own tag. Both are derived from SHORT_SHA here instead. VERSION
+    # still comes from the Makefile so it stays the single source of truth.
+    - name: Create version files
+      id: version
+      run: |
+        SHORT_SHA="${GITHUB_SHA::7}"
+        VERSION=$(grep -m1 '^VERSION' Makefile | cut -d'=' -f2 | tr -d ' ')
+        if [ -z "${VERSION}" ]; then
+          echo "::error::Could not read VERSION from the Makefile"
+          exit 1
+        fi
+
+        echo "VERSION = \"${VERSION}-${SHORT_SHA}\"" > frigate/version.py
+        echo "VITE_GIT_COMMIT_HASH=${SHORT_SHA}" > web/.env
+
+        # Docker tags allow [A-Za-z0-9._-] only, so slashes in branch names must go.
+        BRANCH_SLUG=$(printf '%s' "${GITHUB_REF_NAME}" | tr '/' '-' | tr -cd 'A-Za-z0-9._-' | cut -c1-90)
+
+        {
+          echo "short-sha=${SHORT_SHA}"
+          echo "version=${VERSION}"
+          echo "branch-slug=${BRANCH_SLUG}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "frigate/version.py -> ${VERSION}-${SHORT_SHA}"
       shell: bash

@@ -4,21 +4,34 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - v17.1-update-with-adaptive
+      - "**"
     paths-ignore:
       - "docs/**"
+      - "ra-docs/**"
+      - "**.md"
 
 # only run the latest commit to avoid cache overwrites
 concurrency:
-  group: ${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   id-token: write
   contents: read
 
+env:
+  # Branch that publishes the versioned tag and moves `latest` (what the QNAP pulls).
+  # Every other branch publishes only a throwaway sha-<sha> image. Update when the
+  # working branch moves on.
+  RELEASE_BRANCH: v17.1-update-with-adaptive
+
 jobs:
+  checks:
+    name: Checks
+    uses: ./.github/workflows/checks.yml
+
   amd64_build:
+    needs: [checks]
     runs-on: ubuntu-22.04
     name: AMD64 Build
     steps:
@@ -31,9 +44,34 @@ jobs:
         uses: ./.github/actions/setup
         with:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION }}
           ecr-registry: ${{ secrets.ECR_REGISTRY }}
-          ecr-repository: ${{ secrets.ECR_REPOSITORY }}
+          ecr-repository: ${{ vars.ECR_REPOSITORY }}
+      # Feature branches must not move `latest` — that is what the QNAP pulls — and must
+      # not write the shared build cache. They publish sha-<sha> and cache to their own ref.
+      - name: Resolve tags and cache refs
+        id: plan
+        env:
+          SHA_TAG: ${{ steps.setup.outputs.sha-tag }}
+          VERSION_TAG: ${{ steps.setup.outputs.version-tag }}
+          LATEST_TAG: ${{ steps.setup.outputs.latest-tag }}
+          CACHE_NAME: ${{ steps.setup.outputs.cache-name }}
+          BRANCH_CACHE_NAME: ${{ steps.setup.outputs.branch-cache-name }}
+        run: |
+          TAGS="${SHA_TAG}"
+          CACHE_TO="${BRANCH_CACHE_NAME}"
+
+          if [ "${GITHUB_REF_NAME}" = "${RELEASE_BRANCH}" ]; then
+            TAGS=$(printf '%s\n%s\n%s' "${SHA_TAG}" "${VERSION_TAG}" "${LATEST_TAG}")
+            CACHE_TO="${CACHE_NAME}"
+          fi
+
+          {
+            echo "tags<<__EOF__"
+            echo "${TAGS}"
+            echo "__EOF__"
+            echo "cache-to=${CACHE_TO}"
+          } >> "$GITHUB_OUTPUT"
       - name: Build and push amd64 image
         uses: docker/build-push-action@v6
         with:
@@ -42,8 +80,25 @@ jobs:
           push: true
           platforms: linux/amd64
           target: frigate
-          tags: |
-            ${{ steps.setup.outputs.image-name }}
-            ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:latest
-          cache-from: type=registry,ref=${{ steps.setup.outputs.cache-name }}
-          cache-to: type=registry,ref=${{ steps.setup.outputs.cache-name }},mode=max
+          # A plain single-platform manifest — no attestation index to confuse the
+          # QNAP's Docker or the server-side retag in release.yml.
+          provenance: false
+          tags: ${{ steps.plan.outputs.tags }}
+          # Read the shared cache first, then this branch's own.
+          cache-from: |
+            type=registry,ref=${{ steps.setup.outputs.cache-name }}
+            type=registry,ref=${{ steps.setup.outputs.branch-cache-name }}
+          # image-manifest/oci-mediatypes are REQUIRED for ECR: it rejects buildx's
+          # default cache manifest media type.
+          cache-to: type=registry,ref=${{ steps.plan.outputs.cache-to }},mode=max,image-manifest=true,oci-mediatypes=true
+      - name: Summary
+        env:
+          TAGS: ${{ steps.plan.outputs.tags }}
+        run: |
+          {
+            echo "### Pushed"
+            echo ""
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

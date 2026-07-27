@@ -8,67 +8,11 @@ on:
       - ".github/DISCUSSION_TEMPLATE/**"
       - ".github/ISSUE_TEMPLATE/**"
 
-env:
-  DEFAULT_PYTHON: 3.11
-
 jobs:
-  web_lint:
-    name: Web - Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 20.x
-      - run: npm install
-        working-directory: ./web
-      - name: Lint
-        run: npm run lint
-        working-directory: ./web
-
-  web_test:
-    name: Web - Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 20.x
-      - run: npm install
-        working-directory: ./web
-      - name: Build web
-        run: npm run build
-        working-directory: ./web
-      # - name: Test
-      #   run: npm run test
-      #   working-directory: ./web
-
-  python_checks:
-    runs-on: ubuntu-latest
-    name: Python Checks
-    steps:
-      - name: Check out the repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Set up Python ${{ env.DEFAULT_PYTHON }}
-        uses: actions/setup-python@v5.4.0
-        with:
-          python-version: ${{ env.DEFAULT_PYTHON }}
-      - name: Install requirements
-        run: |
-          python3 -m pip install -U pip
-          python3 -m pip install -r docker/main/requirements-dev.txt
-      - name: Check formatting
-        run: |
-          ruff format --check --diff frigate migrations docker *.py
-      - name: Check lint
-        run: |
-          ruff check frigate migrations docker *.py
+  # Same fast checks CI gates the ECR push on.
+  checks:
+    name: Checks
+    uses: ./.github/workflows/checks.yml
 
   python_tests:
     runs-on: ubuntu-latest

@@ -1,0 +1,52 @@
+name: Checks
+
+# Fast checks (~3 min) shared by CI and pull requests. CI gates the ECR push on these;
+# the slow devcontainer suite (mypy + unittest) stays on pull requests only.
+on:
+  workflow_call:
+
+env:
+  DEFAULT_PYTHON: "3.11"
+
+jobs:
+  python_checks:
+    name: Python - Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ env.DEFAULT_PYTHON }}
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: ${{ env.DEFAULT_PYTHON }}
+      - name: Install requirements
+        run: |
+          python3 -m pip install -U pip
+          python3 -m pip install -r docker/main/requirements-dev.txt
+      - name: Check formatting
+        run: ruff format --check --diff frigate migrations docker *.py
+      - name: Check lint
+        run: ruff check frigate migrations docker *.py
+
+  web_checks:
+    name: Web - Lint & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20.x
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: ./web
+      - name: Lint
+        run: npm run lint
+        working-directory: ./web
+      - name: Build web
+        run: npm run build
+        working-directory: ./web

@@ -1,5 +1,8 @@
 name: On release
 
+# Promotes an image CI already built to a version tag. No rebuild: the retag happens
+# server-side in ECR via `buildx imagetools create`, so the multi-GB image is never
+# downloaded. The tagged commit must have been built by CI first.
 on:
   push:
     tags:
@@ -18,7 +21,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION }}
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
       - name: Create tag variables
@@ -28,20 +31,27 @@ jobs:
           BUILD_TYPE=$([[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "stable" || echo "beta")
           echo "BUILD_TYPE=${BUILD_TYPE}" >> $GITHUB_ENV
           echo "REGISTRY=${{ secrets.ECR_REGISTRY }}" >> $GITHUB_ENV
-          echo "REPOSITORY=${{ secrets.ECR_REPOSITORY }}" >> $GITHUB_ENV
-          echo "BUILD_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          echo "REPOSITORY=${{ vars.ECR_REPOSITORY }}" >> $GITHUB_ENV
+          echo "BUILD_TAG=sha-${GITHUB_SHA::7}" >> $GITHUB_ENV
           echo "CLEAN_VERSION=$(echo ${GITHUB_REF##*/} | tr '[:upper:]' '[:lower:]' | sed 's/^[v]//')" >> $GITHUB_ENV
+      - name: Verify the source image exists
+        run: |
+          if ! aws ecr describe-images \
+                --repository-name "${REPOSITORY}" \
+                --image-ids imageTag="${BUILD_TAG}" >/dev/null 2>&1; then
+            echo "::error::No image tagged ${BUILD_TAG} in ${REPOSITORY}. Commit ${GITHUB_SHA::7} was never built by CI — push it to a branch and let CI finish before tagging."
+            exit 1
+          fi
       - name: Tag and push versioned image
         run: |
           SOURCE=${REGISTRY}/${REPOSITORY}:${BUILD_TAG}
           VERSION_TAG=${REGISTRY}/${REPOSITORY}:${CLEAN_VERSION}
 
-          docker pull ${SOURCE}
-          docker tag ${SOURCE} ${VERSION_TAG}
-          docker push ${VERSION_TAG}
+          docker buildx imagetools create --tag ${VERSION_TAG} ${SOURCE}
+          echo "released ${VERSION_TAG}" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "${BUILD_TYPE}" == "stable" ]]; then
             STABLE_TAG=${REGISTRY}/${REPOSITORY}:stable
-            docker tag ${SOURCE} ${STABLE_TAG}
-            docker push ${STABLE_TAG}
+            docker buildx imagetools create --tag ${STABLE_TAG} ${SOURCE}
+            echo "released ${STABLE_TAG}" >> "$GITHUB_STEP_SUMMARY"
           fi
