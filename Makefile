@@ -1,7 +1,7 @@
 default_target: local
 
 COMMIT_HASH := $(shell git log -1 --pretty=format:"%h"|tail -1)
-VERSION = 0.17.1
+VERSION = 0.17.2
 IMAGE_REPO ?= 747011639879.dkr.ecr.us-west-1.amazonaws.com/frigate
 GITHUB_REF_NAME ?= $(shell git rev-parse --abbrev-ref HEAD)
 BOARDS= #Initialized empty
