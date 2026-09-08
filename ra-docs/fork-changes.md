@@ -5,13 +5,21 @@ upstream `blakeblackshear/frigate`. It is maintained by hand — update it whene
 you change fork-specific behavior.
 
 - **Upstream base:** `dev` (merge-base `416a9b76`)
-- **Active branch:** `v17.1-update-with-adaptive`
+- **Active branch:** `task/multi-camera-playback-perf-1229bc`
 - **Branch commits:**
   - `4228f609` feat: Add support for dual retention for single camera
   - `87d52ed7` test: attempt 2
   - `b1ffe9c4` fix: hls updates
   - `f1795069` fix: Update recordings/summary endpoint response times
-  - *(working tree)* fix: per-variant retention window (`min`→`max`) + cleanup regression test
+  - `648fc516` fix: Resolve SD retention overwritten by HD retention
+  - `7b873dba` fix: Force restart url from config view to stay in config
+  - `1520f286` fix: Config redirect path
+  - `4d8e81f2` test: playback and export performace logs
+  - `04e2aaa7` fix: summary read min max query update
+  - `6c4c9bd1` chore: Update GA flows
+  - `410c033a` chore: Disable python checks
+  - `15a471c6` fix: Add caching to support prefetches for vod
+  - *(working tree)* playback concurrency + precomputed timeline ranges
 
 ## What the fork does
 
@@ -121,6 +129,115 @@ file documents the **code** changes.
 
 ---
 
+## Playback performance & the precomputed timeline
+
+A second strand of fork work, driven by a device recording 32 cameras on a
+4-core QNAP with limited RAM, serving 4 concurrent VOD players.
+
+### Query shape
+
+- **`frigate/record/variants.py` — `recordings_overlap_clause()`.** The seekable
+  overlap predicate. Interval overlap is `start_time <= end_ts AND end_time >=
+  start_ts`; the extra `start_time >= start_ts - MAX_SEGMENT_DURATION` lower
+  bound is implied for any segment shorter than 600s but gives SQLite a
+  two-sided range so it seeks `(camera, variant, start_time, end_time)` instead
+  of walking the camera's entire retained history. **Every time-window query on
+  `Recordings` must use it** — a hand-written `BETWEEN`-OR overlap regresses to
+  a full scan. Guarded by an `EXPLAIN QUERY PLAN` test.
+- **Migration `034`** drops `recordings_variant` and `recordings_camera`. A
+  two-value index is a planner trap without fresh statistics, and both were pure
+  write amplification on the segment-insert path.
+- **`ANALYZE`** runs at startup (`frigate/app.py`) and hourly
+  (`RecordingCleanup.refresh_recordings_stats`). Without statistics the planner
+  picks badly on a multi-million-row table.
+- **`all_recordings_summary`** uses a recursive loose ("skip") index scan that
+  touches ~one row per day-with-footage. Note the MIN/MAX split it documents:
+  SQLite only applies its min/max index optimization to a SELECT containing a
+  *single* aggregate.
+
+### Precomputed ranges (migration `035`)
+
+Client-facing API guide: `ra-docs/playback-timeline-api.md`.
+
+- **`frigate/record/ranges.py`** — the timeline core. A SQL gap-and-islands
+  merge (window functions; SQLite 3.46 via bundled `pysqlite3`) turns ~8,640
+  segment rows per camera-day into ~40 `{start, end}` ranges. Merged on a
+  running `MAX(end_time)`, because segments overlap in the field and merging on
+  the previous row's end drags a range's end backwards and loses footage.
+- **`recording_ranges` / `recording_range_coverage`.** `RecordingCleanup` rolls
+  settled windows up on its existing 60s tick, trims to retention hourly (after
+  `expire_recordings`, so the ranges follow the recordings table), and backfills
+  history a day per hour. Coverage is tracked explicitly so "no footage" is
+  distinguishable from "not precomputed yet"; anything uncovered is merged live
+  with the same SQL, so answers are correct from the first request.
+- Stored at `MATERIALIZED_GAP = 1.0s`; a caller's larger `gap` is served by
+  re-merging, which is equivalent to merging the raw segments at that gap.
+  A smaller gap falls through to the live path.
+
+### API concurrency
+
+- **The blocking playback handlers in `frigate/api/media.py` are plain `def`,
+  not `async def`** — `recordings`, `recordings_summary`,
+  `get_snapshot_from_recording`, `no_recordings`, `recording_clip`, `vod_ts`,
+  and the sibling VOD routes. uvicorn runs a single process with a single event
+  loop, so an `async` handler doing blocking SQLite/ffprobe/ffmpeg work stalls
+  every other request on the box, live view included. As `def`, FastAPI runs
+  them in the worker threadpool. `vod_event` and `event_clip` stay coroutines
+  (they await `require_camera_access`) and reach `_vod_ts` / `_recording_clip`
+  through `run_in_threadpool`. A test asserts none of them is a coroutine.
+- **Threadpool bounded to 4** (`API_THREAD_POOL_SIZE`, override with
+  `FRIGATE_API_THREAD_POOL_SIZE`). Peewee connection state is thread-local, so
+  each worker thread opens its own SQLite connection; anyio's default of 40 is
+  wrong on NAS hardware that is also recording every camera.
+- **VOD mapping cacheability keys on the window's END**
+  (`end_ts < now - MAX_SEGMENT_DURATION`), not its start. A window still being
+  written can gain a segment seconds later; one that cannot is immutable. The
+  old start-based rule marked every ≤1h fragment touching the last hour
+  non-cacheable, and nginx-vod re-requests a non-cacheable mapping *per
+  segment*.
+- **`get_keyframe_before`** (`frigate/util/media.py`) caches the ffprobe
+  keyframe index per file — bounded LRU, single-flight, negative caching.
+
+### Memory and nginx
+
+- **SQLite pragmas**: `cache_size` 512MB → 256MB and `mmap_size` 256MB on all
+  three DB-owning processes (main app, record, embeddings). mmap'd pages are
+  file-backed, so the kernel can reclaim them under pressure and they are shared
+  between connections rather than duplicated per connection — which is what
+  makes the API threadpool affordable.
+- **`nginx.conf`**: `vod_metadata_cache` 512m → 128m and `vod_mapping_cache`
+  5m/10m → 32m/1h (both are shared memory, i.e. RAM, and nginx never returns
+  slab pages to the OS); `open_file_cache` 1000 → 8192 with
+  `worker_rlimit_nofile 16384` (10s segments mean an hour of scrubbing touches
+  ~360 files per camera, and every miss is an `open()` on the recordings
+  volume); `api_cache` `max_size` 10m → 32m in `/dev/shm`.
+- **gzip actually applies to `/api/` JSON now.** The server-level
+  `gzip_types application/vnd.apple.mpegurl` was *replacing* the http-level list
+  containing `application/json` (`gzip_types` does not merge across levels), and
+  `gzip_proxied no-cache no-store private expired auth` gated on upstream
+  headers the API handlers do not send. One list at http level, `gzip_proxied
+  any`. Media types are deliberately excluded — gzipping H.264/fMP4 costs ~32×
+  the CPU for well under 1% of the bytes.
+- **`/api/` `Cache-Control` passthrough**: a `map` on `$upstream_http_cache_control`
+  plus `proxy_hide_header`, so a handler can opt into caching without emitting a
+  duplicate header. Everything that sets nothing still gets `no-store`.
+
+### Observability
+
+- **`frigate/api/perf.py`** — one JSON line per request to
+  `perf-logs/api_perf.log` next to the DB (rotating, `propagate=False` so it
+  stays out of the container log). Carries `resolve_variant_ms`, `sql_ms`,
+  `keyframe_probe_ms`, `keyframe_probes`, `segments`, `nginx_cacheable`,
+  `ffmpeg_first_byte_ms`, `stream_ms`, `total_ms`.
+
+### Capability advertisement
+
+`GET /api/config` carries a top-level `fork` key listing supported fork-only
+features, so clients on a mixed-version fleet can detect endpoints without
+probing for 404s. **Append only** — never rename or remove a shipped flag.
+
+---
+
 ## Frontend changes (`web/`)
 
 - **`src/components/player/RecordingPlaybackPreferenceSelect.tsx`** (new) — the
@@ -164,7 +281,10 @@ docker run --rm --workdir=/opt/frigate --entrypoint= \
   `frigate/detectors/__init__.pyc`, `frigate/test/**/__init__.pyc`). These are build
   artifacts (compiled by the local Python 2.7 on Windows) and should be removed and
   gitignored.
-- The **cleanup retention fix** and **`test_record_cleanup.py`** are uncommitted in
-  the working tree at the time of writing.
-- `ra-docs/` holds working notes; only `dual-stream-api-changes.md` is tracked, the
-  rest are local.
+- Two pre-existing test-environment failures to expect and ignore:
+  `TestGo2rtcStreamAccess` needs a live go2rtc on `127.0.0.1:1984`, and mypy needs
+  `types-peewee` installed or every peewee model reports
+  "Class cannot subclass Model".
+- `ra-docs/` holds working notes; `dual-stream-api-changes.md` and this file are
+  tracked, the rest are local. Note this file lives in `ra-docs/`, not the repo
+  root (CLAUDE.md still says root).

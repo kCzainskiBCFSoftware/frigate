@@ -37,6 +37,7 @@ from frigate.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateTopic,
 )
+from frigate.const import FORK_FEATURES, FORK_NAME
 from frigate.models import Event, Timeline
 from frigate.stats.prometheus import get_metrics, update_metrics
 from frigate.util.builtin import (
@@ -184,6 +185,15 @@ def config(request: Request):
         detector_config["model"]["labelmap"] = (
             request.app.frigate_config.model.merged_labelmap
         )
+
+    # Fork capability advertisement. Devices upgrade independently, so clients
+    # need to know which fork-only endpoints this build actually has without
+    # probing for 404s. Additive only -- never rename or remove a flag that has
+    # shipped, and never let this block touch an existing config key.
+    config["fork"] = {
+        "name": FORK_NAME,
+        "features": sorted(FORK_FEATURES),
+    }
 
     return JSONResponse(content=config)
 

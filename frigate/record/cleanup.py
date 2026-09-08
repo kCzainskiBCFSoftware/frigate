@@ -14,6 +14,11 @@ from playhouse.sqlite_ext import SqliteExtDatabase
 from frigate.config import CameraConfig, FrigateConfig, RetainModeEnum
 from frigate.const import CACHE_DIR, CLIPS_DIR, MAX_WAL_SIZE, RECORD_DIR
 from frigate.models import Previews, Recordings, ReviewSegment, UserReviewStatus
+from frigate.record.ranges import (
+    backfill_ranges,
+    roll_up_ranges,
+    trim_ranges,
+)
 from frigate.record.util import remove_empty_directories, sync_recordings
 from frigate.util.builtin import clear_and_unlink
 from frigate.util.time import get_tomorrow_at_time
@@ -61,6 +66,30 @@ class RecordingCleanup(threading.Thread):
             db = SqliteExtDatabase(self.config.database.path)
             db.execute_sql("PRAGMA wal_checkpoint(TRUNCATE);")
             db.close()
+
+    def roll_up_recording_ranges(self) -> None:
+        """Materialize newly settled playback-timeline ranges.
+
+        Runs every tick so the precomputed coverage stays ~a minute behind
+        live and the API rarely has to merge a live tail."""
+        try:
+            roll_up_ranges(self.config)
+        except Exception:
+            logger.exception("Failed to roll up recording ranges")
+
+    def backfill_recording_ranges(self) -> None:
+        """Extend precomputed coverage one step further into history."""
+        try:
+            backfill_ranges(self.config)
+        except Exception:
+            logger.exception("Failed to backfill recording ranges")
+
+    def trim_recording_ranges(self) -> None:
+        """Drop precomputed ranges for footage retention has deleted."""
+        try:
+            trim_ranges(self.config)
+        except Exception:
+            logger.exception("Failed to trim recording ranges")
 
     def refresh_recordings_stats(self) -> None:
         """Re-sample query-planner statistics for the recordings table.
@@ -502,6 +531,7 @@ class RecordingCleanup(threading.Thread):
                 break
 
             self.clean_tmp_previews()
+            self.roll_up_recording_ranges()
 
             if (
                 self.config.record.sync_recordings
@@ -517,3 +547,7 @@ class RecordingCleanup(threading.Thread):
                 remove_empty_directories(RECORD_DIR)
                 self.truncate_wal()
                 self.refresh_recordings_stats()
+                # after expire_recordings, so the precomputed ranges follow the
+                # recordings table rather than advertising footage that is gone
+                self.trim_recording_ranges()
+                self.backfill_recording_ranges()

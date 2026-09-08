@@ -52,6 +52,8 @@ from frigate.models import (
     Event,
     Export,
     Previews,
+    RecordingRangeCoverage,
+    RecordingRanges,
     Recordings,
     RecordingsToDelete,
     Regions,
@@ -272,7 +274,18 @@ class FrigateApp:
             self.config.database.path,
             pragmas={
                 "auto_vacuum": "FULL",  # Does not defragment database
-                "cache_size": -512 * 1000,  # 512MB of cache,
+                # 256MB page-cache ceiling (was 512MB): the playback queries are
+                # index seeks touching few pages, and the recordings index dwarfs
+                # either value, so the extra 256MB mostly competed for RAM. This is
+                # also the connection the API worker threads multiply -- peewee keeps
+                # connection state thread-local, so each thread opens its own.
+                "cache_size": -256 * 1000,
+                # Read pages through an mmap of the db instead of copying them into
+                # this connection's private cache: the mapping is file-backed, so the
+                # kernel can reclaim it under memory pressure (SQLite's own page cache
+                # cannot be), and one mapping is shared by every connection reading the
+                # file rather than duplicated per connection.
+                "mmap_size": 256 * 1024 * 1024,
                 "journal_mode": "wal",  # required for synchronous=NORMAL to be crash-safe
                 "synchronous": "NORMAL",  # Safe when using WAL https://www.sqlite.org/pragma.html#pragma_synchronous
             },
@@ -287,6 +300,8 @@ class FrigateApp:
             Event,
             Export,
             Previews,
+            RecordingRangeCoverage,
+            RecordingRanges,
             Recordings,
             RecordingsToDelete,
             Regions,
