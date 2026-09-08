@@ -1,4 +1,4 @@
-# Fork Changes — Dual-Stream Recording with Per-Variant Retention
+# Fork Changes — Dual-Stream Recording + Playback Performance
 
 This document is the canonical changelog for what this fork/branch adds on top of
 upstream `blakeblackshear/frigate`. It is maintained by hand — update it whenever
@@ -19,13 +19,18 @@ you change fork-specific behavior.
   - `6c4c9bd1` chore: Update GA flows
   - `410c033a` chore: Disable python checks
   - `15a471c6` fix: Add caching to support prefetches for vod
-  - *(working tree)* playback concurrency + precomputed timeline ranges
+  - `79a2adc1` perf: precomputed playback timeline + real API concurrency
 
 ## What the fork does
 
-One physical camera can now record **two streams as distinct variants** —
+The fork has **two independent strands**. Both are documented below; each has
+its own client-facing guide.
+
+### Strand 1 — dual-stream recording with per-variant retention
+
+One physical camera can record **two streams as distinct variants** —
 `main` (HD) and `sub` (SD) — each a separate row in `Recordings` and a separate
-file tree on disk. The two key user-facing capabilities:
+file tree on disk. Two user-facing capabilities:
 
 1. **Dual retention** — each record variant can have its own retention via a
    per-input `retain_days` override (e.g. keep `sub` 30 days while `main`/base is 7).
@@ -34,10 +39,25 @@ file tree on disk. The two key user-facing capabilities:
    default for playback, `main` for snapshots, and automatic fallback to the other
    variant when the requested one has no footage in range.
 
-Detailed external-client/API behavior lives in
-[ra-docs/dual-stream-api-changes.md](ra-docs/dual-stream-api-changes.md) and
-[ra-docs/be-migration-dual-stream.md](ra-docs/be-migration-dual-stream.md). This
-file documents the **code** changes.
+### Strand 2 — playback performance and the precomputed timeline
+
+Driven by a device recording **32 cameras** on a 4-core QNAP with limited RAM,
+serving **4 concurrent VOD players**:
+
+1. **A timeline API that does not ship raw segment rows.** Three new endpoints
+   answer "which parts of this window have footage" directly, turning a
+   32-camera day view from 32 requests and ~64 MB into one request and ~64 kB.
+   Backed by a precomputed ranges table (migration `035`).
+2. **Real request concurrency.** The blocking playback handlers no longer run on
+   uvicorn's single event loop, so four players and a timeline fetch actually
+   overlap instead of queuing behind each other.
+3. **Memory and nginx tuning** for NAS-class hardware, including a gzip
+   misconfiguration that had silently disabled compression on all `/api/` JSON.
+
+Client-facing guides:
+[ra-docs/dual-stream-api-changes.md](dual-stream-api-changes.md) (the `?variant=`
+model) and [ra-docs/playback-timeline-api.md](playback-timeline-api.md) (the
+timeline endpoints). This file documents the **code** changes.
 
 ---
 
@@ -67,6 +87,14 @@ file documents the **code** changes.
   end_time)`.
 - **`migrations/033_add_recordings_variant.py`** — adds the columns/indexes and
   backfills existing rows to `variant="main"`.
+- **`migrations/034_drop_redundant_recordings_indexes.py`** — drops
+  `recordings_variant` and `recordings_camera`; see *Query shape* below.
+- **`migrations/035_create_recording_ranges.py`** — adds `recording_ranges` and
+  `recording_range_coverage` (models `RecordingRanges` / `RecordingRangeCoverage`
+  in `frigate/models.py`). **DDL only** — two `CREATE TABLE` and one
+  `CREATE INDEX`, no data migration, no triggers, no views, and it never touches
+  `recordings`. The tables start empty and are filled by the rollup; see
+  *Precomputed ranges* below.
 
 ### Recording variant helpers
 - **`frigate/record/variants.py`** (new) — shared constants and query helpers:
@@ -95,7 +123,7 @@ file documents the **code** changes.
     filters the query to that variant;
   - an **orphan sweep** removes rows whose variant is no longer configured;
   - previews are kept if **any** variant still retains an overlapping segment.
-  - **Bug fix (working tree):** the per-variant *outer/motion* window was capped
+  - **Bug fix (`648fc516`):** the per-variant *outer/motion* window was capped
     with `min(base_motion_days, override)`, which reverted the `sub` variant to the
     base (7-day) deletion bound and deleted long-retention footage early. Changed to
     `max(...)` so the override window is honored; the `hard_cap_date` still clamps
@@ -120,6 +148,19 @@ file documents the **code** changes.
   across variants.
 - **`frigate/storage.py`** — per-camera bandwidth (MB/hr) is the **sum** of each
   variant's write rate, so dual-stream cameras report true disk consumption.
+- **New timeline endpoints** (also in `frigate/api/media.py`) — all additive,
+  none of the existing endpoints changed shape:
+
+  | Endpoint | Returns |
+  |---|---|
+  | `GET /api/{camera}/recordings/ranges` | bare `[{start, end}]` array + `X-Recording-Variant` header |
+  | `GET /api/recordings/ranges` | `{ranges: {camera: [...]}, variants: {camera: variant}}` for many cameras in one request |
+  | `GET /api/recordings/hours` | `{camera: {"YYYY-MM-DD": [24 booleans]}}`, local hours, DST-aware |
+
+  Shared params: `after`, `before`, `variant`, and `gap` (seconds; holes smaller
+  than this are encoder jitter, not a recording gap). Windows are capped at
+  `MAX_RANGES_WINDOW` (8 days) with a 422. Query-param models live in
+  `frigate/api/defs/query/media_query_parameters.py`.
 
 ### Infra
 - **`docker/main/rootfs/usr/local/nginx/conf/nginx.conf`** — `vod_upstream_extra_args`
@@ -257,21 +298,61 @@ probing for 404s. **Append only** — never rename or remove a shipped flag.
 
 ## Tests
 
+### Strand 1 — dual-stream
+
 - **`frigate/test/test_config.py`** — dual-variant config validation
   (`test_dual_record_distinct_variants_ok`, duplicate-variant rejection).
 - **`frigate/test/http_api/test_http_media.py`** + **`base_http_test.py`** —
-  variant-aware media endpoint tests; `insert_mock_recording` gained `variant`/`path`.
-- **`frigate/test/test_record_cleanup.py`** (new, working tree) — exercises
+  `TestHttpVodVariants` covers variant-aware media endpoints;
+  `insert_mock_recording` gained `variant`/`path`.
+- **`frigate/test/test_record_cleanup.py`** — exercises
   `RecordingCleanup.expire_recordings()` end-to-end and guards the per-variant
   retention regression (sub retained to its 30-day override; main to base 7 days).
 
-Run backend tests inside the image (local Python lacks the deps):
+### Strand 2 — timeline and concurrency
+
+- **`frigate/test/test_record_ranges.py`** (new, 22 tests) — the core.
+  - `TestRangeMergeCorrectness` — the SQL merge against an independently-written
+    Python reference over randomised jittered segments, plus the three semantics
+    external clients depend on: **running-`max(end)` merging** (a last-end merge
+    loses 30s of footage in the overlapping-segment case), **unclipped window
+    edges**, and `gap` behaving as a real parameter. Includes the
+    `EXPLAIN QUERY PLAN` guard and a check that the hand-written SQL predicate
+    returns the same rows as `recordings_overlap_clause()`.
+  - `TestRematerializedMerge` — **the load-bearing one.** Re-merging ranges
+    stored at `MATERIALIZED_GAP` must equal merging the raw segments at the
+    caller's gap, for every gap at or above it. This is the one correctness risk
+    precomputation introduces.
+  - `TestRollup` — watermark advance, trailing-overlap recomputation (a
+    late-arriving segment still merges correctly), never materialising an
+    unsettled window, the bounded first rollup, stitching a live tail onto
+    stored ranges, falling back to live for uncovered windows, and the
+    `ROLLUP_MIN_ADVANCE` cadence guard.
+  - `TestRetentionTrim` — expired ranges dropped, `covered_from` raised, and a
+    range straddling the cutoff clipped rather than deleted.
+- **`frigate/test/http_api/test_http_media.py`** — three new classes:
+  `TestRecordingRangesApi` (response shapes, per-camera variant fallback,
+  unclipped edges, empty-is-`[]`, 422 over-window, hours agreeing with ranges),
+  `TestPlaybackHandlerConcurrency` (asserts the converted handlers are **not**
+  coroutines, and that `vod_event` / `event_clip` still are), and
+  `TestVodMappingCacheability` (settled window cacheable, live window not, and
+  the `MAX_SEGMENT_DURATION` boundary).
+- **Fixed a pre-existing broken guard.** `test_query_plan_seeks_composite_index`
+  passed in isolation but **failed in the full suite** — on the base commit too.
+  It inserted a single row, so with no `sqlite_stat1` the planner had no basis to
+  prefer the variant composite index and the assertion came down to a tie-break.
+  It now seeds representative rows across both cameras and variants and runs
+  `ANALYZE`, matching production, which ANALYZEs at startup and hourly.
+
+Backend tests do not run natively on Windows (`frigate/log.py` calls
+`os.register_at_fork` at import). Run them in the image:
+
 ```bash
-docker run --rm --workdir=/opt/frigate --entrypoint= \
-  -v "$PWD:/opt/frigate" <frigate-image> \
-  python3 -u -m unittest frigate.test.test_record_cleanup frigate.test.test_config
+docker run --rm --workdir=/opt/frigate --entrypoint= -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/opt/frigate" <frigate-image> python3 -u -m unittest
 ```
 
+Current state: **280 tests**, `ruff check`/`format` clean, mypy clean on every
+changed file. See *Housekeeping* for the two environment-only failures to expect.
 ---
 
 ## Housekeeping / known issues
