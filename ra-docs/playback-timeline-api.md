@@ -41,7 +41,7 @@ now carries a top-level `fork` key:
 ```json
 {
   "fork": {
-    "name": "remote-ally",
+    "version": "0.17.2-abc1234",
     "features": ["recording_variants", "recordings_hours", "recordings_ranges"]
   },
   "cameras": { "...": "unchanged" }

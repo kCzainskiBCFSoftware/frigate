@@ -114,6 +114,7 @@ MAX_PLAYLIST_SECONDS = 7200  # support 2 hour segments for a single playlist to 
 # its own page cache, and the box is also recording every camera. Tunable per
 # device without a rebuild via FRIGATE_API_THREAD_POOL_SIZE.
 API_THREAD_POOL_SIZE = 4
+API_THREAD_POOL_SIZE_ENV_VAR = "FRIGATE_API_THREAD_POOL_SIZE"
 
 # Longest window the recordings range/hours endpoints will answer for. The
 # precomputed table makes a covered window cheap regardless of length, but an
@@ -121,15 +122,15 @@ API_THREAD_POOL_SIZE = 4
 # camera is millions of rows. Callers draw a day at a time.
 MAX_RANGES_WINDOW = 8 * 86400
 
-# Advertised on /api/config so clients can detect fork-only endpoints without
-# probing for 404s. Append only.
-FORK_NAME = "remote-ally"
+# Advertised on /api/config (alongside the build version) so clients can detect
+# fork-only endpoints without probing for 404s. Append only -- never rename or
+# remove a flag that has shipped. Feature names only: this is a public
+# repository, so no vendor or product name belongs here.
 FORK_FEATURES = [
     "recording_variants",
     "recordings_ranges",
     "recordings_hours",
 ]
-API_THREAD_POOL_SIZE_ENV_VAR = "FRIGATE_API_THREAD_POOL_SIZE"
 
 # Internal Comms Topics
 

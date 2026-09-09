@@ -273,9 +273,11 @@ Client-facing API guide: `ra-docs/playback-timeline-api.md`.
 
 ### Capability advertisement
 
-`GET /api/config` carries a top-level `fork` key listing supported fork-only
-features, so clients on a mixed-version fleet can detect endpoints without
-probing for 404s. **Append only** — never rename or remove a shipped flag.
+`GET /api/config` carries a top-level `fork` key — the build `version` plus a
+list of supported fork-only `features` — so clients on a mixed-version fleet can
+detect endpoints without probing for 404s. **Append only** — never rename or
+remove a shipped flag. Deliberately carries no vendor or product name: this is a
+public repository.
 
 ---
 
@@ -357,11 +359,16 @@ changed file. See *Housekeeping* for the two environment-only failures to expect
 
 ## Housekeeping / known issues
 
-- **Stray `.pyc` files** are tracked/untracked in the repo
+- **Stray `.pyc` files removed from tracking** (`79a2adc1`+). Five were tracked
   (`frigate/__init__.pyc`, `frigate/config/__init__.pyc`,
-  `frigate/detectors/__init__.pyc`, `frigate/test/**/__init__.pyc`). These are build
-  artifacts (compiled by the local Python 2.7 on Windows) and should be removed and
-  gitignored.
+  `frigate/detectors/__init__.pyc`, `frigate/test/**/__init__.pyc`) — Python 2.7
+  build artifacts from a Windows checkout. Two of them embedded the absolute
+  build path, i.e. a local username and directory names, in a public repository.
+  `.gitignore` had `__pycache__` but not `*.pyc`, which is how they got in; both
+  are now ignored.
+  **They remain in git history** — untracking only fixes HEAD. Purging them needs
+  a history rewrite (`git filter-repo`) and a force push, which is disruptive on a
+  shared branch; left as a deliberate decision rather than done silently.
 - Two pre-existing test-environment failures to expect and ignore:
   `TestGo2rtcStreamAccess` needs a live go2rtc on `127.0.0.1:1984`, and mypy needs
   `types-peewee` installed or every peewee model reports

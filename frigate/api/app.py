@@ -37,7 +37,7 @@ from frigate.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateTopic,
 )
-from frigate.const import FORK_FEATURES, FORK_NAME
+from frigate.const import FORK_FEATURES
 from frigate.models import Event, Timeline
 from frigate.stats.prometheus import get_metrics, update_metrics
 from frigate.util.builtin import (
@@ -191,7 +191,7 @@ def config(request: Request):
     # probing for 404s. Additive only -- never rename or remove a flag that has
     # shipped, and never let this block touch an existing config key.
     config["fork"] = {
-        "name": FORK_NAME,
+        "version": VERSION,
         "features": sorted(FORK_FEATURES),
     }
 

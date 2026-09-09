@@ -154,7 +154,7 @@ Detect support without probing for 404s: `GET /api/config` now carries a
 top-level `fork` key.
 
 ```json
-"fork": {"name": "remote-ally",
+"fork": {"version": "0.17.2-abc1234",
          "features": ["recording_variants", "recordings_hours", "recordings_ranges"]}
 ```
 
