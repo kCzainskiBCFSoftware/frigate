@@ -214,6 +214,16 @@ Client-facing API guide: `ra-docs/playback-timeline-api.md`.
 - Stored at `MATERIALIZED_GAP = 1.0s`; a caller's larger `gap` is served by
   re-merging, which is equivalent to merging the raw segments at that gap.
   A smaller gap falls through to the live path.
+- **`_replace_window` must preserve coverage outside the window it recomputes.**
+  Stored ranges are unclipped, so a continuous run is one row that extends past
+  the window on both sides; deleting everything that overlaps and regenerating
+  only what `live_ranges` admits destroys the rest. The first field build did
+  exactly that and reported 3.5 h for a 12 h day -- see
+  [ranges-underreporting-postmortem.md](ranges-underreporting-postmortem.md).
+  Guarded by `TestCoverageInvariant`.
+- **Migration `036`** discards both tables so they rebuild from scratch; the rows
+  damaged by that bug lie between `covered_from` and `covered_to`, which neither
+  rebuild path revisits.
 
 ### API concurrency
 
