@@ -23,6 +23,7 @@ from frigate.models import (
 from frigate.record.ranges import (
     MATERIALIZED_GAP,
     ROLLUP_MIN_ADVANCE,
+    _replace_window,
     backfill_ranges,
     live_ranges,
     merge_ranges,
@@ -456,6 +457,125 @@ class TestRollup(RangesTestBase):
         assert later < first
         served = recording_ranges(["back"], old - 100, old + 400, "sub", 3.0)["back"]
         assert served == live_ranges(["back"], old - 100, old + 400, "sub", 3.0)["back"]
+
+
+class TestCoverageInvariant(RangesTestBase):
+    """Whatever the coverage row claims, the stored answer must match live.
+
+    This is the invariant the whole design rests on: outside coverage the API
+    merges live, inside it trusts the table. If the table is wrong *inside* its
+    claimed window, nothing falls back and the timeline silently under-reports.
+
+    A field build shipped with exactly that failure -- the rollup deleted whole
+    unclipped ranges but regenerated only the part inside its own window, eating
+    the table from the left every tick while coverage still claimed the whole
+    span. 12 h of continuous recording came back as 3.5 h.
+    """
+
+    def _assert_matches_live(self, camera="back", variant="sub"):
+        coverage = RecordingRangeCoverage.get(
+            RecordingRangeCoverage.camera == camera,
+            RecordingRangeCoverage.variant == variant,
+        )
+        after, before = coverage.covered_from, coverage.covered_to
+        served = recording_ranges([camera], after, before, variant, 3.0)[camera]
+        live = live_ranges([camera], after, before, variant, 3.0)[camera]
+
+        served_total = sum(e - s for s, e in served)
+        live_total = sum(e - s for s, e in live)
+
+        assert abs(served_total - live_total) < 0.01, (
+            f"stored path reports {served_total:.1f}s inside its own claimed "
+            f"coverage, live merge reports {live_total:.1f}s"
+        )
+        return served_total
+
+    def test_repeated_rollups_preserve_earlier_coverage(self):
+        # continuous recording, no jitter at all, so any hole is the rollup's
+        now = datetime.datetime.now().timestamp()
+        start = now - 4 * 3600
+        t = start
+        while t < now:
+            self.add(t, t + SEGMENT)
+            t += SEGMENT
+
+        # tick as RecordingCleanup does, over four hours of wall clock
+        for i in range(1, 4 * 60 + 1):
+            roll_up_ranges(self.config, now=now + i * 60)
+
+        covered = self._assert_matches_live()
+        assert covered > 3000, covered
+
+        # and a continuous run stays one row rather than gaining a seam per tick
+        rows = list(RecordingRanges.select())
+        assert len(rows) == 1, [(r.start_time - now, r.end_time - now) for r in rows]
+
+    def test_rollup_does_not_truncate_a_long_range_from_the_left(self):
+        # the minimal shape of the bug: one stored range far wider than the
+        # window the next tick recomputes
+        now = datetime.datetime.now().timestamp()
+        start = now - 2 * 3600
+        t = start
+        while t < now:
+            self.add(t, t + SEGMENT)
+            t += SEGMENT
+
+        roll_up_ranges(self.config, now=now)
+        first = min(r.start_time for r in RecordingRanges.select())
+
+        for i in range(1, 21):
+            roll_up_ranges(self.config, now=now + i * 60)
+
+        still = min(r.start_time for r in RecordingRanges.select())
+        assert still <= first + 0.01, (
+            f"left edge walked forward {still - first:.0f}s: earlier coverage "
+            f"was deleted and never regenerated"
+        )
+
+    def test_replace_window_preserves_coverage_on_both_sides(self):
+        # backfill recomputes a window with stored coverage to its right, so the
+        # delete has to be bounded on both sides, not just the left
+        now = datetime.datetime.now().timestamp()
+        left = (now - 10000, now - 9000)
+        right = (now - 2000, now - 1000)
+        RecordingRanges.insert(
+            camera="back", variant="sub", start_time=left[0], end_time=left[1]
+        ).execute()
+        RecordingRanges.insert(
+            camera="back", variant="sub", start_time=right[0], end_time=right[1]
+        ).execute()
+        # one long row spanning the window the recompute will touch
+        RecordingRanges.insert(
+            camera="back", variant="sub", start_time=now - 8000, end_time=now - 3000
+        ).execute()
+
+        _replace_window("back", "sub", now - 6000, now - 5000)
+
+        rows = sorted((r.start_time, r.end_time) for r in RecordingRanges.select())
+        covered = merge_ranges(rows, 0.0)
+
+        def inside(t):
+            return any(s - 0.01 <= t <= e + 0.01 for s, e in covered)
+
+        assert inside(now - 9500), "coverage left of the window was lost"
+        assert inside(now - 1500), "coverage right of the window was lost"
+        assert inside(now - 7000), "left remainder of the straddling range was lost"
+        assert inside(now - 3500), "right remainder of the straddling range was lost"
+
+    def test_backfill_then_rollup_agrees_with_live(self):
+        now = datetime.datetime.now().timestamp()
+        start = now - 3 * DAY
+        t = start
+        while t < now:
+            self.add(t, t + SEGMENT)
+            t += 60.0  # sparse seeding keeps the test cheap
+
+        for i in range(1, 61):
+            roll_up_ranges(self.config, now=now + i * 60)
+        for _ in range(6):
+            backfill_ranges(self.config, now=now)
+
+        self._assert_matches_live()
 
 
 class TestRetentionTrim(RangesTestBase):

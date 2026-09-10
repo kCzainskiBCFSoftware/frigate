@@ -252,12 +252,47 @@ def recording_ranges(
 
 
 def _replace_window(camera: str, variant: str, lo: float, hi: float) -> None:
-    """Recompute stored ranges for [lo, hi], replacing whatever was there.
+    """Recompute stored ranges for [lo, hi], preserving coverage outside it.
 
-    Deleting the overlap and recomputing it (rather than appending) is what
-    makes the rollup self-healing: a segment row that arrives late, or a range
-    that was still growing when it was last written, is simply recomputed.
+    Deleting and recomputing (rather than appending) is what makes the rollup
+    self-healing: a segment row that arrives late, or a range that was still
+    growing when it was last written, is simply recomputed.
+
+    The subtlety is that stored ranges are *unclipped*, so a run of continuous
+    recording is one row that can extend far past this window on either side.
+    Deleting everything that overlaps [lo, hi] therefore throws away coverage
+    the recompute will not regenerate -- ``live_ranges`` only reports what its
+    own ``end_time >= lo`` / ``start_time <= hi`` filters admit. That is what
+    made the incremental rollup eat the table from the left, keeping only its
+    own window while the coverage row still claimed the whole span, so the live
+    fallback that would have hidden the damage never ran.
+
+    So the parts of a straddling range that lie outside the window are carried
+    across explicitly and merged back in, which also keeps a continuous run as a
+    single row instead of gaining a seam at every window boundary.
     """
+    overlapping = (
+        RecordingRanges.select(
+            RecordingRanges.start_time,
+            RecordingRanges.end_time,
+        )
+        .where(
+            RecordingRanges.camera == camera,
+            RecordingRanges.variant == variant,
+            RecordingRanges.end_time >= lo,
+            RecordingRanges.start_time <= hi,
+        )
+        .tuples()
+    )
+
+    carried: list[Range] = []
+
+    for row_start, row_end in overlapping:
+        if row_start < lo:
+            carried.append((row_start, lo))
+        if row_end > hi:
+            carried.append((hi, row_end))
+
     RecordingRanges.delete().where(
         RecordingRanges.camera == camera,
         RecordingRanges.variant == variant,
@@ -265,7 +300,8 @@ def _replace_window(camera: str, variant: str, lo: float, hi: float) -> None:
         RecordingRanges.start_time <= hi,
     ).execute()
 
-    rows = live_ranges([camera], lo, hi, variant, MATERIALIZED_GAP).get(camera, [])
+    fresh = live_ranges([camera], lo, hi, variant, MATERIALIZED_GAP).get(camera, [])
+    rows = merge_ranges(sorted(carried + fresh), MATERIALIZED_GAP)
 
     if rows:
         RecordingRanges.insert_many(
@@ -273,10 +309,10 @@ def _replace_window(camera: str, variant: str, lo: float, hi: float) -> None:
                 {
                     "camera": camera,
                     "variant": variant,
-                    "start_time": start,
-                    "end_time": end,
+                    "start_time": row_start,
+                    "end_time": row_end,
                 }
-                for start, end in rows
+                for row_start, row_end in rows
             ]
         ).execute()
 
