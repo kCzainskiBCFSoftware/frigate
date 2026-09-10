@@ -106,6 +106,32 @@ MAX_SEGMENT_DURATION = 600
 MAX_SEGMENTS_IN_CACHE = 6
 MAX_PLAYLIST_SECONDS = 7200  # support 2 hour segments for a single playlist to account for cameras with inconsistent segment times
 
+# API Values
+
+# Worker threads FastAPI uses for non-async (blocking) route handlers. anyio
+# defaults to 40, which is wrong for NAS-class hardware: peewee keeps connection
+# state thread-local, so each worker thread opens its own SQLite connection with
+# its own page cache, and the box is also recording every camera. Tunable per
+# device without a rebuild via FRIGATE_API_THREAD_POOL_SIZE.
+API_THREAD_POOL_SIZE = 4
+API_THREAD_POOL_SIZE_ENV_VAR = "FRIGATE_API_THREAD_POOL_SIZE"
+
+# Longest window the recordings range/hours endpoints will answer for. The
+# precomputed table makes a covered window cheap regardless of length, but an
+# uncovered one falls back to merging raw segments -- and a month across every
+# camera is millions of rows. Callers draw a day at a time.
+MAX_RANGES_WINDOW = 8 * 86400
+
+# Advertised on /api/config (alongside the build version) so clients can detect
+# fork-only endpoints without probing for 404s. Append only -- never rename or
+# remove a flag that has shipped. Feature names only: this is a public
+# repository, so no vendor or product name belongs here.
+FORK_FEATURES = [
+    "recording_variants",
+    "recordings_ranges",
+    "recordings_hours",
+]
+
 # Internal Comms Topics
 
 INSERT_MANY_RECORDINGS = "insert_many_recordings"

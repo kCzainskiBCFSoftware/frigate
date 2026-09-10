@@ -105,7 +105,16 @@ class EmbeddingMaintainer(threading.Thread):
             config.database.path,
             pragmas={
                 "auto_vacuum": "FULL",  # Does not defragment database
-                "cache_size": -512 * 1000,  # 512MB of cache
+                # 256MB page-cache ceiling (was 512MB). This process only does
+                # work when semantic search / face recognition / LPR are enabled, so
+                # the ceiling is largely untouched on installs that run none of them.
+                "cache_size": -256 * 1000,
+                # Read pages through an mmap of the db instead of copying them into
+                # this connection's private cache: the mapping is file-backed, so the
+                # kernel can reclaim it under memory pressure (SQLite's own page cache
+                # cannot be), and one mapping is shared by every connection reading the
+                # file rather than duplicated per connection.
+                "mmap_size": 256 * 1024 * 1024,
                 "journal_mode": "wal",  # required for synchronous=NORMAL to be crash-safe
                 "synchronous": "NORMAL",  # Safe when using WAL https://www.sqlite.org/pragma.html#pragma_synchronous
             },

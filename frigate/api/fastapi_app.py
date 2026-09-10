@@ -1,7 +1,9 @@
 import logging
+import os
 import re
 from typing import Optional
 
+import anyio.to_thread
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from joserfc.jwk import OctKey
@@ -31,12 +33,47 @@ from frigate.comms.event_metadata_updater import (
 )
 from frigate.config import FrigateConfig
 from frigate.config.camera.updater import CameraConfigUpdatePublisher
+from frigate.const import API_THREAD_POOL_SIZE, API_THREAD_POOL_SIZE_ENV_VAR
 from frigate.embeddings import EmbeddingsContext
 from frigate.ptz.onvif import OnvifController
 from frigate.stats.emitter import StatsEmitter
 from frigate.storage import StorageMaintainer
 
 logger = logging.getLogger(__name__)
+
+
+def _api_thread_pool_size() -> int:
+    """Number of worker threads for blocking (non-async) route handlers.
+
+    Blocking handlers -- the recordings queries, the VOD mapping, clip.mp4 --
+    are declared as plain `def` so FastAPI runs them here instead of on the
+    single event loop, where any one of them stalled every other request on the
+    box. The pool is deliberately small: each thread opens its own SQLite
+    connection (peewee connection state is thread-local) and the same hardware
+    is recording every camera, so anyio's default of 40 would trade one problem
+    for another."""
+    raw = os.environ.get(API_THREAD_POOL_SIZE_ENV_VAR)
+
+    if raw is None:
+        return API_THREAD_POOL_SIZE
+
+    try:
+        size = int(raw)
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid {API_THREAD_POOL_SIZE_ENV_VAR}={raw!r}, "
+            f"using {API_THREAD_POOL_SIZE}"
+        )
+        return API_THREAD_POOL_SIZE
+
+    if size < 1:
+        logger.warning(
+            f"Ignoring {API_THREAD_POOL_SIZE_ENV_VAR}={size} (must be >= 1), "
+            f"using {API_THREAD_POOL_SIZE}"
+        )
+        return API_THREAD_POOL_SIZE
+
+    return size
 
 
 def check_csrf(request: Request) -> bool:
@@ -106,6 +143,9 @@ def create_fastapi_app(
 
     @app.on_event("startup")
     async def startup():
+        anyio.to_thread.current_default_thread_limiter().total_tokens = (
+            _api_thread_pool_size()
+        )
         logger.info("FastAPI started")
 
     # Rate limiter (used for login endpoint)
