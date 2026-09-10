@@ -180,8 +180,8 @@ It is the entire compression ratio. Segments at `0–10`, `10.4–20.4`,
 
 **Send `gap=3` unless you have a reason not to.** It is the default.
 
-One implementation detail that leaks: ranges are precomputed merged at **1.0s**.
-Any `gap >= 1.0` is served from that precomputation. A `gap < 1.0` still works
+One implementation detail that leaks: ranges are precomputed merged at **2.0s**.
+Any `gap >= 2.0` is served from that precomputation. A `gap < 2.0` still works
 and is still correct, but takes a slower path — avoid it in a hot loop.
 
 ---

@@ -274,10 +274,21 @@ class TestRematerializedMerge(RangesTestBase):
         after, before = self.T, t + 100
         stored = live_ranges(["back"], after, before, "sub", MATERIALIZED_GAP)["back"]
 
-        for gap in (1.0, 2.0, 3.0, 5.0, 30.0, 120.0, 1000.0):
+        # only at or above MATERIALIZED_GAP: a finer gap wants splits the stored
+        # merge has already made, which is exactly why recording_ranges sends
+        # those callers down the live path instead
+        for gap in (MATERIALIZED_GAP, 3.0, 5.0, 30.0, 120.0, 1000.0):
             direct = reference_merge(segments, gap)
             rematerialized = merge_ranges(stored, gap)
             assert rematerialized == direct, (gap, rematerialized, direct)
+
+        # and the guard that keeps that contract honest: below the threshold the
+        # table must not be trusted
+        finer = MATERIALIZED_GAP / 2
+        assert merge_ranges(stored, finer) != reference_merge(segments, finer), (
+            "a gap below MATERIALIZED_GAP happened to round-trip; the fixture no "
+            "longer exercises the case recording_ranges routes to the live path"
+        )
 
     def test_merge_ranges_keeps_running_max(self):
         # same trap as the SQL: a wholly-contained later range must not pull the
@@ -576,6 +587,41 @@ class TestCoverageInvariant(RangesTestBase):
             backfill_ranges(self.config, now=now)
 
         self._assert_matches_live()
+
+    def test_backfill_preserves_coverage_it_walks_past(self):
+        # Backfill recomputes windows that already have stored coverage to their
+        # RIGHT, so an unbounded delete trades the left-edge bug for a
+        # right-edge one. Dense continuous footage across several days, checked
+        # after every backfill step rather than only at the end.
+        now = datetime.datetime.now().timestamp()
+        start = now - 3 * DAY
+        t = start
+        while t < now:
+            self.add(t, t + SEGMENT)
+            t += SEGMENT
+
+        for i in range(1, 31):
+            roll_up_ranges(self.config, now=now + i * 60)
+
+        for step in range(1, 6):
+            backfill_ranges(self.config, now=now)
+
+            coverage = RecordingRangeCoverage.get(
+                RecordingRangeCoverage.camera == "back",
+                RecordingRangeCoverage.variant == "sub",
+            )
+            a, b = coverage.covered_from, min(coverage.covered_to, now)
+            served = recording_ranges(["back"], a, b, "sub", 3.0)["back"]
+            live = live_ranges(["back"], a, b, "sub", 3.0)["back"]
+            st = sum(e - s for s, e in served)
+            lt = sum(e - s for s, e in live)
+
+            assert abs(st - lt) < 0.01, (
+                f"after backfill step {step}: stored reports {st:.0f}s inside "
+                f"claimed coverage [{(a - now) / 3600:.1f}h, {(b - now) / 3600:.1f}h], "
+                f"live reports {lt:.0f}s ({100 * (lt - st) / lt:.1f}% lost)"
+            )
+            assert served == live, f"step {step}: boundaries differ"
 
 
 class TestRetentionTrim(RangesTestBase):

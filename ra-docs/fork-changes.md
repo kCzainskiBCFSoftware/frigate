@@ -211,7 +211,8 @@ Client-facing API guide: `ra-docs/playback-timeline-api.md`.
   history a day per hour. Coverage is tracked explicitly so "no footage" is
   distinguishable from "not precomputed yet"; anything uncovered is merged live
   with the same SQL, so answers are correct from the first request.
-- Stored at `MATERIALIZED_GAP = 1.0s`; a caller's larger `gap` is served by
+- Stored at `MATERIALIZED_GAP = 2.0s` (tuned against measured fleet jitter; see
+  the postmortem); a caller's larger `gap` is served by
   re-merging, which is equivalent to merging the raw segments at that gap.
   A smaller gap falls through to the live path.
 - **`_replace_window` must preserve coverage outside the window it recomputes.**

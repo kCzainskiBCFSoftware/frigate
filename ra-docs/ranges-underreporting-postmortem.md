@@ -133,15 +133,50 @@ done
 
 Total hours must match between the two. They differed by 3.4× before the fix.
 
-## 6. Still open
+## 6. The two follow-ups, now measured
 
-- **`MATERIALIZED_GAP = 1.0` is mistuned for this hardware.** The device shows 34
-  inter-segment gaps above 1.0 s in 3.8 h, so a continuous run is stored as ~35
-  rows instead of 1. Purely storage bloat — read-time merging at `gap=3` still
-  returns one range, so the API is unaffected. Raising it to 2.0 would remove
-  nearly all of it, at the cost of sending callers who ask for `gap < 2.0` down
-  the live path. Deliberately **not** bundled into this fix.
-- **The 1–2 % shortfall on backfilled days** should be resolved by the
-  both-sides bounding, but that was inferred from the mechanism rather than
-  measured. Worth re-checking on the device once the backfill has re-walked
-  those days.
+Both were left open in the first pass and have since been measured rather than
+inferred.
+
+### The 1–2 % shortfall on backfilled days — same bug, confirmed
+
+A dense multi-day backfill replay, asserting the coverage invariant after every
+step, fails against the shipped code:
+
+```
+after backfill step 1: stored reports 87270s inside claimed coverage
+[-25.1h, 0.0h], live reports 90550s (3.6% lost)
+```
+
+Same order as the field-reported 1–2 %, and it passes after the fix. So the
+report's "secondary, much smaller" item was never a separate problem — it was
+the same delete, with backfill's geometry, losing coverage off the **right** edge
+of each window instead of the left. This is why the fix bounds the delete on both
+sides rather than only fixing the left. Guarded by
+`test_backfill_preserves_coverage_it_walks_past`.
+
+### `MATERIALIZED_GAP` — retuned to 2.0, and a camera fault found
+
+Measured across all 24 cameras × both variants:
+
+| threshold | stored rows/day, fleet | over 30 d retention |
+|---|---|---|
+| 1.0 s (as shipped) | 22,227 | ~667,000 |
+| 2.0 s (now) | 8,868 | ~266,000 |
+
+Most streams never exceed 1.0 s. **`4-Bullpen-2` alone produced ~16,700 of those
+22,227 rows/day** — three quarters of the fleet. Set to 2.0, which keeps a margin
+below the 3.0 s default callers send.
+
+Worth being clear about the severity: this was only ever storage and read cost,
+never correctness — read-time merging at `gap=3` returned the right answer
+throughout. 667k rows is ~2.5 % of the recordings table, and a day view read
+~22k rows against the 276k raw segments it replaces. It was over-flagged.
+
+**The genuinely important finding came out of measuring it.** `4-Bullpen-2` is
+writing **8.07 s segments instead of 10 s, with ~1.9 s holes between them, and
+covers only 80.6 % of wall-clock time** (4.71 h recorded out of 5.84 h). Its
+neighbour on the same device records 99.98 %. That is a recording fault on that
+camera, not a timeline artefact — the timeline was faithfully reporting it, and
+at `gap=3` those sub-3 s holes merge away so it never showed up in the UI. Worth
+investigating separately; nothing in this fix addresses it.

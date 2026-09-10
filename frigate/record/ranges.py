@@ -26,12 +26,18 @@ from frigate.record.variants import RECORDING_VARIANT_ALL
 logger = logging.getLogger(__name__)
 
 # Gap the stored ranges are merged at. Frigate's 10s segments are meant to abut
-# exactly but the encoder leaves a few hundred ms of jitter between them, which
-# is not a recording gap -- treating it as one would store ~8,640 ranges per
-# camera-day instead of ~40 and defeat the whole point. 1.0s absorbs the jitter
-# while staying below any gap a caller is likely to ask for, so a caller's gap
-# can be served by re-merging these rows (see merge_ranges).
-MATERIALIZED_GAP = 1.0
+# exactly but the encoder leaves jitter between them, which is not a recording
+# gap -- treating it as one would store ~8,640 ranges per camera-day instead of
+# ~40 and defeat the whole point. It has to stay at or below the smallest gap a
+# caller asks for, since anything below it falls through to the live path
+# (see recording_ranges).
+#
+# Measured across a 24-camera dual-stream fleet: most streams never exceed 1.0s,
+# but a camera writing short segments (8.1s median instead of 10s, with ~1.9s
+# holes) produced ~8,200 rows/day on its own at a 1.0s threshold -- three
+# quarters of the whole fleet's row count. 2.0 absorbs that while keeping a
+# margin below the 3.0s default callers send.
+MATERIALIZED_GAP = 2.0
 
 # How far back the first rollup for a camera reaches. Kept small so a fresh
 # install does not scan its entire retained history on the first tick; the
