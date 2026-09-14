@@ -93,7 +93,7 @@ react-i18next (`t()`) with English source in `web/public/locales/en/` — enforc
 ## Fork-specific work: dual-stream recording + dual retention
 
 This branch adds recording of both main and sub camera streams as distinct "variants", each with its
-own retention. **`fork-changes.md` (repo root) is the canonical changelog — read/update it for the full
+own retention. **`ra-docs/fork-changes.md` is the canonical changelog — read/update it for the full
 list.** Key pieces:
 - `frigate/record/variants.py` — variant constants (`main`/`sub`/`all`) and query helpers (incl.
   `resolve_playback_variant` fallback). Defaults: playback uses `sub`, snapshots use `main`.

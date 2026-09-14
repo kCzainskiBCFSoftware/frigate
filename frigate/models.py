@@ -1,4 +1,5 @@
 from peewee import (
+    AutoField,
     BlobField,
     BooleanField,
     CharField,
@@ -174,3 +175,47 @@ class Trigger(Model):
 
     class Meta:
         primary_key = CompositeKey("camera", "name")
+
+
+class RecordingRanges(Model):
+    """Contiguous runs of recording coverage, precomputed from ``recordings``.
+
+    The playback timeline needs "which parts of this day have footage", which
+    means merging ~8,640 segment rows per camera-day into ~40 ranges. Doing that
+    per request across every camera on a device reads hundreds of thousands of
+    rows, so a rollup keeps the merged answer here instead
+    (see ``frigate.record.ranges``).
+
+    Ranges are merged at a fixed ``MATERIALIZED_GAP``; a caller asking for a
+    larger gap is served by re-merging these, which is equivalent to merging the
+    raw segments at that gap.
+    """
+
+    id = AutoField()
+    camera = CharField(max_length=20)
+    variant = CharField(default="main", max_length=20)
+    start_time = DateTimeField()
+    end_time = DateTimeField()
+
+    class Meta:
+        table_name = "recording_ranges"
+        indexes = ((("camera", "variant", "start_time", "end_time"), False),)
+
+
+class RecordingRangeCoverage(Model):
+    """How much of the timeline ``recording_ranges`` actually speaks for.
+
+    Without this, a day with no footage is indistinguishable from a day the
+    rollup has not reached yet, and the API would silently report gaps that are
+    really just missing precomputation. A window outside this range falls back
+    to merging ``recordings`` live.
+    """
+
+    camera = CharField(max_length=20)
+    variant = CharField(max_length=20)
+    covered_from = DateTimeField()
+    covered_to = DateTimeField()
+
+    class Meta:
+        table_name = "recording_range_coverage"
+        primary_key = CompositeKey("camera", "variant")

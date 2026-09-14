@@ -140,6 +140,115 @@ before because the underlying data was never per-variant:
 
 ---
 
+## 2.6 Playback timeline: merged ranges and hour buckets (new)
+
+> Full integration guide, self-contained for client implementers:
+> **`ra-docs/playback-timeline-api.md`**.
+
+`GET /api/{camera}/recordings` answers "what segments exist" — ~8,640 rows of
+12 fields per camera-day, about 2 MB, when what a timeline needs is ~40
+`{start, end}` pairs. These three endpoints answer the timeline question
+directly. They are **additive**; nothing about the existing endpoints changed.
+
+Detect support without probing for 404s: `GET /api/config` now carries a
+top-level `fork` key.
+
+```json
+"fork": {"version": "0.17.2-abc1234",
+         "features": ["recording_variants", "recordings_hours", "recordings_ranges"]}
+```
+
+### `GET /api/{camera}/recordings/ranges`
+
+Merged coverage for one camera.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `after` / `before` | last hour | window, unix seconds |
+| `variant` | `sub` | `main` / `sub` / `all`, same fallback as the other endpoints |
+| `gap` | `3.0` | holes ≤ this many seconds are merged (see below) |
+
+```json
+[{"start": 1787813986.0, "end": 1787814015.999674},
+ {"start": 1787815176.0, "end": 1787819999.5}]
+```
+
+The variant actually served is returned in the **`X-Recording-Variant`**
+response header, since the fallback can pick the other variant.
+
+### `GET /api/recordings/ranges`
+
+The same thing for many cameras in one request, so a multi-camera day view is
+one round trip rather than one per camera.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `cameras` | `all` | comma-separated, intersected with what the caller may see |
+| `after` / `before` / `variant` / `gap` | as above | |
+
+```json
+{"ranges":   {"front": [{"start": 1787813986.0, "end": 1787814015.999674}],
+              "back":  []},
+ "variants": {"front": "sub", "back": "main"}}
+```
+
+`variants` is per camera because the fallback is per camera: a camera whose
+history predates the dual-stream upgrade answers for `main` while its
+neighbours answer for `sub`. A camera with no footage gets an empty list, not a
+missing key and not an error.
+
+### `GET /api/recordings/hours`
+
+24 booleans per camera-day — coarse, but far cheaper over long windows, so it
+suits a calendar or a first paint before exact ranges arrive.
+
+| Param | Default |
+|---|---|
+| `cameras` / `after` / `before` / `variant` | as above |
+| `timezone` | `utc` — buckets are local hours, DST handled |
+
+```json
+{"front": {"2026-09-06": [0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}
+```
+
+### Semantics that matter
+
+- **`gap` is a presentation decision, so the caller owns it.** Frigate's ~10s
+  segments are meant to abut exactly, but the encoder leaves a few hundred ms
+  between them. That is not a recording gap. `gap` is the threshold separating
+  jitter (merge it) from a real outage (keep it visible). At `gap=0` a
+  camera-day is ~8,640 ranges; at `gap=3` it is ~40; at `gap=600` a real
+  five-minute outage disappears.
+- **Ranges are merged on a running `max(end)`.** Segments do overlap in the
+  field, and merging on the previous row's end instead would drag a range's end
+  backwards and drop real footage off the end of the timeline.
+- **Ranges straddling the window edge are returned whole, not clipped.** Clamp
+  client-side if you need them clipped; dropping a segment that starts before
+  `after` leaves a visible hole at midnight.
+- **Both endpoints cap the window** at `MAX_RANGES_WINDOW` (8 days) and return
+  422 beyond it. Draw a day at a time.
+- **`Cache-Control` is set**: `max-age=60, stale-while-revalidate=300` once the
+  window is fully in the past, `max-age=5` while it still touches now. Not
+  `immutable` — retention deletes footage out from under past windows.
+
+### Where the answer comes from
+
+Ranges are precomputed. `RecordingCleanup` merges settled windows into
+`recording_ranges` on its existing 60s tick and walks history backwards a day
+per hour; `recording_range_coverage` records how much of the timeline those
+rows speak for. A window outside that coverage is merged live from
+`recordings` with the same SQL, so **the answer is correct from the first
+request** — a freshly upgraded device is simply slower for the days the
+backfill has not reached yet. Nothing to wait for and nothing to trigger.
+
+Hour buckets are computed independently of the rollup (a loose index scan that
+touches ~one row per hour-with-footage), so they are fast on any window
+regardless of what has been precomputed. They key on a segment's `start_time`,
+so a segment spanning an hour boundary marks only the hour it began in — a
+sub-10s imprecision, matching `GET /api/recordings/summary`.
+
+---
+
 ## 3. Impact on the things you mentioned
 
 > *"I use both export, live playback view, thumbnails, previews etc."*
@@ -271,6 +380,9 @@ If you build any of the following, here is what to consider:
 | Live MJPEG | `GET /api/{camera}` | n/a | n/a |
 | Latest frame | `GET /api/{camera}/latest.{ext}` | n/a | n/a |
 | Daily availability summary | `GET /api/recordings/summary` (no camera) | n/a (not filtered) | n/a |
+| **Timeline for one camera** | `GET /api/{camera}/recordings/ranges` | `sub` | Yes |
+| **Timeline for many cameras** | `GET /api/recordings/ranges` | `sub` | Yes |
+| **Hour buckets, many cameras** | `GET /api/recordings/hours` | `sub` | Yes |
 
 ---
 
@@ -329,9 +441,18 @@ The `recordings` table gained these columns (migration 033):
 | `bitrate` | INTEGER | YES | Bits per second. May be null for legacy rows. |
 | `transcoded_from_main` | INTEGER | NO | Default `0`. Reserved for an optional Phase-2 transcoding feature; always `0` today. |
 
-New indexes:
-- `recordings_variant (variant)`
+New indexes (migration 033):
 - `recordings_camera_variant_start_time_end_time (camera, variant, start_time DESC, end_time DESC)`
+- ~~`recordings_variant (variant)`~~ — added by 033, then **dropped by migration
+  034**. With only two distinct values it was a query-planner trap (SQLite could
+  pick it for variant-filtered playback and scan half the table via random row
+  lookups) and pure write amplification on the segment-insert hot path. Camera
+  lookups are served by the composite indexes, which lead with `camera`.
+
+New tables (migration 035), for the precomputed playback timeline — see §2.6.
+You should not need to query these directly; use `/api/recordings/ranges`:
+- `recording_ranges (id, camera, variant, start_time, end_time)`
+- `recording_range_coverage (camera, variant, covered_from, covered_to)`
 
 If you have external SQL queries against `recordings`, decide whether you
 want to add `AND variant = 'main'` (or `'sub'`) to them. Without the filter,

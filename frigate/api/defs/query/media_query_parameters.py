@@ -55,6 +55,22 @@ class MediaRecordingsSummaryQueryParams(BaseModel):
     cameras: Optional[str] = "all"
 
 
+class MediaRecordingsRangesQueryParams(BaseModel):
+    cameras: Optional[str] = "all"
+    before: Union[float, SkipJsonSchema[None]] = None
+    after: Union[float, SkipJsonSchema[None]] = None
+    # Holes smaller than this are encoder jitter between abutting segments, not
+    # a recording gap. A presentation decision, so the caller owns it.
+    gap: float = 3.0
+
+
+class MediaRecordingsHoursQueryParams(BaseModel):
+    timezone: str = "utc"
+    cameras: Optional[str] = "all"
+    before: Union[float, SkipJsonSchema[None]] = None
+    after: Union[float, SkipJsonSchema[None]] = None
+
+
 class MediaRecordingsAvailabilityQueryParams(BaseModel):
     cameras: str = "all"
     before: Union[float, SkipJsonSchema[None]] = None

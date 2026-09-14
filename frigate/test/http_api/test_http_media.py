@@ -1,5 +1,8 @@
 """Unit tests for recordings/media API endpoints."""
 
+import inspect
+import time
+import unittest
 from datetime import datetime, timezone
 
 import pytz
@@ -7,7 +10,12 @@ from fastapi import Request
 
 from frigate.api.auth import get_allowed_cameras_for_filter, get_current_user
 from frigate.const import MAX_SEGMENT_DURATION
-from frigate.models import Event, Recordings
+from frigate.models import (
+    Event,
+    RecordingRangeCoverage,
+    RecordingRanges,
+    Recordings,
+)
 from frigate.record.variants import apply_variant_filter, recordings_overlap_clause
 from frigate.test.http_api.base_http_test import AuthTestClient, BaseTestHttp
 
@@ -733,6 +741,268 @@ class TestHttpVodVariants(BaseTestHttp):
             assert gap.json() == []
 
 
+class TestRecordingRangesApi(BaseTestHttp):
+    """The endpoints that replace shipping every segment row to the client."""
+
+    # fixed, far-past window so the cache/settled logic is deterministic
+    T = 1700000000.0
+
+    def setUp(self):
+        super().setUp([Event, Recordings, RecordingRanges, RecordingRangeCoverage])
+        self.app = super().create_app()
+
+        async def mock_get_current_user(request: Request):
+            return {"username": "admin", "role": "admin"}
+
+        self.app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        async def mock_get_allowed_cameras_for_filter(request: Request):
+            return ["front_door", "side_door"]
+
+        self.app.dependency_overrides[get_allowed_cameras_for_filter] = (
+            mock_get_allowed_cameras_for_filter
+        )
+        self._row = 0
+
+    def tearDown(self):
+        self.app.dependency_overrides.clear()
+        super().tearDown()
+
+    def _run(self, start, count, camera="front_door", variant="sub"):
+        for i in range(count):
+            self._row += 1
+            self.insert_mock_recording(
+                f"rg-{self._row}",
+                start + i * 10,
+                start + i * 10 + 10,
+                camera=camera,
+                variant=variant,
+                path=f"/rg/{self._row}",
+            )
+
+    def test_camera_ranges_returns_bare_array_and_variant_header(self):
+        self._run(self.T, 6)
+        self._run(self.T + 600, 6)
+
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                f"/front_door/recordings/ranges?after={self.T}&before={self.T + 2000}&gap=3"
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert isinstance(body, list)
+        assert [sorted(r) for r in body] == [["end", "start"]] * len(body)
+        assert len(body) == 2, body
+        assert body[0]["start"] == self.T
+        assert response.headers["x-recording-variant"] == "sub"
+        assert "max-age" in response.headers["cache-control"]
+
+    def test_batch_ranges_returns_ranges_and_variants(self):
+        self._run(self.T, 6, camera="front_door")
+        self._run(self.T, 3, camera="side_door")
+
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                f"/recordings/ranges?after={self.T}&before={self.T + 2000}&gap=3"
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert set(body) == {"ranges", "variants"}
+        assert set(body["ranges"]) == {"front_door", "side_door"}
+        assert body["variants"]["front_door"] == "sub"
+        assert len(body["ranges"]["front_door"]) == 1
+        assert len(body["ranges"]["side_door"]) == 1
+
+    def test_batch_ranges_reports_per_camera_variant_fallback(self):
+        # front_door has sub, side_door only has main (history predating the
+        # dual-stream upgrade) -- the response has to say so per camera
+        self._run(self.T, 3, camera="front_door", variant="sub")
+        self._run(self.T, 3, camera="side_door", variant="main")
+
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                f"/recordings/ranges?after={self.T}&before={self.T + 2000}&variant=sub"
+            )
+
+        body = response.json()
+        assert body["variants"] == {"front_door": "sub", "side_door": "main"}
+        assert body["ranges"]["side_door"]
+
+    def test_camera_with_no_footage_is_an_empty_list_not_an_error(self):
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                f"/front_door/recordings/ranges?after={self.T}&before={self.T + 2000}"
+            )
+
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_window_too_large_is_rejected(self):
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                f"/recordings/ranges?after={self.T}&before={self.T + 40 * 86400}"
+            )
+
+        assert response.status_code == 422
+
+    def test_ranges_are_unclipped_at_window_edges(self):
+        self.insert_mock_recording(
+            "edge-a", self.T - 60, self.T + 10, variant="sub", path="/edge/a"
+        )
+        self.insert_mock_recording(
+            "edge-b", self.T + 990, self.T + 1060, variant="sub", path="/edge/b"
+        )
+
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                f"/front_door/recordings/ranges?after={self.T}&before={self.T + 1000}"
+            )
+
+        body = response.json()
+        assert body[0]["start"] < self.T
+        assert body[-1]["end"] > self.T + 1000
+
+    def test_hours_marks_only_hours_with_footage(self):
+        # 02:00 and 05:00 UTC on the day containing T
+        day_start = self.T - (self.T % 86400)
+        self._run(day_start + 2 * 3600, 6)
+        self._run(day_start + 5 * 3600, 6)
+
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                f"/recordings/hours?after={day_start}&before={day_start + 86400}"
+                "&timezone=utc&cameras=front_door"
+            )
+
+        assert response.status_code == 200
+        days = response.json()["front_door"]
+        assert len(days) == 1
+        buckets = next(iter(days.values()))
+        assert len(buckets) == 24
+        assert [i for i, v in enumerate(buckets) if v] == [2, 5]
+
+    def test_hours_agrees_with_ranges(self):
+        day_start = self.T - (self.T % 86400)
+        for hour in (0, 3, 4, 23):
+            self._run(day_start + hour * 3600, 6)
+
+        with AuthTestClient(self.app) as client:
+            hours = client.get(
+                f"/recordings/hours?after={day_start}&before={day_start + 86400}"
+                "&timezone=utc&cameras=front_door"
+            ).json()["front_door"]
+            ranges = client.get(
+                f"/front_door/recordings/ranges?after={day_start}"
+                f"&before={day_start + 86400}"
+            ).json()
+
+        marked = {
+            i for buckets in hours.values() for i, value in enumerate(buckets) if value
+        }
+        from_ranges = {int((r["start"] - day_start) // 3600) for r in ranges}
+
+        assert marked == from_ranges, (marked, from_ranges)
+
+    def test_hours_empty_selection_is_empty_object(self):
+        with AuthTestClient(self.app) as client:
+            response = client.get("/recordings/hours?cameras=nope")
+
+        assert response.status_code == 200
+        assert response.json() == {}
+
+
+class TestPlaybackHandlerConcurrency(unittest.TestCase):
+    """The blocking playback handlers must not run on the event loop.
+
+    uvicorn serves the API from a single process with a single event loop, so a
+    handler declared `async def` that then does blocking SQLite / ffprobe /
+    ffmpeg work stalls every other request on the box for its duration --
+    including live view, and including the other players in a multi-camera
+    view. Declared as plain `def`, FastAPI runs them in the worker threadpool
+    instead. This is easy to undo by accident, hence the guard.
+
+    Introspection only, so it deliberately skips the migrating DB fixture."""
+
+    def test_playback_handlers_are_not_coroutines(self):
+        from frigate.api import media
+
+        for name in (
+            "recordings",
+            "recordings_summary",
+            "get_snapshot_from_recording",
+            "no_recordings",
+            "recording_clip",
+            "_recording_clip",
+            "vod_ts",
+            "_vod_ts",
+            "vod_hour",
+            "vod_hour_no_timezone",
+            "vod_clip",
+        ):
+            handler = getattr(media, name)
+            assert not inspect.iscoroutinefunction(handler), (
+                f"{name} is a coroutine: it would run its blocking work on the "
+                f"event loop and serialize every other API request"
+            )
+
+    def test_vod_event_stays_async(self):
+        # the exception to the rule: vod_event awaits require_camera_access,
+        # which is async, so it stays a coroutine and hands the blocking halves
+        # to the threadpool itself
+        from frigate.api import media
+
+        assert inspect.iscoroutinefunction(media.vod_event)
+        assert inspect.iscoroutinefunction(media.event_clip)
+
+
+class TestVodMappingCacheability(BaseTestHttp):
+    """nginx-vod caches a mapping only when the response says it may.
+
+    A non-cacheable mapping is re-requested for every single segment, so each
+    one repeats the recordings query and the keyframe probe -- multiplied by
+    the number of concurrent players."""
+
+    def setUp(self):
+        super().setUp([Event, Recordings])
+        self.app = super().create_app()
+
+    def tearDown(self):
+        self.app.dependency_overrides.clear()
+        super().tearDown()
+
+    def _cache_flag(self, start_ts, end_ts):
+        self.insert_mock_recording(
+            f"c-{start_ts}",
+            start_ts,
+            start_ts + 20,
+            variant="sub",
+            path=f"/c/{start_ts}",
+        )
+        with AuthTestClient(self.app) as client:
+            response = client.get(f"/vod/front_door/start/{start_ts}/end/{end_ts}/sub")
+        assert response.status_code == 200, response.text
+        return response.json()["cache"]
+
+    def test_settled_window_is_cacheable(self):
+        now = time.time()
+        start = now - 7200
+        assert self._cache_flag(start, start + 3600) is True
+
+    def test_window_still_being_written_is_not_cacheable(self):
+        # ends "now", so a segment can still land inside it
+        now = time.time()
+        assert self._cache_flag(now - 3600, now) is False
+
+    def test_boundary_is_max_segment_duration_from_now(self):
+        # a window that ended less than MAX_SEGMENT_DURATION ago is still
+        # exposed to a late-arriving segment row, so it must not be cached
+        now = time.time()
+        just_inside = now - (MAX_SEGMENT_DURATION / 2)
+        assert self._cache_flag(just_inside - 3600, just_inside) is False
+
+
 class TestRecordingsOverlapQuery(BaseTestHttp):
     """DB-level guarantees for the seekable recordings overlap predicate."""
 
@@ -802,10 +1072,32 @@ class TestRecordingsOverlapQuery(BaseTestHttp):
     def test_query_plan_seeks_composite_index(self):
         # regression guard: the playback query shape must range-seek the
         # (camera, variant, start_time, end_time) index, not walk the whole
-        # camera+variant partition
-        self.insert_mock_recording(
-            "qp-1", self.T, self.T + 20, variant="sub", path="/qp/1"
-        )
+        # camera+variant partition.
+        #
+        # Populate both variants across two cameras and ANALYZE before asking
+        # for the plan. With a single row and no sqlite_stat1 the planner has
+        # no basis to prefer the variant composite over
+        # recordings_camera_start_time_end_time, so the assertion below came
+        # down to a tie-break and failed depending on which other test modules
+        # had run first. Production always has statistics -- they are refreshed
+        # at startup and hourly by RecordingCleanup.refresh_recordings_stats --
+        # so seeding them here is both deterministic and closer to real life.
+        row = 0
+        for camera in ("front_door", "side_door"):
+            for variant in ("main", "sub"):
+                for i in range(50):
+                    row += 1
+                    start = self.T + i * 20
+                    self.insert_mock_recording(
+                        f"qp-{row}",
+                        start,
+                        start + 20,
+                        camera=camera,
+                        variant=variant,
+                        path=f"/qp/{row}",
+                    )
+        self.db.execute_sql("ANALYZE")
+
         query = apply_variant_filter(
             Recordings.select(Recordings.id).where(
                 Recordings.camera == "front_door",

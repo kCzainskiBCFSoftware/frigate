@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, Path, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pathvalidate import sanitize_filename
 from peewee import DoesNotExist, fn, operator
+from starlette.concurrency import run_in_threadpool
 from tzlocal import get_localzone_name
 
 from frigate.api.auth import (
@@ -33,6 +34,8 @@ from frigate.api.defs.query.media_query_parameters import (
     MediaLatestFrameQueryParams,
     MediaMjpegFeedQueryParams,
     MediaRecordingsAvailabilityQueryParams,
+    MediaRecordingsHoursQueryParams,
+    MediaRecordingsRangesQueryParams,
     MediaRecordingsSummaryQueryParams,
 )
 from frigate.api.defs.tags import Tags
@@ -43,11 +46,13 @@ from frigate.const import (
     CACHE_DIR,
     CLIPS_DIR,
     INSTALL_DIR,
+    MAX_RANGES_WINDOW,
     MAX_SEGMENT_DURATION,
     PREVIEW_FRAME_TYPE,
     RECORD_DIR,
 )
 from frigate.models import Event, Previews, Recordings, Regions, ReviewSegment
+from frigate.record.ranges import recording_ranges
 from frigate.record.variants import (
     DEFAULT_PLAYBACK_VARIANT,
     DEFAULT_SNAPSHOT_VARIANT,
@@ -261,7 +266,7 @@ async def latest_frame(
     "/{camera_name}/recordings/{frame_time}/snapshot.{format}",
     dependencies=[Depends(require_camera_access)],
 )
-async def get_snapshot_from_recording(
+def get_snapshot_from_recording(
     request: Request,
     camera_name: str,
     frame_time: float,
@@ -632,10 +637,238 @@ def all_recordings_summary(
     return JSONResponse(content=dict(sorted(days.items())))
 
 
+# Loose ("skip") index scan at hour granularity -- the day-granularity sibling
+# of RECORDINGS_SUMMARY_SCAN_SQL above. Walks one recording per local hour using
+# the (camera, variant, start_time) index, jumping straight to the next hour's
+# first segment instead of scanning every ~10s segment row, so a month costs
+# ~720 rows per camera rather than ~250,000. ``:off`` is the period's constant
+# UTC offset (seconds). Placeholders (in order): camera, variant, period_start,
+# period_end, camera, variant, period_end, off, off, hour_mod, minute_mod.
+RECORDINGS_HOUR_SCAN_SQL = """
+WITH RECURSIVE scan(ts) AS (
+    SELECT MIN(start_time) FROM recordings
+     WHERE camera = ? AND variant = ? AND start_time BETWEEN ? AND ?
+  UNION ALL
+    SELECT (
+        SELECT MIN(start_time) FROM recordings
+         WHERE camera = ? AND variant = ? AND start_time <= ?
+           AND start_time >= ((CAST((scan.ts + ?) / 3600 AS INT) + 1) * 3600 - ?)
+    )
+    FROM scan WHERE scan.ts IS NOT NULL
+)
+SELECT DISTINCT strftime('%Y-%m-%d %H', datetime(ts, 'unixepoch', ?, ?)) AS hour
+FROM scan WHERE ts IS NOT NULL
+"""
+
+
+def _resolve_range_window(after: Optional[float], before: Optional[float]):
+    """Default and validate a [after, before] window. Returns (after, before)."""
+    resolved_before = before if before is not None else datetime.now().timestamp()
+    resolved_after = (
+        after
+        if after is not None
+        else (datetime.now() - timedelta(hours=1)).timestamp()
+    )
+    return resolved_after, resolved_before
+
+
+def _range_cache_control(before: float) -> str:
+    """Past windows are stable; a window touching now still gains segments."""
+    if before < datetime.now().timestamp() - MAX_SEGMENT_DURATION:
+        # not immutable -- retention deletes footage out from under past windows
+        return "public, max-age=60, stale-while-revalidate=300"
+
+    return "public, max-age=5"
+
+
+def _ranges_by_camera(
+    camera_list: List[str], after: float, before: float, variant: str, gap: float
+):
+    """Resolve the variant per camera, then merge, grouping the queries.
+
+    The variant fallback is per camera -- a camera whose history predates the
+    dual-stream upgrade answers for "main" while its neighbours answer for
+    "sub" -- so cameras are grouped by the variant actually served and each
+    group takes one query.
+    """
+    variants = {
+        camera: resolve_playback_variant(camera, variant, after, before)
+        for camera in camera_list
+    }
+
+    grouped: dict[str, list[str]] = {}
+    for camera, selected in variants.items():
+        grouped.setdefault(selected, []).append(camera)
+
+    ranges: dict[str, list] = {}
+    for selected, cameras in grouped.items():
+        ranges.update(recording_ranges(cameras, after, before, selected, gap))
+
+    return ranges, variants
+
+
+@router.get("/recordings/ranges", dependencies=[Depends(allow_any_authenticated())])
+def all_recordings_ranges(
+    request: Request,
+    params: MediaRecordingsRangesQueryParams = Depends(),
+    variant: VariantListParam = DEFAULT_PLAYBACK_VARIANT,
+    allowed_cameras: List[str] = Depends(get_allowed_cameras_for_filter),
+):
+    """Merged recording coverage for many cameras in one request.
+
+    Answers the timeline question -- which parts of this window have footage --
+    directly, instead of making the caller download every segment row and merge
+    them. Ranges straddling the window edge are returned whole; clamp on the
+    client if you need them clipped."""
+    camera_list = _resolve_summary_camera_list(params.cameras, allowed_cameras)
+
+    if not camera_list:
+        return JSONResponse(content={"ranges": {}, "variants": {}})
+
+    after, before = _resolve_range_window(params.after, params.before)
+
+    if before - after > MAX_RANGES_WINDOW:
+        return JSONResponse(
+            content={
+                "success": False,
+                "message": f"Window exceeds the {MAX_RANGES_WINDOW}s maximum",
+            },
+            status_code=422,
+        )
+
+    ranges, variants = _ranges_by_camera(
+        camera_list, after, before, variant, params.gap
+    )
+
+    return JSONResponse(
+        content={
+            "ranges": {
+                camera: [{"start": start, "end": end} for start, end in rows]
+                for camera, rows in ranges.items()
+            },
+            "variants": variants,
+        },
+        headers={"Cache-Control": _range_cache_control(before)},
+    )
+
+
+@router.get(
+    "/{camera_name}/recordings/ranges",
+    dependencies=[Depends(require_camera_access)],
+    description="Merged recording coverage for one camera. Consecutive segments closer together than 'gap' seconds are one range; ranges straddling the window edge are returned whole. The variant actually served is returned in the X-Recording-Variant header.",
+)
+def camera_recordings_ranges(
+    camera_name: str,
+    params: MediaRecordingsRangesQueryParams = Depends(),
+    variant: VariantListParam = DEFAULT_PLAYBACK_VARIANT,
+):
+    after, before = _resolve_range_window(params.after, params.before)
+
+    if before - after > MAX_RANGES_WINDOW:
+        return JSONResponse(
+            content={
+                "success": False,
+                "message": f"Window exceeds the {MAX_RANGES_WINDOW}s maximum",
+            },
+            status_code=422,
+        )
+
+    ranges, variants = _ranges_by_camera(
+        [camera_name], after, before, variant, params.gap
+    )
+
+    return JSONResponse(
+        content=[
+            {"start": start, "end": end} for start, end in ranges.get(camera_name, [])
+        ],
+        headers={
+            "Cache-Control": _range_cache_control(before),
+            "X-Recording-Variant": variants.get(camera_name, variant),
+        },
+    )
+
+
+@router.get("/recordings/hours", dependencies=[Depends(allow_any_authenticated())])
+def all_recordings_hours(
+    request: Request,
+    params: MediaRecordingsHoursQueryParams = Depends(),
+    variant: VariantListParam = DEFAULT_PLAYBACK_VARIANT,
+    allowed_cameras: List[str] = Depends(get_allowed_cameras_for_filter),
+):
+    """24 booleans per camera-day saying which local hours have footage.
+
+    Coarser than /recordings/ranges and much cheaper over long windows: it
+    touches roughly one row per hour-with-footage rather than every segment, so
+    a month of calendar data stays affordable.
+
+    Buckets key on a segment's start_time only, so a segment spanning an hour
+    boundary marks just the hour it started in -- a sub-10s imprecision at the
+    boundary, matching /recordings/summary."""
+    camera_list = _resolve_summary_camera_list(params.cameras, allowed_cameras)
+
+    if not camera_list:
+        return JSONResponse(content={})
+
+    after, before = _resolve_range_window(params.after, params.before)
+
+    if before - after > MAX_RANGES_WINDOW:
+        return JSONResponse(
+            content={
+                "success": False,
+                "message": f"Window exceeds the {MAX_RANGES_WINDOW}s maximum",
+            },
+            status_code=422,
+        )
+
+    database = Recordings._meta.database
+    result: dict[str, dict[str, list[int]]] = {}
+
+    for camera in camera_list:
+        selected = resolve_playback_variant(camera, variant, after, before)
+        days: dict[str, list[int]] = {}
+
+        for period_start, period_end, period_offset in get_dst_transitions(
+            params.timezone, after, before
+        ):
+            hours_offset = int(period_offset / 60 / 60)
+            minutes_offset = int(period_offset / 60 - hours_offset * 60)
+            offset_seconds = int(period_offset)
+
+            cursor = database.execute_sql(
+                RECORDINGS_HOUR_SCAN_SQL,
+                (
+                    camera,
+                    selected,
+                    period_start,
+                    period_end,
+                    camera,
+                    selected,
+                    period_end,
+                    offset_seconds,
+                    offset_seconds,
+                    f"{hours_offset} hour",
+                    f"{minutes_offset} minute",
+                ),
+            )
+
+            for (bucket,) in cursor.fetchall():
+                if bucket is None:
+                    continue
+
+                day, hour = bucket.split(" ")
+                days.setdefault(day, [0] * 24)[int(hour)] = 1
+
+        result[camera] = dict(sorted(days.items()))
+
+    return JSONResponse(
+        content=result, headers={"Cache-Control": _range_cache_control(before)}
+    )
+
+
 @router.get(
     "/{camera_name}/recordings/summary", dependencies=[Depends(require_camera_access)]
 )
-async def recordings_summary(
+def recordings_summary(
     camera_name: str,
     timezone: str = "utc",
     variant: VariantListParam = DEFAULT_PLAYBACK_VARIANT,
@@ -752,7 +985,7 @@ async def recordings_summary(
 
 
 @router.get("/{camera_name}/recordings", dependencies=[Depends(require_camera_access)])
-async def recordings(
+def recordings(
     camera_name: str,
     after: float = (datetime.now() - timedelta(hours=1)).timestamp(),
     before: float = datetime.now().timestamp(),
@@ -790,7 +1023,7 @@ async def recordings(
     response_model=list[dict],
     dependencies=[Depends(allow_any_authenticated())],
 )
-async def no_recordings(
+def no_recordings(
     request: Request,
     params: MediaRecordingsAvailabilityQueryParams = Depends(),
     allowed_cameras: List[str] = Depends(get_allowed_cameras_for_filter),
@@ -872,13 +1105,27 @@ async def no_recordings(
     dependencies=[Depends(require_camera_access)],
     description="For iOS devices, use the master.m3u8 HLS link instead of clip.mp4. Safari does not reliably process progressive mp4 files.",
 )
-async def recording_clip(
+def recording_clip(
     request: Request,
     camera_name: str,
     start_ts: float,
     end_ts: float,
     variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
+    return _recording_clip(request, camera_name, start_ts, end_ts, variant)
+
+
+def _recording_clip(
+    request: Request,
+    camera_name: str,
+    start_ts: float,
+    end_ts: float,
+    variant: str = DEFAULT_PLAYBACK_VARIANT,
+):
+    """Blocking body of the clip.mp4 route.
+
+    Split out so async callers (event_clip) can reach it through
+    run_in_threadpool without the route itself having to be a coroutine."""
     request_start = time.monotonic()
     perf = {
         "endpoint": "clip.mp4",
@@ -1031,13 +1278,28 @@ async def recording_clip(
     dependencies=[Depends(require_camera_access)],
     description="Returns an HLS playlist for the specified timestamp-range on the specified camera. Append /master.m3u8 or /index.m3u8 for HLS playback. NOTE: ?variant= only reaches this endpoint when called directly; through nginx HLS playback use the /{variant} path form.",
 )
-async def vod_ts(
+def vod_ts(
     camera_name: str,
     start_ts: float,
     end_ts: float,
     force_discontinuity: bool = False,
     variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
+    return _vod_ts(camera_name, start_ts, end_ts, force_discontinuity, variant)
+
+
+def _vod_ts(
+    camera_name: str,
+    start_ts: float,
+    end_ts: float,
+    force_discontinuity: bool = False,
+    variant: str = DEFAULT_PLAYBACK_VARIANT,
+) -> JSONResponse:
+    """Blocking body of the VOD mapping route.
+
+    nginx-vod-module calls this as its mapping subrequest, potentially once per
+    segment, so it is the hottest handler during playback. Split out so the
+    sibling VOD routes and async callers can reach it directly."""
     logger.debug(
         "VOD: Generating VOD for %s from %s to %s variant=%s force_discontinuity=%s",
         camera_name,
@@ -1187,11 +1449,15 @@ async def vod_ts(
             status_code=404,
         )
 
-    hour_ago = datetime.now() - timedelta(hours=1)
-    mapping_cacheable = hour_ago.timestamp() > start_ts
+    # A window is safe to cache once no new segment can still land in it, which
+    # is a property of its END, not its start: a window that is still being
+    # written can gain a segment seconds after we answer. The previous rule keyed
+    # on start_ts, so every fragment touching the last hour was non-cacheable --
+    # and nginx-vod re-requests a non-cacheable mapping for EVERY segment, so the
+    # query plus the keyframe probe repeated ~360 times per hour, per player.
+    # MAX_SEGMENT_DURATION bounds how late a row can still change.
+    mapping_cacheable = end_ts < datetime.now().timestamp() - MAX_SEGMENT_DURATION
     perf["status"] = "ok"
-    # non-cacheable mappings (recent windows) are re-requested by nginx-vod
-    # throughout playback, so a slow request here repeats per segment
     perf["nginx_cacheable"] = mapping_cacheable
     perf["total_ms"] = (time.monotonic() - request_start) * 1000
     log_api_perf(perf)
@@ -1212,7 +1478,7 @@ async def vod_ts(
     dependencies=[Depends(require_camera_access)],
     description="Returns an HLS playlist for the specified date-time on the specified camera. Append /master.m3u8 or /index.m3u8 for HLS playback.",
 )
-async def vod_hour_no_timezone(
+def vod_hour_no_timezone(
     year_month: str,
     day: int,
     hour: int,
@@ -1220,7 +1486,7 @@ async def vod_hour_no_timezone(
     variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
     """VOD for specific hour. Uses the default timezone (UTC)."""
-    return await vod_hour(
+    return vod_hour(
         year_month,
         day,
         hour,
@@ -1235,7 +1501,7 @@ async def vod_hour_no_timezone(
     dependencies=[Depends(require_camera_access)],
     description="Returns an HLS playlist for the specified date-time (with timezone) on the specified camera. Append /master.m3u8 or /index.m3u8 for HLS playback. The trailing segment may instead be a variant ('main'/'sub'), in which case the local timezone is used — required for variant selection through nginx HLS playback, which drops query strings.",
 )
-async def vod_hour(
+def vod_hour(
     year_month: str,
     day: int,
     hour: int,
@@ -1259,7 +1525,38 @@ async def vod_hour(
     start_ts = start_date.timestamp()
     end_ts = end_date.timestamp()
 
-    return await vod_ts(camera_name, start_ts, end_ts, variant=variant)
+    return _vod_ts(camera_name, start_ts, end_ts, variant=variant)
+
+
+def _lookup_event(event_id: str) -> Optional[Event]:
+    """Fetch an event by id, or None. Blocking; call via run_in_threadpool."""
+    try:
+        return Event.get(Event.id == event_id)
+    except DoesNotExist:
+        return None
+
+
+def _vod_event(event: Event, event_id: str, padding: int, variant: str):
+    """Blocking body of the event VOD route."""
+    end_ts = (
+        datetime.now().timestamp()
+        if event.end_time is None
+        else (event.end_time + padding)
+    )
+    vod_response = _vod_ts(
+        event.camera, event.start_time - padding, end_ts, variant=variant
+    )
+
+    # If the recordings are not found and the event started more than 5 minutes ago, set has_clip to false
+    if (
+        event.start_time < datetime.now().timestamp() - 300
+        and type(vod_response) is tuple
+        and len(vod_response) == 2
+        and vod_response[1] == 404
+    ):
+        Event.update(has_clip=False).where(Event.id == event_id).execute()
+
+    return vod_response
 
 
 @router.get(
@@ -1278,9 +1575,12 @@ async def vod_event(
     padding: int = Query(0, description="Padding to apply to the vod."),
     variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
-    try:
-        event: Event = Event.get(Event.id == event_id)
-    except DoesNotExist:
+    # Unlike its sibling VOD routes this stays a coroutine, because
+    # require_camera_access is async and has to run on the event loop. The two
+    # blocking halves around it are pushed to the worker threadpool.
+    event = await run_in_threadpool(_lookup_event, event_id)
+
+    if event is None:
         logger.error(f"Event not found: {event_id}")
         return JSONResponse(
             content={
@@ -1292,25 +1592,7 @@ async def vod_event(
 
     await require_camera_access(event.camera, request=request)
 
-    end_ts = (
-        datetime.now().timestamp()
-        if event.end_time is None
-        else (event.end_time + padding)
-    )
-    vod_response = await vod_ts(
-        event.camera, event.start_time - padding, end_ts, variant=variant
-    )
-
-    # If the recordings are not found and the event started more than 5 minutes ago, set has_clip to false
-    if (
-        event.start_time < datetime.now().timestamp() - 300
-        and type(vod_response) is tuple
-        and len(vod_response) == 2
-        and vod_response[1] == 404
-    ):
-        Event.update(has_clip=False).where(Event.id == event_id).execute()
-
-    return vod_response
+    return await run_in_threadpool(_vod_event, event, event_id, padding, variant)
 
 
 @router.get(
@@ -1323,13 +1605,13 @@ async def vod_event(
     dependencies=[Depends(require_camera_access)],
     description="Returns an HLS playlist for a timestamp range with HLS discontinuity enabled. Append /master.m3u8 or /index.m3u8 for HLS playback.",
 )
-async def vod_clip(
+def vod_clip(
     camera_name: str,
     start_ts: float,
     end_ts: float,
     variant: VariantParam = DEFAULT_PLAYBACK_VARIANT,
 ):
-    return await vod_ts(
+    return _vod_ts(
         camera_name, start_ts, end_ts, force_discontinuity=True, variant=variant
     )
 
@@ -1765,8 +2047,8 @@ async def event_clip(
         if event.end_time is None
         else event.end_time + padding
     )
-    return await recording_clip(
-        request, event.camera, event.start_time - padding, end_ts
+    return await run_in_threadpool(
+        _recording_clip, request, event.camera, event.start_time - padding, end_ts
     )
 
 
