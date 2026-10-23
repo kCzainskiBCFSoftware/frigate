@@ -86,6 +86,47 @@
         }
       }
     },
+    "pipeline": {
+      "label": "Recording pipeline settings (global only, except recorder_stale_timeout).",
+      "properties": {
+        "processing_timeout": {
+          "label": "Seconds a continuous segment waits for frame processing before it is moved with unknown activity stats (0 waits indefinitely, as upstream)."
+        },
+        "move_concurrency": {
+          "label": "Most segment probes and copies the mover runs at once (0 is unbounded, as upstream)."
+        },
+        "max_cached_segments": {
+          "label": "Closed segments kept in the cache per camera and variant before the oldest are discarded."
+        },
+        "cache_free_reserve": {
+          "label": "Percent of the cache filesystem kept free by discarding the oldest closed segments (0 is off, as upstream)."
+        },
+        "async_db_writes": {
+          "label": "Write segment rows from a background writer instead of blocking the mover (false is upstream)."
+        },
+        "db_write_queue": {
+          "label": "Most segment rows the background writer holds before the mover waits."
+        },
+        "db_flush_timeout": {
+          "label": "Seconds the background writer drains queued rows on shutdown."
+        },
+        "reconcile_on_unclean_shutdown": {
+          "label": "After an unclean shutdown, add rows for recent segment files that have none (false is upstream)."
+        },
+        "reconcile_window": {
+          "label": "Hours of recordings the unclean-shutdown recovery scans."
+        },
+        "recorder_watchdog": {
+          "label": "Signal the camera watchdog judges recorders by: their cache output, or the mover's messages (upstream)."
+        },
+        "recorder_stale_timeout": {
+          "label": "Seconds without new output before a recorder is restarted."
+        },
+        "empty_directory_cleanup": {
+          "label": "Remove only the directories a cleanup run deleted from, or walk the whole recordings tree (full, upstream)."
+        }
+      }
+    },
     "enabled_in_config": {
       "label": "Keep track of original state of recording."
     }

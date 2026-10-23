@@ -6,12 +6,12 @@ affecting the others (open question 2).
 
 ## 1. Configuration
 
-- [ ] 1.1 Add a `RecordPipelineConfig` model in a new fork-only file `frigate/config/camera/record_pipeline.py` with the `record.pipeline` settings and defaults from design D11. Add it to `RecordConfig` as `pipeline`. Validate `processing_timeout + 10 < max_cached_segments × 10`, and reject negative counts and durations.
-- [ ] 1.2 Make every `record.pipeline` setting except `recorder_stale_timeout` global-only: the global value is used and camera-level values are ignored, as for `record.expire_interval`. Let a camera override `recorder_stale_timeout`.
-- [ ] 1.3 Add `wal_checkpoint` (`passive`|`truncate`), `wal_size_limit` (MB) and `cache_size` (MB) to `DatabaseConfig` in `frigate/config/database.py`.
-- [ ] 1.4 Add the input's `record_variant` to each `ffmpeg_cmds` entry in `CameraConfig.create_ffmpeg_cmds` (`frigate/config/camera/camera.py`).
-- [ ] 1.5 Extend `frigate/test/test_config.py`: defaults, the validation error for a processing wait longer than the backlog window, a camera override of `recorder_stale_timeout`, and the variant on `ffmpeg_cmds`.
-- [ ] 1.6 Regenerate the English config translations for `record` and `database` with `generate_config_translations.py`.
+- [x] 1.1 Add a `RecordPipelineConfig` model in a new fork-only file `frigate/config/camera/record_pipeline.py` with the `record.pipeline` settings and defaults from design D11. Add it to `RecordConfig` as `pipeline`. Validate `processing_timeout + 10 < max_cached_segments × 10`, and reject negative counts and durations.
+- [x] 1.2 Make every `record.pipeline` setting except `recorder_stale_timeout` global-only: the global value is used and camera-level values are ignored, as for `record.expire_interval`. Let a camera override `recorder_stale_timeout`.
+- [x] 1.3 Add `wal_checkpoint` (`passive`|`truncate`), `wal_size_limit` (MB) and `cache_size` (MB) to `DatabaseConfig` in `frigate/config/database.py`.
+- [x] 1.4 Add the input's `record_variant` to each `ffmpeg_cmds` entry in `CameraConfig.create_ffmpeg_cmds` (`frigate/config/camera/camera.py`).
+- [x] 1.5 Extend `frigate/test/test_config.py`: defaults, the validation error for a processing wait longer than the backlog window, a camera override of `recorder_stale_timeout`, and the variant on `ffmpeg_cmds`.
+- [x] 1.6 Regenerate the English config translations for `record` and `database` with `generate_config_translations.py`.
 
 ## 2. Mover: processing wait, complete-stats discard, concurrency, backlog limit
 

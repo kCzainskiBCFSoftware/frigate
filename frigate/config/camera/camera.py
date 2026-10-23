@@ -1,6 +1,6 @@
 import os
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import Field, PrivateAttr, model_validator
 
@@ -139,7 +139,7 @@ class CameraConfig(FrigateBaseModel):
         default=None, title="Keep track of original state of camera."
     )
 
-    _ffmpeg_cmds: list[dict[str, list[str]]] = PrivateAttr()
+    _ffmpeg_cmds: list[dict[str, Any]] = PrivateAttr()
 
     def __init__(self, **config):
         # Set zone colors
@@ -174,7 +174,7 @@ class CameraConfig(FrigateBaseModel):
         return self.detect.height * 3 // 2, self.detect.width
 
     @property
-    def ffmpeg_cmds(self) -> list[dict[str, list[str]]]:
+    def ffmpeg_cmds(self) -> list[dict[str, Any]]:
         return self._ffmpeg_cmds
 
     def get_formatted_name(self) -> str:
@@ -224,7 +224,16 @@ class CameraConfig(FrigateBaseModel):
             if ffmpeg_cmd is None:
                 continue
 
-            ffmpeg_cmds.append({"roles": ffmpeg_input.roles, "cmd": ffmpeg_cmd})
+            ffmpeg_cmds.append(
+                {
+                    "roles": ffmpeg_input.roles,
+                    "cmd": ffmpeg_cmd,
+                    # lets the watchdog judge each recorder by its own output
+                    "record_variant": ffmpeg_input.record_variant
+                    if "record" in ffmpeg_input.roles
+                    else None,
+                }
+            )
         self._ffmpeg_cmds = ffmpeg_cmds
 
     def _get_ffmpeg_cmd(self, ffmpeg_input: CameraInput):

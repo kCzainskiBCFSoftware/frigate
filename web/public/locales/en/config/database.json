@@ -3,6 +3,15 @@
   "properties": {
     "path": {
       "label": "Database path."
+    },
+    "wal_checkpoint": {
+      "label": "Checkpoint after each recordings cleanup run: passive, which never blocks writers, or truncate (upstream)."
+    },
+    "wal_size_limit": {
+      "label": "Size in MB the WAL file is cut back to each time it restarts."
+    },
+    "cache_size": {
+      "label": "SQLite page-cache ceiling in MB for each main and recording process connection."
     }
   }
 }
