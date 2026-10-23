@@ -7,6 +7,7 @@ from playhouse.sqliteq import SqliteQueueDatabase
 
 from frigate.config import FrigateConfig
 from frigate.const import PROCESS_PRIORITY_HIGH
+from frigate.db.maintenance import size_pragmas
 from frigate.models import Recordings, ReviewSegment
 from frigate.record.maintainer import RecordingMaintainer
 from frigate.util.process import FrigateProcess
@@ -33,7 +34,9 @@ class RecordProcess(FrigateProcess):
                 # 256MB page-cache ceiling (was 512MB). This process is
                 # write-heavy -- one row per camera per variant every segment_time --
                 # so it benefits least of the three from a large read cache.
-                "cache_size": -256 * 1000,
+                # database.cache_size (default 256) and the WAL bound
+                # database.wal_size_limit come from size_pragmas.
+                **size_pragmas(self.config.database),
                 # Read pages through an mmap of the db instead of copying them into
                 # this connection's private cache: the mapping is file-backed, so the
                 # kernel can reclaim it under memory pressure (SQLite's own page cache

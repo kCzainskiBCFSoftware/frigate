@@ -12,7 +12,13 @@ from typing import Optional
 from playhouse.sqlite_ext import SqliteExtDatabase
 
 from frigate.config import CameraConfig, FrigateConfig, RetainModeEnum
-from frigate.const import CACHE_DIR, CLIPS_DIR, MAX_WAL_SIZE, RECORD_DIR
+from frigate.const import CACHE_DIR, CLIPS_DIR, RECORD_DIR
+from frigate.db.maintenance import (
+    CheckpointResult,
+    CleanupRunSummary,
+    maintain_wal,
+    size_pragmas,
+)
 from frigate.models import Previews, Recordings, ReviewSegment, UserReviewStatus
 from frigate.record.ranges import (
     backfill_ranges,
@@ -50,22 +56,16 @@ class RecordingCleanup(threading.Thread):
                 logger.debug("Deleting tmp clip.")
                 clear_and_unlink(p)
 
-    def truncate_wal(self) -> None:
-        """check if the WAL needs to be manually truncated."""
+    def truncate_wal(self) -> CheckpointResult:
+        """checkpoint the WAL at the end of a run without blocking writers."""
 
         # by default the WAL should be check-pointed automatically
         # however, high levels of activity can prevent an opportunity
         # for the checkpoint to be finished which means the WAL will grow
         # without bound
 
-        # with auto checkpoint most users should never hit this
-
-        if (
-            os.stat(f"{self.config.database.path}-wal").st_size / (1024 * 1024)
-        ) > MAX_WAL_SIZE:
-            db = SqliteExtDatabase(self.config.database.path)
-            db.execute_sql("PRAGMA wal_checkpoint(TRUNCATE);")
-            db.close()
+        # database.wal_checkpoint: truncate restores the upstream blocking form
+        return maintain_wal(self.config.database)
 
     def roll_up_recording_ranges(self) -> None:
         """Materialize newly settled playback-timeline ranges.
@@ -99,7 +99,9 @@ class RecordingCleanup(threading.Thread):
         low-selectivity index and turn playback queries into large scans.
         analysis_limit keeps the re-sample cheap enough to run hourly.
         """
-        db = SqliteExtDatabase(self.config.database.path)
+        db = SqliteExtDatabase(
+            self.config.database.path, pragmas=size_pragmas(self.config.database)
+        )
         db.execute_sql("PRAGMA analysis_limit=1000;")
         db.execute_sql("ANALYZE recordings;")
         db.close()
@@ -542,12 +544,19 @@ class RecordingCleanup(threading.Thread):
                 next_sync = get_tomorrow_at_time(3)
 
             if counter == 0:
+                summary = CleanupRunSummary()
                 self.clean_tmp_clips()
-                self.expire_recordings()
-                remove_empty_directories(RECORD_DIR)
-                self.truncate_wal()
-                self.refresh_recordings_stats()
+                with summary.phase("expire"):
+                    self.expire_recordings()
+                with summary.phase("directories"):
+                    remove_empty_directories(RECORD_DIR)
+                with summary.phase("checkpoint"):
+                    summary.checkpoint = self.truncate_wal()
+                with summary.phase("stats"):
+                    self.refresh_recordings_stats()
                 # after expire_recordings, so the precomputed ranges follow the
                 # recordings table rather than advertising footage that is gone
-                self.trim_recording_ranges()
-                self.backfill_recording_ranges()
+                with summary.phase("ranges"):
+                    self.trim_recording_ranges()
+                    self.backfill_recording_ranges()
+                summary.log()

@@ -91,15 +91,15 @@ affecting the others (open question 2).
 
 ## 6. WAL maintenance
 
-- [ ] 6.1 Add `frigate/db/maintenance.py` with:
+- [x] 6.1 Add `frigate/db/maintenance.py` with:
   - a passive checkpoint that returns `(busy, log, checkpointed)`;
   - the bounded `TRUNCATE` fallback (2 s busy timeout, attempted above 4 × `wal_size_limit`);
   - the `truncate` mode that restores upstream behavior.
 
   Call it from `RecordingCleanup.truncate_wal`.
-- [ ] 6.2 Set `journal_size_limit` and `cache_size` from `DatabaseConfig` in the pragmas in `FrigateApp.bind_database` and `RecordProcess.run`.
-- [ ] 6.3 Log the per-run summary line: each phase's duration, the WAL size before and after, and the checkpoint result.
-- [ ] 6.4 Tests: with a reader holding a snapshot, a writer is not blocked by the passive checkpoint; the fallback gives up within about 2 s while a reader holds a snapshot; `journal_size_limit` is set on new connections.
+- [x] 6.2 Set `journal_size_limit` and `cache_size` from `DatabaseConfig` in the pragmas in `FrigateApp.bind_database` and `RecordProcess.run`.
+- [x] 6.3 Log the per-run summary line: each phase's duration, the WAL size before and after, and the checkpoint result.
+- [x] 6.4 Tests: with a reader holding a snapshot, a writer is not blocked by the passive checkpoint; the fallback gives up within about 2 s while a reader holds a snapshot; `journal_size_limit` is set on new connections.
 
 ## 7. Shorter cleanup run
 

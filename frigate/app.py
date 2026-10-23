@@ -42,6 +42,7 @@ from frigate.const import (
     TRIGGER_DIR,
 )
 from frigate.data_processing.types import DataProcessorMetrics
+from frigate.db.maintenance import size_pragmas
 from frigate.db.sqlitevecq import SqliteVecQueueDatabase
 from frigate.embeddings import EmbeddingProcess, EmbeddingsContext
 from frigate.events.audio import AudioProcessor
@@ -191,7 +192,9 @@ class FrigateApp:
                 logger.error("Unable to write to /config to save DB state")
 
         # Migrate DB schema
-        migrate_db = SqliteExtDatabase(self.config.database.path)
+        migrate_db = SqliteExtDatabase(
+            self.config.database.path, pragmas=size_pragmas(self.config.database)
+        )
 
         # Run migrations
         del logging.getLogger("peewee_migrate").handlers[:]
@@ -279,7 +282,9 @@ class FrigateApp:
                 # either value, so the extra 256MB mostly competed for RAM. This is
                 # also the connection the API worker threads multiply -- peewee keeps
                 # connection state thread-local, so each thread opens its own.
-                "cache_size": -256 * 1000,
+                # database.cache_size (default 256) and the WAL bound
+                # database.wal_size_limit come from size_pragmas.
+                **size_pragmas(self.config.database),
                 # Read pages through an mmap of the db instead of copying them into
                 # this connection's private cache: the mapping is file-backed, so the
                 # kernel can reclaim it under memory pressure (SQLite's own page cache
