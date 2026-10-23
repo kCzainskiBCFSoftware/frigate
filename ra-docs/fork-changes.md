@@ -4,8 +4,10 @@ This document is the canonical changelog for what this fork/branch adds on top o
 upstream `blakeblackshear/frigate`. It is maintained by hand — update it whenever
 you change fork-specific behavior.
 
-- **Upstream base:** `dev` (merge-base `416a9b76`)
-- **Active branch:** `task/multi-camera-playback-perf-1229bc`
+- **Upstream base:** tag `v0.17.1` (`416a9b76`)
+- **Active branch:** `v17.1-update-with-adaptive`
+- **Behavior specs:** `openspec/specs/` (one per capability). This file stays the
+  code-level changelog.
 - **Branch commits:**
   - `4228f609` feat: Add support for dual retention for single camera
   - `87d52ed7` test: attempt 2
@@ -19,7 +21,7 @@ you change fork-specific behavior.
   - `6c4c9bd1` chore: Update GA flows
   - `410c033a` chore: Disable python checks
   - `15a471c6` fix: Add caching to support prefetches for vod
-  - `79a2adc1` perf: precomputed playback timeline + real API concurrency
+  - `7246a154` perf: Precomputed playback timeline + real API concurrency (#2)
 
 ## What the fork does
 
@@ -384,6 +386,5 @@ changed file. See *Housekeeping* for the two environment-only failures to expect
   `TestGo2rtcStreamAccess` needs a live go2rtc on `127.0.0.1:1984`, and mypy needs
   `types-peewee` installed or every peewee model reports
   "Class cannot subclass Model".
-- `ra-docs/` holds working notes; `dual-stream-api-changes.md` and this file are
-  tracked, the rest are local. Note this file lives in `ra-docs/`, not the repo
-  root (CLAUDE.md still says root).
+- `ra-docs/` holds this changelog, the two client guides and the ranges
+  postmortem, all tracked. Note this file lives in `ra-docs/`, not the repo root.

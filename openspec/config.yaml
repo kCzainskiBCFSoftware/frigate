@@ -1,0 +1,45 @@
+schema: spec-driven
+
+# Project context: constraints an agent cannot infer by reading the code.
+context: |
+  This repository is a fork of upstream Frigate NVR (blakeblackshear/frigate).
+  The fork is based on upstream tag v0.17.1 (commit 416a9b76); the release
+  branch is v17.1-update-with-adaptive, which CI publishes as the `latest` image.
+
+  The specs under openspec/specs/ describe ONLY behavior this fork adds or
+  changes on top of upstream. Do not spec unchanged upstream behavior; if a
+  change touches upstream code without changing fork behavior, say so in the
+  proposal instead of adding a spec.
+
+  Deployment target: a 4-core QNAP NAS with limited RAM recording ~32 cameras,
+  most of them dual-stream (HD `main` + SD `sub`), serving up to 4 concurrent
+  VOD players plus a multi-camera timeline. Proposals touching recording,
+  playback, the database or nginx must state their CPU, RAM and disk-I/O cost
+  on that hardware.
+
+  Devices upgrade independently, so clients see a mixed-version fleet. New
+  client-facing endpoints must be additive and advertised through the `fork`
+  feature list on GET /api/config. That list is append-only.
+
+  The repository is public: no vendor, customer or product names in code,
+  specs, feature flags or docs.
+
+  ra-docs/fork-changes.md is the hand-maintained code-level changelog of the
+  fork. OpenSpec specs are the behavior contract; fork-changes.md says where
+  that behavior lives in the code. Keep both in step.
+
+rules:
+  proposal:
+    - State the upstream merge impact - which upstream files the change touches and how likely it is to conflict on the next rebase onto a newer upstream release.
+    - Call out any database migration (new number under migrations/) and whether it rewrites or backfills existing rows on a multi-million-row recordings table.
+    - Mark changes to API defaults or response shapes as **BREAKING** for external clients, even when the old request form keeps working.
+  design:
+    - Account for the recording variant dimension (main/sub) wherever recordings, playback, exports or retention are involved.
+  tasks:
+    - Include a task to update ra-docs/fork-changes.md, and the client guides in ra-docs/ when API behavior changes.
+    - Backend tests run in Docker, not natively on Windows; include the container test run as a task.
+
+operations:
+  archive:
+    guidance:
+      - Before archiving, confirm ra-docs/fork-changes.md reflects the change.
