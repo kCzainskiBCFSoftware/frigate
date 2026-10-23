@@ -119,9 +119,9 @@ affecting the others (open question 2).
 
 ## 9. Verification
 
-- [ ] 9.1 Run the touched backend test modules in the Docker test image (`frigate-test-deps:local`, or the release image if present): `test_config`, `test_maintainer`, `test_record_cleanup`, `test_record_retention`, `test_record_ranges`, `test_video`, `http_api.test_http_media`, plus the new writer, reconcile and maintenance tests. Compare any failure with the base commit before treating it as a regression.
-- [ ] 9.2 Run ruff (`--select E4,E7,E9,F,I --ignore E501,E711,E712`) and `ruff format --check` on `frigate/` in the container.
-- [ ] 9.3 Check the web timeline and playback against a database that has `NULL`-stat rows (see 2.9).
+- [x] 9.1 Run the touched backend test modules in the Docker test image (`frigate-test-deps:local`, or the release image if present): `test_config`, `test_maintainer`, `test_record_cleanup`, `test_record_retention`, `test_record_ranges`, `test_video`, `http_api.test_http_media`, plus the new writer, reconcile and maintenance tests. Compare any failure with the base commit before treating it as a regression.
+- [x] 9.2 Run ruff (`--select E4,E7,E9,F,I --ignore E501,E711,E712`) and `ruff format --check` on `frigate/` in the container.
+- [x] 9.3 Check the web timeline and playback against a database that has `NULL`-stat rows (see 2.9).
 - [ ] 9.4 Field validation on the 32-camera device, after the preview-frames bind mount is in place, watching tmpfs free space and stopping at 80%:
   - (a) `SIGSTOP` one camera's `frigate.process` for 3 min: its segments keep arriving, its rows have null motion, there are no drops, and the UI renders.
   - (b) Hold a write lock on `frigate.db` from another process for 90 s: there are no drops, and every row appears within a minute after release.

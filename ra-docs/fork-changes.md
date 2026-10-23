@@ -536,8 +536,10 @@ Backend tests do not run natively on Windows (`frigate/log.py` calls
 docker run --rm --workdir=/opt/frigate --entrypoint= -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/opt/frigate" <frigate-image> python3 -u -m unittest
 ```
 
-Current state: **280 tests**, `ruff check`/`format` clean, mypy clean on every
-changed file. See *Housekeeping* for the two environment-only failures to expect.
+Current state: **374 tests**, `ruff check` clean, `ruff format` clean apart from
+the unchanged `frigate/config/camera/ffmpeg.py` (see *Housekeeping*). mypy was
+last checked for strand 2, not for strand 3. See *Housekeeping* for the
+environment-only failures to expect.
 ---
 
 ## Housekeeping / known issues
@@ -569,8 +571,12 @@ changed file. See *Housekeeping* for the two environment-only failures to expect
     REP thread; only `INSERT_MANY_RECORDINGS` is hardened.
   - The main REP thread still waits on the database while it is locked, so other
     inter-process clients stall as upstream (design open question 6).
-- Test-environment notes: `ruff format --check` with a current ruff flags
-  `frigate/config/camera/ffmpeg.py`, which this fork has not changed. Running the
-  suite from a copy inside the container (instead of the bind mount) makes
-  `TestRematerializedMerge` fail with "disk I/O error" on the base commit too —
-  the HTTP test base never stops its `SqliteQueueDatabase` writer threads.
+- Test-environment notes: `ruff format --check` with a current ruff (0.17)
+  flags `frigate/config/camera/ffmpeg.py`, which this fork has not changed.
+  **Fixed a flaky test harness:** `BaseTestHttp.tearDown` deleted `test.db`
+  without stopping the test's `SqliteQueueDatabase` writer thread, which kept
+  the deleted files open. Later tests then failed at random with "disk I/O
+  error" or "attempt to write a readonly database" (on the base commit too, e.g.
+  `TestRematerializedMerge` when run from a copy inside the container), and a
+  write queued to a writer that had died at connect waited forever, hanging the
+  full suite. `tearDown` now calls `self.db.stop()`.

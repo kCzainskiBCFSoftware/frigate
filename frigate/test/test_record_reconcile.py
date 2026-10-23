@@ -25,8 +25,9 @@ UNPROBEABLE = "unprobeable"
 
 
 async def fake_probe(ffmpeg, path, get_duration=False):
-    if UNPROBEABLE in open(path).read():
-        return {"has_valid_video": False, "duration": -1}
+    with open(path) as f:
+        if UNPROBEABLE in f.read():
+            return {"has_valid_video": False, "duration": -1}
 
     return {
         "has_valid_video": True,

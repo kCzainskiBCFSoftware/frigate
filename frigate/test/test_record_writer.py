@@ -2,6 +2,7 @@
 
 import importlib
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -10,6 +11,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from frigate.config import FrigateConfig
@@ -23,7 +25,6 @@ from frigate.record.writer import (
     take_clean_shutdown_marker,
     write_clean_shutdown_marker,
 )
-from frigate.test.const import TEST_DB
 from frigate.test.http_api.base_http_test import BaseTestHttp
 
 
@@ -270,18 +271,29 @@ class TestInsertHandler(BaseTestHttp):
         assert stored.dBFS is None and stored.regions is None
 
     def _lock_database(self) -> sqlite3.Connection:
-        holder = sqlite3.connect(TEST_DB, isolation_level=None)
+        holder = sqlite3.connect(self.lock_db_path, isolation_level=None)
         holder.execute("BEGIN IMMEDIATE")
         self.addCleanup(holder.close)
         return holder
 
     def _short_timeout_db(self) -> SqliteQueueDatabase:
-        db = SqliteQueueDatabase(TEST_DB, timeout=0.2)
-        db.bind([Recordings, RecordingRanges, RecordingRangeCoverage])
+        # a database of its own on the container filesystem: a second writer
+        # on the shared test.db is unreliable over a Windows bind mount
+        models = [Recordings, RecordingRanges, RecordingRangeCoverage]
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.lock_db_path = os.path.join(tmp, "locked.db")
+        schema = SqliteDatabase(self.lock_db_path, pragmas={"journal_mode": "wal"})
+        schema.bind(models)
+        schema.create_tables(models)
+        schema.close()
+
+        db = SqliteQueueDatabase(self.lock_db_path, timeout=0.5)
+        db.bind(models)
         self.addCleanup(db.stop)
         # wait for one queued write, so its writer thread has connected (and
         # set its pragmas) before the test takes the lock
-        db.execute_sql("DELETE FROM recordings WHERE 0").rowcount
+        db.execute_sql("DELETE FROM recordings WHERE 0", timeout=5).rowcount
         return db
 
     def test_locked_database_is_a_failed_outcome(self):
