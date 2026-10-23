@@ -103,9 +103,9 @@ affecting the others (open question 2).
 
 ## 7. Shorter cleanup run
 
-- [ ] 7.1 Make `expire_existing_camera_recordings` (and the removed-camera and orphan-variant sweeps in `expire_recordings`) return the parent directories of the files they delete. Add a scoped removal in `frigate/record/util.py` that removes those directories and their parents up to `RECORD_DIR`, as each becomes empty. Keep `remove_empty_directories` for `empty_directory_cleanup: full`.
-- [ ] 7.2 Add `start_time` upper bounds to the removed-camera, per-variant and orphan-variant expiry queries in `frigate/record/cleanup.py` (design D10).
-- [ ] 7.3 Tests:
+- [x] 7.1 Make `expire_existing_camera_recordings` (and the removed-camera and orphan-variant sweeps in `expire_recordings`) return the parent directories of the files they delete. Add a scoped removal in `frigate/record/util.py` that removes those directories and their parents up to `RECORD_DIR`, as each becomes empty. Keep `remove_empty_directories` for `empty_directory_cleanup: full`.
+- [x] 7.2 Add `start_time` upper bounds to the removed-camera, per-variant and orphan-variant expiry queries in `frigate/record/cleanup.py` (design D10).
+- [x] 7.3 Tests:
   - scoped removal deletes only emptied branches and never `RECORD_DIR`;
   - equivalence of the bounded queries on a mixed fixture with null-stat, motion, review-overlapping, removed-camera and unconfigured-variant rows;
   - an `EXPLAIN QUERY PLAN` guard that each query uses a range search on `start_time`, following `TestRecordingsOverlapQuery`.

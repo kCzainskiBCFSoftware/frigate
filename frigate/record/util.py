@@ -3,6 +3,7 @@
 import datetime
 import logging
 import os
+from typing import Iterable
 
 from peewee import DatabaseError, chunked
 
@@ -26,6 +27,35 @@ def remove_empty_directories(directory: str) -> None:
             continue
         if len(os.listdir(path)) == 0:
             os.rmdir(path)
+
+
+def remove_empty_parent_directories(directories: Iterable[str], root: str) -> None:
+    """Remove each directory and then its parents up to ``root``, while empty.
+
+    Only these branches are touched: nothing else under ``root`` is listed,
+    and ``root`` itself is never removed.
+    """
+    root = os.path.normpath(root)
+
+    # deepest first, so a shared parent is tried after all of its children
+    for directory in sorted(
+        {os.path.normpath(d) for d in directories},
+        key=lambda d: d.count(os.sep),
+        reverse=True,
+    ):
+        path = directory
+
+        while path != root and path.startswith(root + os.sep):
+            try:
+                os.rmdir(path)
+            except FileNotFoundError:
+                # removed already through another branch; its parent may not be
+                pass
+            except OSError:
+                # not empty
+                break
+
+            path = os.path.dirname(path)
 
 
 def sync_recordings(limited: bool) -> None:
