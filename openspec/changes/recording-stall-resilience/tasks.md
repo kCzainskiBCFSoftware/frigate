@@ -67,15 +67,15 @@ affecting the others (open question 2).
 
 ## 4. Recorder watchdog
 
-- [ ] 4.1 Add `frigate/record/cache_watch.py`. It scans `CACHE_DIR` once per check, tracks per variant the newest start time from file names and that file's mtime, and remembers the last-seen freshness.
-- [ ] 4.2 In `CameraWatchdog` (`frigate/video.py`):
+- [x] 4.1 Add `frigate/record/cache_watch.py`. It scans `CACHE_DIR` once per check, tracks per variant the newest start time from file names and that file's mtime, and remembers the last-seen freshness.
+- [x] 4.2 In `CameraWatchdog` (`frigate/video.py`):
   - judge each record process by its variant's freshness;
   - use the arrival of `latest` messages as the mover heartbeat;
   - gate `valid_stale` and `invalid_stale` on the heartbeat, measured from the last resume;
   - attribute valid and invalid messages to a variant through `cache_path`;
   - restart only the stale recorder.
-- [ ] 4.3 Add the rate-limited "recording mover stalled" warning. Replace the hardcoded `120` in the checks and the message with `recorder_stale_timeout`, and the grace period with `min(90, timeout)`. Keep `recorder_watchdog: mover` as the upstream path.
-- [ ] 4.4 Tests in `frigate/test/test_video.py`:
+- [x] 4.3 Add the rate-limited "recording mover stalled" warning. Replace the hardcoded `120` in the checks and the message with `recorder_stale_timeout`, and the grace period with `min(90, timeout)`. Keep `recorder_watchdog: mover` as the upstream path.
+- [x] 4.4 Tests in `frigate/test/test_video.py`:
   - a paused mover with fresh cache files gives no restart;
   - a recorder with no new files is restarted after the timeout;
   - a hung `sub` with a healthy `main` restarts only `sub`;

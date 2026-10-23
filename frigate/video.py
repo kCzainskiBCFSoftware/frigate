@@ -18,6 +18,7 @@ from frigate.comms.recordings_updater import (
 )
 from frigate.config import CameraConfig, DetectConfig, LoggerConfig, ModelConfig
 from frigate.config.camera.camera import CameraTypeEnum
+from frigate.config.camera.record_pipeline import RecorderWatchdogEnum
 from frigate.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateSubscriber,
@@ -31,6 +32,7 @@ from frigate.motion import MotionDetector
 from frigate.motion.improved_motion import ImprovedMotionDetector
 from frigate.object_detection.base import RemoteObjectDetector
 from frigate.ptz.autotrack import ptz_moving_at_frame_time
+from frigate.record.cache_watch import RECORDER_GRACE, RecorderWatch
 from frigate.track import ObjectTracker
 from frigate.track.norfair_tracker import NorfairTracker
 from frigate.track.tracked_object import TrackedObjectAttribute
@@ -215,6 +217,13 @@ class CameraWatchdog(threading.Thread):
         self.latest_invalid_segment_time: float = 0
         self.latest_cache_segment_time: float = 0
         self.record_enable_time: datetime | None = None
+        # record.pipeline.recorder_watchdog: cache judges each recorder by its
+        # own cache output; mover keeps the upstream signals above
+        self.recorder_watch = (
+            RecorderWatch(config.name, time.time())
+            if config.record.pipeline.recorder_watchdog == RecorderWatchdogEnum.cache
+            else None
+        )
 
     def _update_enabled_state(self) -> bool:
         """Fetch the latest config and update enabled state."""
@@ -279,6 +288,8 @@ class CameraWatchdog(threading.Thread):
                     self.latest_invalid_segment_time = 0
                     self.latest_cache_segment_time = 0
                     self.record_enable_time = datetime.now().astimezone(timezone.utc)
+                    if self.recorder_watch is not None:
+                        self.recorder_watch.reset(time.time())
                 else:
                     self.logger.debug(f"Disabling camera {self.config.name}")
                     self.stop_all_ffmpeg()
@@ -306,10 +317,13 @@ class CameraWatchdog(threading.Thread):
                 raw_topic, payload = update
                 if raw_topic and payload:
                     topic = str(raw_topic)
-                    camera, segment_time, _ = payload
+                    camera, segment_time, cache_path = payload
 
                     if camera != self.config.name:
                         continue
+
+                    if self.recorder_watch is not None:
+                        self.recorder_watch_message(topic, segment_time, cache_path)
 
                     if topic.endswith(RecordingsDataTypeEnum.valid.value):
                         self.logger.debug(
@@ -361,17 +375,30 @@ class CameraWatchdog(threading.Thread):
                 self.requestor.send_data(f"{self.config.name}/status/detect", "online")
                 self.fps_overflow_count = 0
 
+            stale_timeout = self.config.record.pipeline.recorder_stale_timeout
+
+            if self.recorder_watch is not None and self.config.record.enabled:
+                self.recorder_watch.scan()
+                self.warn_if_mover_stalled(stale_timeout)
+
             for p in self.ffmpeg_other_processes:
                 poll = p["process"].poll()
 
-                if self.config.record.enabled and "record" in p["roles"]:
+                if (
+                    self.recorder_watch is not None
+                    and self.config.record.enabled
+                    and "record" in p["roles"]
+                ):
+                    if self.restart_if_stale(p, stale_timeout):
+                        continue
+                elif self.config.record.enabled and "record" in p["roles"]:
                     now_utc = datetime.now().astimezone(timezone.utc)
 
                     # Check if we're within the grace period after enabling recording
-                    # Grace period: 90 seconds allows time for ffmpeg to start and create first segment
+                    # Grace period allows time for ffmpeg to start and create first segment
                     in_grace_period = self.record_enable_time is not None and (
                         now_utc - self.record_enable_time
-                    ) < timedelta(seconds=90)
+                    ) < timedelta(seconds=min(RECORDER_GRACE, stale_timeout))
 
                     latest_cache_dt = (
                         datetime.fromtimestamp(
@@ -400,15 +427,16 @@ class CameraWatchdog(threading.Thread):
                     # ensure segments are still being created and that they have valid video data
                     # Skip checks during grace period to allow segments to start being created
                     cache_stale = not in_grace_period and now_utc > (
-                        latest_cache_dt + timedelta(seconds=120)
+                        latest_cache_dt + timedelta(seconds=stale_timeout)
                     )
                     valid_stale = not in_grace_period and now_utc > (
-                        latest_valid_dt + timedelta(seconds=120)
+                        latest_valid_dt + timedelta(seconds=stale_timeout)
                     )
                     invalid_stale_condition = (
                         self.latest_invalid_segment_time > 0
                         and not in_grace_period
-                        and now_utc > (latest_invalid_dt + timedelta(seconds=120))
+                        and now_utc
+                        > (latest_invalid_dt + timedelta(seconds=stale_timeout))
                         and self.latest_valid_segment_time
                         <= self.latest_invalid_segment_time
                     )
@@ -425,7 +453,7 @@ class CameraWatchdog(threading.Thread):
                             )
 
                         self.logger.error(
-                            f"{reason} for {self.config.name} in the last 120s. Restarting the ffmpeg record process..."
+                            f"{reason} for {self.config.name} in the last {stale_timeout}s. Restarting the ffmpeg record process..."
                         )
                         p["process"] = start_or_restart_ffmpeg(
                             p["cmd"],
@@ -464,6 +492,64 @@ class CameraWatchdog(threading.Thread):
         self.config_subscriber.stop()
         self.segment_subscriber.stop()
 
+    def recorder_watch_message(
+        self, topic: str, segment_time: float | None, cache_path: str | None
+    ) -> None:
+        """Feed one mover message to the per-recorder watch (cache mode)."""
+        timeout = self.config.record.pipeline.recorder_stale_timeout
+
+        if topic.endswith(RecordingsDataTypeEnum.latest.value):
+            # every pass publishes latest for every camera: the mover heartbeat
+            self.recorder_watch.on_latest(time.time(), timeout)
+        elif topic.endswith(RecordingsDataTypeEnum.valid.value):
+            self.recorder_watch.on_valid(cache_path, segment_time)
+        elif topic.endswith(RecordingsDataTypeEnum.invalid.value):
+            self.recorder_watch.on_invalid(cache_path, segment_time)
+
+    def warn_if_mover_stalled(self, timeout: int) -> None:
+        now = time.time()
+        stalled_for = self.recorder_watch.mover_stalled_for(now, timeout)
+
+        if stalled_for is None or now - self.recorder_watch.stall_logged < 300:
+            return
+
+        self.recorder_watch.stall_logged = now
+        self.logger.warning(
+            f"The recording mover has reported no progress for {stalled_for:.0f}s. "
+            f"The recorders for {self.config.name} are judged by their cache output "
+            "and are not restarted for it"
+        )
+
+    def restart_if_stale(self, p: dict[str, Any], timeout: int) -> bool:
+        """Restart this record process if its own recorder is stale (cache mode)."""
+        now = time.time()
+        variant = p.get("record_variant") or "main"
+        enabled_at = (
+            self.record_enable_time.timestamp()
+            if self.record_enable_time is not None
+            else None
+        )
+        reason = self.recorder_watch.stale_reason(variant, now, timeout, enabled_at)
+
+        if reason is None:
+            self.requestor.send_data(f"{self.config.name}/status/record", "online")
+            return False
+
+        self.logger.error(
+            f"{reason} for {self.config.name} ({variant}) in the last {timeout}s. Restarting the ffmpeg record process..."
+        )
+        p["process"] = start_or_restart_ffmpeg(
+            p["cmd"], self.logger, p["logpipe"], ffmpeg_process=p["process"]
+        )
+        self.recorder_watch.on_restart(variant, now)
+
+        for role in p["roles"]:
+            self.requestor.send_data(
+                f"{self.config.name}/status/{role.value}", "offline"
+            )
+
+        return True
+
     def start_ffmpeg_detect(self):
         ffmpeg_cmd = [
             c["cmd"] for c in self.config.ffmpeg_cmds if "detect" in c["roles"]
@@ -499,6 +585,7 @@ class CameraWatchdog(threading.Thread):
                 {
                     "cmd": c["cmd"],
                     "roles": c["roles"],
+                    "record_variant": c.get("record_variant"),
                     "logpipe": logpipe,
                     "process": start_or_restart_ffmpeg(c["cmd"], self.logger, logpipe),
                 }
