@@ -22,3 +22,22 @@ class TestHttpApp(BaseTestHttp):
             response = client.get("/stats")
             response_json = response.json()
             assert response_json == self.test_stats
+
+    ####################################################################################################################
+    ###################################  GET /config fork block   ######################################################
+    ####################################################################################################################
+    def test_config_advertises_fork_features(self):
+        with AuthTestClient(self.app) as client:
+            response = client.get("/config")
+
+        assert response.status_code == 200
+        fork = response.json()["fork"]
+        assert set(fork) == {"version", "features"}
+        # append-only: every shipped flag stays, in sorted order
+        assert fork["features"] == sorted(fork["features"])
+        assert {
+            "recording_variants",
+            "recordings_ranges",
+            "recordings_hours",
+            "recordings_unknown_stats",
+        } <= set(fork["features"])

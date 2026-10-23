@@ -112,10 +112,10 @@ affecting the others (open question 2).
 
 ## 8. Feature flag, docs and changelog
 
-- [ ] 8.1 Append `recordings_unknown_stats` to `FORK_FEATURES` in `frigate/const.py`, and update the fork-block test.
-- [ ] 8.2 Update `ra-docs/fork-changes.md`: a new strand for recording-path resilience, covering the config keys, the new modules, the upstream files touched and the opt-outs.
-- [ ] 8.3 Update `ra-docs/dual-stream-api-changes.md`. `motion` and `objects` can be `null` in recording listings and summaries, and clients detect this through `recordings_unknown_stats`. Mark it **BREAKING** for strict clients.
-- [ ] 8.4 Document the `record.pipeline` and `database` settings, with their upstream-equivalent values, in the fork's config reference in `ra-docs/`.
+- [x] 8.1 Append `recordings_unknown_stats` to `FORK_FEATURES` in `frigate/const.py`, and update the fork-block test.
+- [x] 8.2 Update `ra-docs/fork-changes.md`: a new strand for recording-path resilience, covering the config keys, the new modules, the upstream files touched and the opt-outs.
+- [x] 8.3 Update `ra-docs/dual-stream-api-changes.md`. `motion` and `objects` can be `null` in recording listings and summaries, and clients detect this through `recordings_unknown_stats`. Mark it **BREAKING** for strict clients.
+- [x] 8.4 Document the `record.pipeline` and `database` settings, with their upstream-equivalent values, in the fork's config reference in `ra-docs/`.
 
 ## 9. Verification
 
