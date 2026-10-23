@@ -26,6 +26,7 @@ from frigate.record.ranges import (
     roll_up_ranges,
     trim_ranges,
 )
+from frigate.record.reconcile import reconcile_recordings
 from frigate.record.util import (
     remove_empty_directories,
     remove_empty_parent_directories,
@@ -49,10 +50,17 @@ def expiry_seek_bound(cutoff: float):
 class RecordingCleanup(threading.Thread):
     """Cleanup existing recordings based on retention config."""
 
-    def __init__(self, config: FrigateConfig, stop_event: MpEvent) -> None:
+    def __init__(
+        self,
+        config: FrigateConfig,
+        stop_event: MpEvent,
+        unclean_shutdown: bool = False,
+    ) -> None:
         super().__init__(name="recording_cleanup")
         self.config = config
         self.stop_event = stop_event
+        # the previous run left no clean-shutdown marker (frigate.record.writer)
+        self.unclean_shutdown = unclean_shutdown
         self.expired_dirs: set[str] = set()
 
     def clean_tmp_previews(self) -> None:
@@ -583,6 +591,17 @@ class RecordingCleanup(threading.Thread):
         if self.config.safe_mode:
             logger.info("Safe mode enabled, skipping recording cleanup")
             return
+
+        # give rows to segment files a crash left without one; before
+        # sync_recordings, which deletes files that have no row
+        if (
+            self.unclean_shutdown
+            and self.config.record.pipeline.reconcile_on_unclean_shutdown
+        ):
+            try:
+                reconcile_recordings(self.config)
+            except Exception:
+                logger.exception("Failed to recover recording rows")
 
         # on startup sync recordings with disk if enabled
         if self.config.record.sync_recordings:

@@ -84,10 +84,10 @@ affecting the others (open question 2).
 
 ## 5. Recovery after an unclean shutdown
 
-- [ ] 5.1 In `FrigateApp`, read and remove the clean-shutdown marker before the recording process starts, and pass "unclean" to `RecordingCleanup`.
-- [ ] 5.2 Add `frigate/record/reconcile.py`. It lists the per-variant hour directories of the last `reconcile_window` hours and compares them with one indexed query per camera and variant. For each orphan, one at a time, it probes the file and inserts a row with `NULL` stats, the variant from the path and on-conflict-ignore. It logs files that cannot be probed, and marks late rows for the ranges repair (3.6).
-- [ ] 5.3 Run it at the top of `RecordingCleanup.run()`, before `sync_recordings`, only when the previous shutdown was unclean and `reconcile_on_unclean_shutdown` is on.
-- [ ] 5.4 Tests: orphans in the window are inserted with the right variant and duration, files outside the window are ignored, re-running is a no-op, and a clean marker skips the scan.
+- [x] 5.1 In `FrigateApp`, read and remove the clean-shutdown marker before the recording process starts, and pass "unclean" to `RecordingCleanup`.
+- [x] 5.2 Add `frigate/record/reconcile.py`. It lists the per-variant hour directories of the last `reconcile_window` hours and compares them with one indexed query per camera and variant. For each orphan, one at a time, it probes the file and inserts a row with `NULL` stats, the variant from the path and on-conflict-ignore. It logs files that cannot be probed, and marks late rows for the ranges repair (3.6).
+- [x] 5.3 Run it at the top of `RecordingCleanup.run()`, before `sync_recordings`, only when the previous shutdown was unclean and `reconcile_on_unclean_shutdown` is on.
+- [x] 5.4 Tests: orphans in the window are inserted with the right variant and duration, files outside the window are ignored, re-running is a no-op, and a clean marker skips the scan.
 
 ## 6. WAL maintenance
 

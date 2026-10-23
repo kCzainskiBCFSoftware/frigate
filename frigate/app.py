@@ -70,6 +70,7 @@ from frigate.ptz.onvif import OnvifController
 from frigate.record.cleanup import RecordingCleanup
 from frigate.record.export import migrate_exports
 from frigate.record.record import RecordProcess
+from frigate.record.writer import take_clean_shutdown_marker
 from frigate.review.review import ReviewProcess
 from frigate.stats.emitter import StatsEmitter
 from frigate.stats.util import stats_init
@@ -247,6 +248,13 @@ class FrigateApp:
                 self.processes["go2rtc"] = proc.info["pid"]
 
     def init_recording_manager(self) -> None:
+        # read before the new recording process can leave a marker of its own
+        self.unclean_shutdown = not take_clean_shutdown_marker(
+            self.config.database.path
+        )
+        if self.unclean_shutdown:
+            logger.info("The previous run did not stop cleanly")
+
         recording_process = RecordProcess(self.config, self.stop_event)
         self.recording_process = recording_process
         recording_process.start()
@@ -478,7 +486,9 @@ class FrigateApp:
         self.event_cleanup.start()
 
     def start_record_cleanup(self) -> None:
-        self.record_cleanup = RecordingCleanup(self.config, self.stop_event)
+        self.record_cleanup = RecordingCleanup(
+            self.config, self.stop_event, self.unclean_shutdown
+        )
         self.record_cleanup.start()
 
     def start_storage_maintainer(self) -> None:
