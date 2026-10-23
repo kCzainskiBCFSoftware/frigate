@@ -651,8 +651,11 @@ class FrigateApp:
         self.output_processor.terminate()
         self.output_processor.join()
 
-        self.recording_process.terminate()
-        self.recording_process.join()
+        # let the recording process write its queued segment rows first
+        self.recording_process.join(self.config.record.pipeline.db_flush_timeout + 5)
+        if self.recording_process.is_alive():
+            self.recording_process.terminate()
+            self.recording_process.join()
 
         self.review_segment_process.terminate()
         self.review_segment_process.join()

@@ -38,6 +38,7 @@ from frigate.const import (
 )
 from frigate.models import Recordings, ReviewSegment
 from frigate.record.cache_watch import CachedSegment, cache_space, reserve_discards
+from frigate.record.writer import RecordingsWriter
 from frigate.review.types import SeverityEnum
 from frigate.util.services import get_video_properties
 
@@ -102,9 +103,17 @@ class SegmentInfo:
 
 
 class RecordingMaintainer(threading.Thread):
-    def __init__(self, config: FrigateConfig, stop_event: MpEvent):
+    def __init__(
+        self,
+        config: FrigateConfig,
+        stop_event: MpEvent,
+        writer: Optional[RecordingsWriter] = None,
+    ):
         super().__init__(name="recording_maintainer")
         self.config = config
+        # record.pipeline.async_db_writes: rows go to the writer thread instead
+        # of a request that blocks the pass until they commit
+        self.writer = writer
 
         # create communication for retained recordings
         self.requestor = InterProcessRequestor()
@@ -250,6 +259,7 @@ class RecordingMaintainer(threading.Thread):
         )
 
         tasks = []
+        saved: dict[str, Optional[float]] = {}
         for camera, recordings in grouped_recordings.items():
             if not recordings:
                 continue
@@ -295,16 +305,18 @@ class RecordingMaintainer(threading.Thread):
             )
 
             # publish most recently available recording time and None if disabled
-            self.recordings_publisher.publish(
-                (
-                    camera,
-                    recordings[0]["start_time"].timestamp()
-                    if self.config.cameras[camera].record.enabled
-                    else None,
-                    None,
-                ),
-                RecordingsDataTypeEnum.saved.value,
+            saved[camera] = (
+                recordings[0]["start_time"].timestamp()
+                if self.config.cameras[camera].record.enabled
+                else None
             )
+
+            # with the writer, saved is published once earlier rows are written
+            if self.writer is None:
+                self.recordings_publisher.publish(
+                    (camera, saved[camera], None),
+                    RecordingsDataTypeEnum.saved.value,
+                )
 
         recordings_to_insert: list[Optional[Recordings]] = await asyncio.gather(*tasks)
 
@@ -313,11 +325,20 @@ class RecordingMaintainer(threading.Thread):
 
         self.enforce_cache_reserve(grouped_recordings)
 
+        rows = [r for r in recordings_to_insert if r is not None]
+
+        if self.writer is not None:
+            # waits only while the writer's queue is full
+            self.writer.submit(rows, saved)
+            return
+
         # fire and forget recordings entries
-        self.requestor.send_data(
-            INSERT_MANY_RECORDINGS,
-            [r for r in recordings_to_insert if r is not None],
-        )
+        result = self.requestor.send_data(INSERT_MANY_RECORDINGS, rows)
+
+        if isinstance(result, dict) and not result.get("ok", True):
+            logger.error(
+                f"Failed to write {len(rows)} recording rows: {result.get('error')}"
+            )
 
     def drop_segment(self, cache_path: str) -> None:
         Path(cache_path).unlink(missing_ok=True)

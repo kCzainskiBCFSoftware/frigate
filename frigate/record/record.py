@@ -10,6 +10,7 @@ from frigate.const import PROCESS_PRIORITY_HIGH
 from frigate.db.maintenance import size_pragmas
 from frigate.models import Recordings, ReviewSegment
 from frigate.record.maintainer import RecordingMaintainer
+from frigate.record.writer import RecordingsWriter, write_clean_shutdown_marker
 from frigate.util.process import FrigateProcess
 
 logger = logging.getLogger(__name__)
@@ -53,8 +54,23 @@ class RecordProcess(FrigateProcess):
         models = [ReviewSegment, Recordings]
         db.bind(models)
 
+        pipeline = self.config.record.pipeline
+        writer = RecordingsWriter(self.config) if pipeline.async_db_writes else None
+
+        if writer is not None:
+            writer.start()
+
         maintainer = RecordingMaintainer(
             self.config,
             self.stop_event,
+            writer,
         )
         maintainer.start()
+        maintainer.join()
+
+        # the mover has stopped: write what it queued, then record a clean stop
+        # so the next start skips the recovery scan
+        drained = writer is None or writer.stop(pipeline.db_flush_timeout)
+
+        if self.stop_event.is_set() and drained:
+            write_clean_shutdown_marker(self.config.database.path)

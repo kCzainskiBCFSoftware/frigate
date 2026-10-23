@@ -16,7 +16,8 @@ request and only get faster as the backfill lands.
 
 import datetime
 import logging
-from typing import Iterable, Optional, Sequence
+import threading
+from typing import Any, Iterable, Optional, Sequence
 
 from frigate.config import FrigateConfig
 from frigate.const import MAX_SEGMENT_DURATION
@@ -56,6 +57,16 @@ BACKFILL_STEP = 86400.0
 ROLLUP_MIN_ADVANCE = 300.0
 
 Range = tuple[float, float]
+
+# Late rows. The rollup re-merges only MAX_SEGMENT_DURATION behind covered_to,
+# so a row written long after its segment -- queued through a database stall,
+# or added by recovery after an unclean shutdown -- would never reach the
+# stored ranges. The insert handler notes the earliest such start per camera and
+# variant, and the next rollup tick re-merges from there. Main-process memory
+# only: the handler and the rollup both run there, on different threads.
+_late_lock = threading.Lock()
+_late_starts: dict[tuple[str, str], float] = {}
+_covered_to: Optional[dict[tuple[str, str], float]] = None
 
 # Gap-and-islands merge. The MAX() window over all preceding rows is what
 # implements "merge on the running max end" -- segments do overlap in the field,
@@ -323,6 +334,54 @@ def _replace_window(camera: str, variant: str, lo: float, hi: float) -> None:
         ).execute()
 
 
+def note_late_rows(rows: Iterable[dict[str, Any]]) -> None:
+    """Remember rows that start behind their camera/variant's covered_to."""
+    global _covered_to
+
+    with _late_lock:
+        if _covered_to is None:
+            _covered_to = {
+                (camera, variant): covered_to
+                for camera, variant, covered_to in RecordingRangeCoverage.select(
+                    RecordingRangeCoverage.camera,
+                    RecordingRangeCoverage.variant,
+                    RecordingRangeCoverage.covered_to,
+                ).tuples()
+            }
+
+        for row in rows:
+            key = (row["camera"], row.get("variant", "main"))
+            start = row["start_time"]
+            covered_to = _covered_to.get(key)
+
+            # not rolled up yet, or ahead of the watermark: the rollup sees it
+            if covered_to is None or start >= covered_to:
+                continue
+
+            if key not in _late_starts or start < _late_starts[key]:
+                _late_starts[key] = start
+
+
+def _take_late_start(camera: str, variant: str) -> Optional[float]:
+    with _late_lock:
+        return _late_starts.pop((camera, variant), None)
+
+
+def _set_covered_to(camera: str, variant: str, covered_to: float) -> None:
+    with _late_lock:
+        if _covered_to is not None:
+            _covered_to[(camera, variant)] = covered_to
+
+
+def reset_late_rows() -> None:
+    """Forget noted late rows and the cached coverage (tests, DB rebinding)."""
+    global _covered_to
+
+    with _late_lock:
+        _late_starts.clear()
+        _covered_to = None
+
+
 def _camera_variants(config: FrigateConfig) -> list[tuple[str, str]]:
     return [
         (camera_name, variant)
@@ -373,6 +432,24 @@ def roll_up_ranges(config: FrigateConfig, now: Optional[float] = None) -> None:
             lo = hi - ROLLUP_INITIAL_WINDOW
             covered_from = lo
         else:
+            late = _take_late_start(camera, variant)
+
+            if late is not None and late < coverage.covered_to:
+                try:
+                    _replace_window(
+                        camera,
+                        variant,
+                        late - MAX_SEGMENT_DURATION,
+                        coverage.covered_to,
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Failed to re-merge late rows for {camera}/{variant}"
+                    )
+                    note_late_rows(
+                        [{"camera": camera, "variant": variant, "start_time": late}]
+                    )
+
             if hi - coverage.covered_to < ROLLUP_MIN_ADVANCE:
                 continue
 
@@ -393,6 +470,7 @@ def roll_up_ranges(config: FrigateConfig, now: Optional[float] = None) -> None:
             covered_from=covered_from,
             covered_to=hi,
         ).execute()
+        _set_covered_to(camera, variant, hi)
 
 
 def backfill_ranges(config: FrigateConfig, now: Optional[float] = None) -> None:

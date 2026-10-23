@@ -32,8 +32,9 @@ from frigate.const import (
     UPDATE_REVIEW_DESCRIPTION,
     UPSERT_REVIEW_SEGMENT,
 )
-from frigate.models import Event, Previews, Recordings, ReviewSegment
+from frigate.models import Event, Previews, ReviewSegment
 from frigate.ptz.onvif import OnvifCommandEnum, OnvifController
+from frigate.record.writer import insert_recording_rows
 from frigate.types import ModelStatusTypesEnum, TrackedObjectUpdateTypesEnum
 from frigate.util.object import get_camera_regions_grid
 from frigate.util.services import restart_frigate
@@ -111,8 +112,10 @@ class Dispatcher:
         def handle_restart() -> None:
             restart_frigate()
 
-        def handle_insert_many_recordings() -> None:
-            Recordings.insert_many(payload).execute()
+        def handle_insert_many_recordings() -> dict[str, Any]:
+            # returns {"ok": ...} and never raises: an exception here would end
+            # the inter-process request thread for all of Frigate
+            return insert_recording_rows(payload)
 
         def handle_request_region_grid() -> Any:
             camera = payload

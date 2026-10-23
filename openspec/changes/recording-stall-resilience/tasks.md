@@ -41,22 +41,22 @@ affecting the others (open question 2).
 
 ## 3. Database writes off the mover's path
 
-- [ ] 3.1 Harden `handle_insert_many_recordings` in `frigate/comms/dispatcher.py`: insert with on-conflict-ignore, catch database errors, and return `{"ok": bool, "count"|"error"}`. No exception may reach `InterProcessCommunicator.read()`.
-- [ ] 3.2 Add `frigate/record/writer.py`, a writer thread in the recording process with:
+- [x] 3.1 Harden `handle_insert_many_recordings` in `frigate/comms/dispatcher.py`: insert with on-conflict-ignore, catch database errors, and return `{"ok": bool, "count"|"error"}`. No exception may reach `InterProcessCommunicator.read()`.
+- [x] 3.2 Add `frigate/record/writer.py`, a writer thread in the recording process with:
   - a bounded queue of `db_write_queue` rows, with backpressure on the mover;
   - batches of at most 500 rows;
   - retry with backoff from 1 s up to 30 s;
   - warning, error and recovery logs with the queue depth.
-- [ ] 3.3 Wire the writer into `RecordingMaintainer.move_files` and `RecordProcess.run` behind `async_db_writes`. With the setting off, keep the blocking call but use the hardened handler.
-- [ ] 3.4 Move the `saved` publication into the writer, publishing after acknowledgement the oldest start time still cached or queued per camera.
-- [ ] 3.5 Shutdown:
+- [x] 3.3 Wire the writer into `RecordingMaintainer.move_files` and `RecordProcess.run` behind `async_db_writes`. With the setting off, keep the blocking call but use the hardened handler.
+- [x] 3.4 Move the `saved` publication into the writer, publishing after acknowledgement the oldest start time still cached or queued per camera.
+- [x] 3.5 Shutdown:
   - drain the writer for up to `db_flush_timeout` when `stop_event` is set;
   - write the clean-shutdown marker next to the database only after a full drain;
   - in `FrigateApp.stop()`, `join` the recording process for `db_flush_timeout` + 5 s before `terminate()`.
-- [ ] 3.6 Late-row repair (design D4):
+- [x] 3.6 Late-row repair (design D4):
   - in the insert handler, record per camera and variant the earliest start time of rows that start before `covered_to`;
   - in `roll_up_ranges` (`frigate/record/ranges.py`), recompute `[earliest − MAX_SEGMENT_DURATION, covered_to]` with `_replace_window` before advancing, then clear the entry.
-- [ ] 3.7 Tests:
+- [x] 3.7 Tests:
   - the writer keeps moving while the requestor blocks;
   - the queue bound and backpressure;
   - a retry after a failed outcome;

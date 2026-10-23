@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -19,9 +20,10 @@ sys.modules["frigate.config.camera.updater"] = MagicMock()
 from peewee import SqliteDatabase  # noqa: E402
 
 from frigate.config import FrigateConfig  # noqa: E402
-from frigate.const import CACHE_SEGMENT_FORMAT  # noqa: E402
+from frigate.const import CACHE_SEGMENT_FORMAT, INSERT_MANY_RECORDINGS  # noqa: E402
 from frigate.models import ReviewSegment  # noqa: E402
 from frigate.record.maintainer import RecordingMaintainer  # noqa: E402
+from frigate.record.writer import RecordingsWriter  # noqa: E402
 
 
 class TestMaintainer(unittest.IsolatedAsyncioTestCase):
@@ -438,6 +440,62 @@ class TestMovePass(MoverTestBase):
         await maintainer.move_files()
 
         assert os.path.exists(path)
+
+
+class TestWriterHandOff(MoverTestBase):
+    async def test_passes_continue_while_the_database_blocks(self):
+        maintainer = self.make_maintainer()
+        maintainer.requestor = MagicMock()
+        blocked = threading.Event()
+        written: list[dict] = []
+
+        class BlockedRequestor:
+            def send_data(self, topic, rows):
+                blocked.wait()
+                written.extend(rows)
+                return {"ok": True, "count": len(rows)}
+
+            def stop(self):
+                pass
+
+        writer = RecordingsWriter(
+            maintainer.config,
+            requestor_factory=BlockedRequestor,
+            publisher_factory=MagicMock,
+        )
+        writer.start()
+        maintainer.writer = writer
+
+        try:
+            # two passes, each with segments to move, while no row can commit
+            for first_age in (300, 120):
+                for i in range(3):
+                    self.add_segment(age=first_age + i * 10)
+                await asyncio.wait_for(maintainer.move_files(), timeout=5)
+
+            assert len(self.recorded_files()) == 6
+            assert os.listdir(self.cache_dir) == []
+            assert written == []
+            maintainer.requestor.send_data.assert_not_called()
+        finally:
+            blocked.set()
+
+        assert writer.stop(5)
+        assert len(written) == 6
+
+    async def test_blocking_mode_keeps_the_upstream_request(self):
+        maintainer = self.make_maintainer(async_db_writes=False)
+        maintainer.requestor = MagicMock()
+        maintainer.requestor.send_data.return_value = {"ok": True, "count": 2}
+
+        for i in range(2):
+            self.add_segment(age=120 + i * 10)
+
+        await maintainer.move_files()
+
+        topic, rows = maintainer.requestor.send_data.call_args.args
+        assert topic == INSERT_MANY_RECORDINGS
+        assert len(rows) == 2
 
 
 if __name__ == "__main__":
