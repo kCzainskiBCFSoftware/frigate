@@ -15,13 +15,13 @@ affecting the others (open question 2).
 
 ## 2. Mover: processing wait, complete-stats discard, concurrency, backlog limit
 
-- [ ] 2.1 In `RecordingMaintainer.validate_and_move_segment`, move a continuous-retention segment once frame processing has passed `end_time`, or once `processing_timeout` seconds have passed since `end_time`. On the timeout, store `motion`, `objects`, `regions` and `dBFS` as `None`. `processing_timeout: 0` keeps the upstream wait.
-- [ ] 2.2 Only consult `should_discard_segment` when processing has passed `end_time`. For continuous cameras, remove the early review-path move. A not-yet-processed segment stays cached (design D2).
-- [ ] 2.3 Add the rate-limited "frame processing is N s behind" warning (once per camera per 5 min).
-- [ ] 2.4 Wrap the probe-fallback and copy part of segment handling in an `asyncio.Semaphore(move_concurrency)`. `0` means unbounded.
-- [ ] 2.5 Apply the backlog limit per camera and variant, after the pass's moves, keeping the existing warning texts (design D9).
-- [ ] 2.6 Add the cache free-space reserve check (`os.statvfs(CACHE_DIR)`) at the start and end of each pass. Discard the oldest closed segments across cameras, with an error log.
-- [ ] 2.7 Tests in `frigate/test/test_maintainer.py`:
+- [x] 2.1 In `RecordingMaintainer.validate_and_move_segment`, move a continuous-retention segment once frame processing has passed `end_time`, or once `processing_timeout` seconds have passed since `end_time`. On the timeout, store `motion`, `objects`, `regions` and `dBFS` as `None`. `processing_timeout: 0` keeps the upstream wait.
+- [x] 2.2 Only consult `should_discard_segment` when processing has passed `end_time`. For continuous cameras, remove the early review-path move. A not-yet-processed segment stays cached (design D2).
+- [x] 2.3 Add the rate-limited "frame processing is N s behind" warning (once per camera per 5 min).
+- [x] 2.4 Wrap the probe-fallback and copy part of segment handling in an `asyncio.Semaphore(move_concurrency)`. `0` means unbounded.
+- [x] 2.5 Apply the backlog limit per camera and variant, after the pass's moves, keeping the existing warning texts (design D9).
+- [x] 2.6 Add the cache free-space reserve check (`os.statvfs(CACHE_DIR)`) at the start and end of each pass. Discard the oldest closed segments across cameras, with an error log.
+- [x] 2.7 Tests in `frigate/test/test_maintainer.py`:
   - a timed-out continuous segment is moved with `None` stats, and a processed one with real stats;
   - `processing_timeout: 0` waits;
   - a motion-only camera waits;
@@ -30,8 +30,8 @@ affecting the others (open question 2).
   - a backlog moved in the same pass is not discarded;
   - per-variant limits;
   - the free-space reserve.
-- [ ] 2.8 Tests in `frigate/test/test_record_cleanup.py` and `test_record_retention.py`: rows with `NULL` stats survive the continuous-only rule and the `motion`/`active_objects` review modes, expire at the outer window, and respect a variant's `retain_days` hard cap.
-- [ ] 2.9 Check the API and UI with `NULL` stats:
+- [x] 2.8 Tests in `frigate/test/test_record_cleanup.py` and `test_record_retention.py`: rows with `NULL` stats survive the continuous-only rule and the `motion`/`active_objects` review modes, expire at the outer window, and respect a variant's `retain_days` hard cap.
+- [x] 2.9 Check the API and UI with `NULL` stats:
   - `GET /api/{camera}/recordings` returns `null`;
   - `/recordings/summary` per-hour totals follow the spec;
   - `/review/activity/motion` skips them;

@@ -103,6 +103,71 @@ class TestRecordingCleanup(BaseTestHttp):
         self.assertNotIn("sub-35d", remaining)
 
 
+class TestUnknownStatsRetention(BaseTestHttp):
+    """Rows moved on the processing timeout have NULL stats; keep, don't expire."""
+
+    def setUp(self):
+        super().setUp([Recordings, ReviewSegment, UserReviewStatus, Previews])
+
+    def _config(self, **record) -> FrigateConfig:
+        return FrigateConfig(
+            **{
+                "mqtt": {"host": "mqtt"},
+                "record": {"enabled": True, **record},
+                "cameras": {"back": _dual_stream_camera("10.0.0.1", 30)},
+            }
+        )
+
+    def _insert(self, id: str, variant: str, age_days: float, stats) -> None:
+        motion, objects, dbfs = stats
+        start = datetime.datetime.now().timestamp() - age_days * DAY
+        Recordings.insert(
+            id=id,
+            path=id,
+            camera="back",
+            start_time=start,
+            end_time=start + 10,
+            duration=10,
+            motion=motion,
+            objects=objects,
+            dBFS=dbfs,
+            regions=None if motion is None else 0,
+            variant=variant,
+        ).execute()
+
+    def _expire(self, config: FrigateConfig) -> set[str]:
+        RecordingCleanup(config, mp.Event()).expire_recordings()
+        return {r.id for r in Recordings.select(Recordings.id)}
+
+    def test_kept_until_the_outer_window(self):
+        config = self._config(continuous={"days": 1}, motion={"days": 7})
+        unknown = (None, None, None)
+        self._insert("unknown-3d", "main", 3, unknown)
+        self._insert("still-3d", "main", 3, (0, 0, 0))
+        self._insert("unknown-8d", "main", 8, unknown)
+
+        remaining = self._expire(config)
+
+        # the continuous-only "no motion" rule expires known-still footage only
+        assert remaining == {"unknown-3d"}
+
+    def test_hard_cap_still_applies(self):
+        config = self._config(continuous={"days": 7}, motion={"days": 7})
+        unknown = (None, None, None)
+        self._insert("sub-unknown-29d", "sub", 29, unknown)
+        self._insert("sub-unknown-31d", "sub", 31, unknown)
+
+        remaining = self._expire(config)
+
+        assert remaining == {"sub-unknown-29d"}
+
+    def test_hard_cap_applies_inside_a_longer_motion_window(self):
+        config = self._config(continuous={"days": 7}, motion={"days": 60})
+        self._insert("sub-unknown-31d", "sub", 31, (None, None, None))
+
+        assert self._expire(config) == set()
+
+
 class TestScopedDirectoryRemoval(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()
