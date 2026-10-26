@@ -1,13 +1,22 @@
 name: On release
 
-# Promotes an image CI already built to a version tag. No rebuild: the retag happens
-# server-side in ECR via `buildx imagetools create`, so the multi-GB image is never
-# downloaded. The tagged commit must have been built by CI first.
+# Promotes an image CI already built, and you already tested, to a deliberate version
+# tag. The image is not rebuilt: a single layer is added on top that rewrites
+# frigate/version.py to the bare tag version, so a released instance reports `0.17.3`
+# and never `0.17.3-abc1234`. Every other layer is the one you tested, and ECR already
+# holds them, so only the new layer is uploaded.
+#
+# The tagged commit must have been built by CI first, and its Makefile VERSION must
+# match the tag — see the guards below.
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to release, e.g. v0.17.3'
+        required: true
 
 jobs:
   release:
@@ -17,6 +26,53 @@ jobs:
       contents: read
 
     steps:
+      # A manual dispatch has no tag in github.ref_name — it is the branch the workflow
+      # was dispatched from — so the tag comes from the input there and is validated
+      # either way. Deriving it from the branch is how `17.1-update-with-adaptive` ends
+      # up pushed as an image tag.
+      - name: Resolve and validate the tag
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'${TAG}' is not a version tag (expected vX.Y.Z or vX.Y.Z-suffix)"
+            exit 1
+          fi
+
+          CLEAN_VERSION="${TAG#v}"
+          {
+            echo "TAG=${TAG}"
+            echo "CLEAN_VERSION=${CLEAN_VERSION}"
+            # A pre-release tag like v0.18.0-beta1 is built from the 0.18.0 source, so
+            # the Makefile is checked against the base while the image is stamped with
+            # the full tag.
+            echo "BASE_VERSION=${CLEAN_VERSION%%-*}"
+            echo "BUILD_TYPE=$([[ "${CLEAN_VERSION}" == *-* ]] && echo beta || echo stable)"
+            echo "REGISTRY=${{ secrets.ECR_REGISTRY }}"
+            echo "REPOSITORY=${{ vars.ECR_REPOSITORY }}"
+          } >> $GITHUB_ENV
+
+      - name: Check out the tagged commit
+        uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      # The image tags use ${GITHUB_SHA::7}, and git's own abbreviation is 8 chars in
+      # this repo, so the length is pinned rather than left to git.
+      - name: Resolve the build tag
+        run: echo "BUILD_TAG=sha-$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
+
+      - name: Guard - the Makefile version must match the tag
+        run: |
+          MAKEFILE_VERSION=$(grep -m1 '^VERSION' Makefile | cut -d'=' -f2 | tr -d ' ')
+          if [ "${MAKEFILE_VERSION}" != "${BASE_VERSION}" ]; then
+            echo "::error::Tag ${TAG} was applied to a commit whose Makefile says VERSION = ${MAKEFILE_VERSION}, not ${BASE_VERSION}."
+            echo "::error::Run the 'Bump version' workflow, let CI rebuild, test that image, then tag the bump commit."
+            exit 1
+          fi
+          echo "Makefile VERSION = ${MAKEFILE_VERSION}, matches ${TAG}"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -24,34 +80,56 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
-      - name: Create tag variables
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          BUILD_TYPE=$([[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "stable" || echo "beta")
-          echo "BUILD_TYPE=${BUILD_TYPE}" >> $GITHUB_ENV
-          echo "REGISTRY=${{ secrets.ECR_REGISTRY }}" >> $GITHUB_ENV
-          echo "REPOSITORY=${{ vars.ECR_REPOSITORY }}" >> $GITHUB_ENV
-          echo "BUILD_TAG=sha-${GITHUB_SHA::7}" >> $GITHUB_ENV
-          echo "CLEAN_VERSION=$(echo ${GITHUB_REF##*/} | tr '[:upper:]' '[:lower:]' | sed 's/^[v]//')" >> $GITHUB_ENV
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Verify the source image exists
         run: |
           if ! aws ecr describe-images \
                 --repository-name "${REPOSITORY}" \
                 --image-ids imageTag="${BUILD_TAG}" >/dev/null 2>&1; then
-            echo "::error::No image tagged ${BUILD_TAG} in ${REPOSITORY}. Commit ${GITHUB_SHA::7} was never built by CI — push it to a branch and let CI finish before tagging."
+            echo "::error::No image tagged ${BUILD_TAG} in ${REPOSITORY}. That commit was never built by CI — push it to a branch and let CI finish before tagging."
             exit 1
           fi
-      - name: Tag and push versioned image
+
+      - name: Stamp the release version and push
         run: |
-          SOURCE=${REGISTRY}/${REPOSITORY}:${BUILD_TAG}
-          VERSION_TAG=${REGISTRY}/${REPOSITORY}:${CLEAN_VERSION}
-
-          docker buildx imagetools create --tag ${VERSION_TAG} ${SOURCE}
-          echo "released ${VERSION_TAG}" >> "$GITHUB_STEP_SUMMARY"
-
-          if [[ "${BUILD_TYPE}" == "stable" ]]; then
-            STABLE_TAG=${REGISTRY}/${REPOSITORY}:stable
-            docker buildx imagetools create --tag ${STABLE_TAG} ${SOURCE}
-            echo "released ${STABLE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+          SOURCE="${REGISTRY}/${REPOSITORY}:${BUILD_TAG}"
+          TAGS=(--tag "${REGISTRY}/${REPOSITORY}:${CLEAN_VERSION}")
+          if [ "${BUILD_TYPE}" = "stable" ]; then
+            TAGS+=(--tag "${REGISTRY}/${REPOSITORY}:stable")
           fi
+
+          # Empty context: the Dockerfile comes from the checkout via -f and needs
+          # nothing else, so there is no reason to upload the repo to the builder.
+          mkdir -p /tmp/empty-context
+
+          # provenance=false keeps this a plain single-platform manifest, matching what
+          # CI pushes — an attestation index confuses the QNAP's Docker.
+          docker buildx build \
+            --file docker/release/version-stamp.Dockerfile \
+            --build-arg SOURCE="${SOURCE}" \
+            --build-arg RELEASE_VERSION="${CLEAN_VERSION}" \
+            --build-arg BASE_VERSION="${BASE_VERSION}" \
+            "${TAGS[@]}" \
+            --provenance=false \
+            --push \
+            /tmp/empty-context
+
+          {
+            echo "### Released \`${CLEAN_VERSION}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tag | \`${TAG}\` |"
+            echo "| Built from | \`${BUILD_TAG}\` |"
+            echo "| Instances report | \`${CLEAN_VERSION}\` |"
+            echo ""
+            echo "Pushed:"
+            echo '```'
+            echo "${REGISTRY}/${REPOSITORY}:${CLEAN_VERSION}"
+            if [ "${BUILD_TYPE}" = "stable" ]; then
+              echo "${REGISTRY}/${REPOSITORY}:stable"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
