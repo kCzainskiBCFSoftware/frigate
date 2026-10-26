@@ -418,12 +418,46 @@ class TestBoundedExpiryQueries(BaseTestHttp):
             ).fetchall()
         )
 
+    def _retained_history(self, per_recorder: int = 2000) -> None:
+        """Recent rows, so an expiry range is a thin slice of the table.
+
+        That is the production shape: a run expires minutes to hours of
+        footage out of days or weeks. With the small fixture alone the range
+        covers most rows, and a planner with full statistics (the Frigate
+        image's SQLite build) rightly prefers a table scan.
+        """
+        now = datetime.datetime.now().timestamp()
+        rows = [
+            {
+                "id": f"recent-{camera}-{variant}-{i}",
+                "path": f"/recent/{camera}/{variant}/{i}",
+                "camera": camera,
+                "variant": variant,
+                "start_time": now - 6 * DAY + i * 200,
+                "end_time": now - 6 * DAY + i * 200 + 10,
+                "duration": 10,
+            }
+            for camera, variant in (
+                ("back", "main"),
+                ("back", "sub"),
+                ("front", "main"),
+                ("front", "sub"),
+                ("gone", "main"),
+            )
+            for i in range(per_recorder)
+        ]
+
+        for i in range(0, len(rows), 500):
+            Recordings.insert_many(rows[i : i + 500]).execute()
+
     def _assert_seeks_start_time(self, query) -> None:
         self._fixture()
+        self._retained_history()
         self.db.execute_sql("ANALYZE")
         plan = self._plan(query)
         assert "start_time<" in plan, plan
-        assert "SCAN recordings" not in plan, plan
+        # peewee aliases the table (t1), so check for any full scan
+        assert "SCAN" not in plan, plan
 
     def test_removed_camera_query_seeks_start_time(self):
         cleanup = RecordingCleanup(self.config, mp.Event())

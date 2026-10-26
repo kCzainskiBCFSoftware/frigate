@@ -3,12 +3,15 @@
 import logging
 import os
 import shutil
-import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 
+# the SQLite library peewee uses (pysqlite3 in the Frigate image). A second
+# library in the same process would not see this one's locks: POSIX locks
+# never conflict within a process, and each library tracks its own.
+from peewee import sqlite3
 from playhouse.sqlite_ext import SqliteExtDatabase
 
 from frigate.config.database import DatabaseConfig

@@ -3,7 +3,6 @@
 import importlib
 import os
 import shutil
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -11,7 +10,9 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from peewee import SqliteDatabase
+# sqlite3: the library peewee uses (pysqlite3 in the Frigate image), so the
+# lock the test holds is seen by peewee's connections in this process
+from peewee import SqliteDatabase, sqlite3
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from frigate.config import FrigateConfig
