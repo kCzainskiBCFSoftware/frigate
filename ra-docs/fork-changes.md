@@ -169,6 +169,14 @@ timeline endpoints). This file documents the **code** changes.
   so query args reach the vod upstream (path-form variant remains canonical).
 - **`.github/workflows/*` and `.github/actions/setup`** — CI workflows trimmed for
   the fork. *(Not feature-related; review before merging upstream.)*
+- **`.github/workflows/release.yml`, `.github/workflows/bump_version.yml`,
+  `docker/release/version-stamp.Dockerfile`** — releases were a pure retag, so the
+  `<Makefile VERSION>-<sha>` baked in at build time shipped unchanged and a device
+  pulling `:0.17.3` reported `0.17.2-abc1234`. The release now adds one layer on top
+  of the tested image rewriting `frigate/version.py` to the bare tag version; test
+  builds keep the `-<sha>` suffix. Two guards refuse a tag whose version does not
+  match the Makefile at the tagged commit. `bump_version.yml` bumps the Makefile and
+  triggers CI explicitly, since a `GITHUB_TOKEN` push does not.
 
 ---
 
