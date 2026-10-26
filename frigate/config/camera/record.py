@@ -7,6 +7,7 @@ from frigate.const import MAX_PRE_CAPTURE
 from frigate.review.types import SeverityEnum
 
 from ..base import FrigateBaseModel
+from .record_pipeline import RecordPipelineConfig
 
 __all__ = [
     "RecordConfig",
@@ -99,6 +100,10 @@ class RecordConfig(FrigateBaseModel):
     )
     preview: RecordPreviewConfig = Field(
         default_factory=RecordPreviewConfig, title="Recording Preview Config"
+    )
+    pipeline: RecordPipelineConfig = Field(
+        default_factory=RecordPipelineConfig,
+        title="Recording pipeline settings (global only, except recorder_stale_timeout).",
     )
     enabled_in_config: Optional[bool] = Field(
         default=None, title="Keep track of original state of recording."

@@ -1,4 +1,4 @@
-# Fork Changes — Dual-Stream Recording + Playback Performance
+# Fork Changes — Dual-Stream Recording + Playback Performance + Recording Resilience
 
 This document is the canonical changelog for what this fork/branch adds on top of
 upstream `blakeblackshear/frigate`. It is maintained by hand — update it whenever
@@ -25,8 +25,8 @@ you change fork-specific behavior.
 
 ## What the fork does
 
-The fork has **two independent strands**. Both are documented below; each has
-its own client-facing guide.
+The fork has **three independent strands**, all documented below. The first two
+have their own client-facing guides; the third has a config reference.
 
 ### Strand 1 — dual-stream recording with per-variant retention
 
@@ -43,7 +43,7 @@ file tree on disk. Two user-facing capabilities:
 
 ### Strand 2 — playback performance and the precomputed timeline
 
-Driven by a device recording **32 cameras** on a 4-core QNAP with limited RAM,
+Driven by a device recording **32 cameras** on a 4-core NAS with limited RAM,
 serving **4 concurrent VOD players**:
 
 1. **A timeline API that does not ship raw segment rows.** Three new endpoints
@@ -56,10 +56,25 @@ serving **4 concurrent VOD players**:
 3. **Memory and nginx tuning** for NAS-class hardware, including a gzip
    misconfiguration that had silently disabled compression on all `/api/` JSON.
 
+### Strand 3 — recording-path resilience
+
+On the same 32-camera device, every camera periodically logged "Unable to keep
+up with recording segments in cache" in the same second and lost footage, and
+the watchdog then restarted every healthy recorder. The ffmpeg recorders were
+fine; the segment mover was held up by frame processing, by a blocking
+database insert queued behind the cleanup's `wal_checkpoint(TRUNCATE)`, and the
+watchdog read the stalled mover as dead recorders. This strand takes the mover
+off those dependencies, makes WAL maintenance non-blocking, shortens the
+cleanup run, and judges each recorder by its own output. Every part has a
+`record.pipeline.*` or `database.*` setting that restores upstream behavior.
+
 Client-facing guides:
 [ra-docs/dual-stream-api-changes.md](dual-stream-api-changes.md) (the `?variant=`
-model) and [ra-docs/playback-timeline-api.md](playback-timeline-api.md) (the
-timeline endpoints). This file documents the **code** changes.
+model, and §2.1.1 for `null` activity stats) and
+[ra-docs/playback-timeline-api.md](playback-timeline-api.md) (the timeline
+endpoints). Config reference for strand 3:
+[ra-docs/recording-pipeline-config.md](recording-pipeline-config.md). This file
+documents the **code** changes.
 
 ---
 
@@ -175,7 +190,7 @@ timeline endpoints). This file documents the **code** changes.
 ## Playback performance & the precomputed timeline
 
 A second strand of fork work, driven by a device recording 32 cameras on a
-4-core QNAP with limited RAM, serving 4 concurrent VOD players.
+4-core NAS with limited RAM, serving 4 concurrent VOD players.
 
 ### Query shape
 
@@ -294,6 +309,126 @@ public repository.
 
 ---
 
+## Recording-path resilience
+
+OpenSpec change `recording-stall-resilience` (design and field evidence in its
+`design.md`). No schema migration; no existing row is rewritten. Settings,
+defaults and upstream values: [recording-pipeline-config.md](recording-pipeline-config.md).
+
+### Configuration
+- **`frigate/config/camera/record_pipeline.py`** (new) — `RecordPipelineConfig`,
+  the `record.pipeline` block, with `apply_global_pipeline()`, which
+  `FrigateConfig.post_validation` calls so every camera carries the global values
+  except its own `recorder_stale_timeout`. Validates
+  `processing_timeout + 10 < max_cached_segments × 10`.
+- **`frigate/config/database.py`** — `wal_checkpoint`, `wal_size_limit`,
+  `cache_size`.
+- **`frigate/config/camera/camera.py`** — each `ffmpeg_cmds` entry carries its
+  input's `record_variant` (`None` for non-record inputs), so the watchdog maps
+  each record process to one recorder. Additive in `GET /api/config`.
+
+### Segment mover (`frigate/record/maintainer.py`)
+- A continuous-retention segment moves once frame processing has passed its
+  end, or `processing_timeout` after it; on the timeout `motion`, `objects`,
+  `regions` and `dBFS` are stored as `NULL` and `warn_processing_lag` logs at
+  most once per camera per 5 minutes.
+- **Bug fix (found in review):** a continuous or motion segment overlapping an
+  in-progress alert/detection was moved in the review's retain mode before its
+  frames were processed, and `should_discard_segment` then deleted it with no
+  log line. Activity-based discard now waits for complete stats
+  (`frames_processed`). Unconditional — there is no setting for the old behavior.
+- Probes and copies run under an `asyncio.Semaphore(move_concurrency)`
+  (`move_slot()`).
+- `discard_backlog()` applies the cache limit per camera and variant **after**
+  the pass's moves, with the upstream warning texts; `enforce_cache_reserve()`
+  keeps `cache_free_reserve` free at the start and end of each pass (helpers in
+  `frigate/record/cache_watch.py`).
+- Rows go to the writer (`self.writer.submit(rows, saved)`); without it the
+  upstream blocking request remains.
+
+### Row writes (`frigate/record/writer.py`, new)
+- `insert_recording_rows()` — the body of the main-process
+  `INSERT_MANY_RECORDINGS` handler (`frigate/comms/dispatcher.py`). Inserts with
+  `ON CONFLICT DO NOTHING` (re-sent batches are harmless), returns
+  `{"ok": bool, "count"|"error"}` and never raises. **Bug fix (found in review):**
+  a database error escaping the old handler ended the inter-process REP thread,
+  and every REQ client in Frigate then waited forever.
+- `RecordingsWriter` — bounded queue (`db_write_queue`), batches of 500,
+  retry with backoff 1 s → 30 s, warning / error after 60 s / info on recovery
+  with the queue depth, and the `recordings/saved` publication, which never
+  runs ahead of a queued row.
+- Shutdown: `RecordProcess.run` (`frigate/record/record.py`) joins the mover,
+  drains the writer for `db_flush_timeout`, then writes
+  `.recordings_clean_shutdown` next to the database. `FrigateApp.stop()` joins
+  the recording process for `db_flush_timeout + 5` s before terminating it.
+- **Timeline correctness:** `note_late_rows()` in `frigate/record/ranges.py`
+  records rows that start behind a camera/variant's `covered_to`; the next
+  `roll_up_ranges` tick re-merges from there. Without it, a row written more than
+  `MAX_SEGMENT_DURATION` late was never reflected in the precomputed ranges (the
+  bug class of [the postmortem](ranges-underreporting-postmortem.md)).
+
+### Recovery (`frigate/record/reconcile.py`, new)
+- `FrigateApp.init_recording_manager` takes the marker before starting the
+  recording process; without one, `RecordingCleanup.run` calls
+  `reconcile_recordings()` before `sync_recordings`. It scans the per-variant
+  hour directories of the last `reconcile_window` hours, one indexed query per
+  camera and variant, probes each file without a row one at a time and inserts
+  it through `insert_recording_rows` with `NULL` stats. Unprobeable files are
+  logged and left alone; files the new run wrote are left to the writer.
+
+### Recorder watchdog (`frigate/video.py`, `frigate/record/cache_watch.py`)
+- `RecorderWatch` (new, in `cache_watch.py`) scans the cache once per check and
+  keeps, per variant, the newest output seen (file-name start time or mtime);
+  the mover's `latest` messages are only a heartbeat; `valid`/`invalid` are
+  kept per variant via `cache_path` and judged only while the heartbeat is
+  fresh, from no earlier than its last resume.
+- `CameraWatchdog.restart_if_stale()` restarts only the stale recorder and gives
+  it a new startup grace; `warn_if_mover_stalled()` reports a stalled mover at
+  most every 5 minutes and restarts nothing. `recorder_watchdog: mover` keeps the
+  upstream block, which now uses `recorder_stale_timeout` instead of a hardcoded
+  120 s and a `min(90, timeout)` grace.
+
+### Database maintenance (`frigate/db/maintenance.py`, new)
+- `maintain_wal()` — `PASSIVE` checkpoint, bounded `TRUNCATE` fallback (2 s busy
+  timeout, above 4 × `wal_size_limit`), or the upstream `truncate` mode; called
+  from `RecordingCleanup.truncate_wal`.
+- `size_pragmas()` — `cache_size` and `journal_size_limit`, used by
+  `FrigateApp.bind_database`, `init_database`, `RecordProcess.run` and the
+  cleanup's `ANALYZE` connection.
+- `CleanupRunSummary` — one info line per cleanup run: phase timings (expire,
+  directories, checkpoint, stats, ranges), WAL size before/after, checkpoint
+  result.
+
+### Cleanup run (`frigate/record/cleanup.py`, `frigate/record/util.py`)
+- Scoped empty-directory removal: `unlink_recording()` collects each deleted
+  file's directory, `expire_recordings()` returns them, and
+  `remove_empty_parent_directories()` removes those and their parents up to
+  `recordings/` once empty. `full` keeps `remove_empty_directories()`.
+- The removed-camera, per-variant and orphan-variant queries
+  (`removed_camera_query`, `variant_expiry_query`, `orphan_variant_query`) get a
+  `start_time` upper bound (`expiry_seek_bound`) equal to their latest
+  `end_time` cutoff — no result changes, but SQLite seeks an index instead of
+  reading every retained row.
+- **Bug fix:** the per-variant query also selects rows older than the variant's
+  `retain_days` hard cap. Before, a segment *with motion* inside a longer motion
+  window was never read, so the hard cap required by the variant-retention spec
+  did not apply to it.
+
+### Feature flag
+- `recordings_unknown_stats` appended to `FORK_FEATURES` (`frigate/const.py`):
+  `motion`/`objects` in recording listings and summaries can be `null`.
+
+### Upstream files touched
+High rebase-conflict risk: `frigate/record/maintainer.py`,
+`frigate/record/cleanup.py`, `frigate/video.py`. Low to medium:
+`frigate/comms/dispatcher.py` (one handler), `frigate/record/util.py`,
+`frigate/record/record.py`. Low and additive: `frigate/app.py`,
+`frigate/config/camera/record.py`, `frigate/config/config.py` (one call),
+`frigate/config/database.py`, `frigate/config/camera/camera.py`,
+`frigate/const.py`.
+
+---
+
 ## Frontend changes (`web/`)
 
 - **`src/components/player/RecordingPlaybackPreferenceSelect.tsx`** (new) — the
@@ -306,7 +441,10 @@ public repository.
   preference into the export job.
 - **`src/components/overlay/detail/SearchDetailDialog.tsx`,
   `TrackingDetails.tsx`** — variant-aware media references.
-- **`src/types/record.ts`** — variant types.
+- **`src/types/record.ts`** — variant types; `motion`, `objects` and `dBFS` on
+  recording rows are `number | null` (unknown activity stats). No component
+  reads them: the timeline uses the ranges endpoints and the motion graph uses
+  `/review/activity/motion`, which leaves unknown segments out.
 - **`public/locales/en/components/player.json`** — strings for the variant selector.
 
 ---
@@ -359,6 +497,38 @@ public repository.
   It now seeds representative rows across both cameras and variants and runs
   `ANALYZE`, matching production, which ANALYZEs at startup and hourly.
 
+### Strand 3 — recording-path resilience
+
+- **`frigate/test/test_maintainer.py`** — processing timeout (`NULL` stats,
+  `0` waits, motion-only waits, rate-limited warning), complete-stats discard
+  (reproduces the silent deletion on the old code), the copy cap, a backlog moved
+  in the same pass is not discarded, per-variant limits, the free-space reserve,
+  and the hand-off to the writer while the database blocks.
+- **`frigate/test/test_record_writer.py`** (new) — the writer (no waiting on a
+  blocked database, backpressure, retry and outage logging, `saved` never ahead
+  of queued rows, flush on stop, unsent rows reported), the marker, and the
+  handler (idempotent re-send, `NULL` stats, a locked database is a failed
+  outcome, and the real REQ/REP loop keeps serving after one).
+- **`frigate/test/test_record_reconcile.py`** (new) — recovery in and outside the
+  window, re-run no-op, unprobeable files, files of the new run left alone,
+  recovered rows reaching the precomputed timeline, and recovery running before
+  `sync_recordings` only after an unclean shutdown.
+- **`frigate/test/test_video.py`** — `RecorderWatch` and the per-recorder
+  restart: paused mover, no new files, hung `sub`, invalid-only segments,
+  backlog clearing after a resume, grace and the stalled-mover warning.
+- **`frigate/test/test_db_maintenance.py`** (new) — size pragmas on new
+  connections, the WAL cut back to its limit, passive checkpoint not blocking
+  writers, the bounded fallback giving up within its timeout, upstream
+  `truncate` mode, the run summary.
+- **`frigate/test/test_record_cleanup.py`** — scoped directory removal,
+  equivalence of the bounded expiry queries, `EXPLAIN QUERY PLAN` guards on
+  `start_time`, the hard cap with motion, `NULL`-stat retention.
+- **`frigate/test/test_record_retention.py`**, **`test_record_ranges.py`**,
+  **`http_api/test_http_media.py`**, **`http_api/test_http_app.py`**,
+  **`test_config.py`** — `NULL` stats under review retain modes, a row written
+  30 minutes late, the API with `NULL` stats, the fork feature block, and the
+  new settings.
+
 Backend tests do not run natively on Windows (`frigate/log.py` calls
 `os.register_at_fork` at import). Run them in the image:
 
@@ -366,8 +536,10 @@ Backend tests do not run natively on Windows (`frigate/log.py` calls
 docker run --rm --workdir=/opt/frigate --entrypoint= -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/opt/frigate" <frigate-image> python3 -u -m unittest
 ```
 
-Current state: **280 tests**, `ruff check`/`format` clean, mypy clean on every
-changed file. See *Housekeeping* for the two environment-only failures to expect.
+Current state: **374 tests**, `ruff check` clean, `ruff format` clean apart from
+the unchanged `frigate/config/camera/ffmpeg.py` (see *Housekeeping*). mypy was
+last checked for strand 2, not for strand 3. See *Housekeeping* for the
+environment-only failures to expect.
 ---
 
 ## Housekeeping / known issues
@@ -386,5 +558,25 @@ changed file. See *Housekeeping* for the two environment-only failures to expect
   `TestGo2rtcStreamAccess` needs a live go2rtc on `127.0.0.1:1984`, and mypy needs
   `types-peewee` installed or every peewee model reports
   "Class cannot subclass Model".
-- `ra-docs/` holds this changelog, the two client guides and the ranges
-  postmortem, all tracked. Note this file lives in `ra-docs/`, not the repo root.
+- `ra-docs/` holds this changelog, the two client guides, the recording
+  pipeline config reference and the ranges postmortem, all tracked. Note this
+  file lives in `ra-docs/`, not the repo root.
+- Found while building strand 3, **not fixed** (separate changes):
+  - `expire_recordings()` fetches reviews with `start_time` before the *oldest*
+    variant motion cutoff (`min(...)`), so on a dual-stream camera whose `sub`
+    keeps footage longer, `main` segments overlapping alerts or detections
+    between the two windows are expired. It likely wants `max(...)`.
+  - The `INSERT_PREVIEW`, `UPSERT_REVIEW_SEGMENT` and other inter-process
+    handlers can still raise into `InterProcessCommunicator.read()` and end the
+    REP thread; only `INSERT_MANY_RECORDINGS` is hardened.
+  - The main REP thread still waits on the database while it is locked, so other
+    inter-process clients stall as upstream (design open question 6).
+- Test-environment notes: `ruff format --check` with a current ruff (0.17)
+  flags `frigate/config/camera/ffmpeg.py`, which this fork has not changed.
+  **Fixed a flaky test harness:** `BaseTestHttp.tearDown` deleted `test.db`
+  without stopping the test's `SqliteQueueDatabase` writer thread, which kept
+  the deleted files open. Later tests then failed at random with "disk I/O
+  error" or "attempt to write a readonly database" (on the base commit too, e.g.
+  `TestRematerializedMerge` when run from a copy inside the container), and a
+  write queued to a writer that had died at connect waited forever, hanging the
+  full suite. `tearDown` now calls `self.db.stop()`.

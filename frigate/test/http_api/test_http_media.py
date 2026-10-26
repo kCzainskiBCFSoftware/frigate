@@ -1115,3 +1115,114 @@ class TestRecordingsOverlapQuery(BaseTestHttp):
         assert "recordings_camera_variant_start_time_end_time" in plan, plan
         # a two-sided start_time range in the plan detail proves the seek
         assert "start_time<" in plan and "start_time>" in plan, plan
+
+
+class TestUnknownStatsApi(BaseTestHttp):
+    """Segments moved on the processing timeout have NULL activity stats."""
+
+    # 2023-11-14 22:13:20 UTC: hour 22 is mixed, hour 23 is all unknown
+    T = 1700000000.0
+
+    def setUp(self):
+        super().setUp([Event, Recordings, RecordingRanges, RecordingRangeCoverage])
+        self.app = super().create_app()
+
+        async def mock_get_current_user(request: Request):
+            return {"username": "admin", "role": "admin"}
+
+        self.app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        async def mock_get_allowed_cameras_for_filter(request: Request):
+            return ["front_door"]
+
+        self.app.dependency_overrides[get_allowed_cameras_for_filter] = (
+            mock_get_allowed_cameras_for_filter
+        )
+
+        for id, start, motion, objects in (
+            ("unknown-22", self.T, None, None),
+            ("known-22", self.T + 10, 5, 1),
+            ("unknown-23", self.T + 3600, None, None),
+        ):
+            Recordings.insert(
+                id=id,
+                path=f"/rec/{id}.mp4",
+                camera="front_door",
+                start_time=start,
+                end_time=start + 10,
+                duration=10,
+                motion=motion,
+                objects=objects,
+                regions=None if motion is None else 2,
+                dBFS=None if motion is None else 0,
+                variant="main",
+            ).execute()
+
+    def tearDown(self):
+        self.app.dependency_overrides.clear()
+        super().tearDown()
+
+    def test_listing_reports_null_not_zero(self):
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                "/front_door/recordings",
+                params={"after": self.T, "before": self.T + 20, "variant": "main"},
+            )
+
+        assert response.status_code == 200
+        rows = {r["id"]: r for r in response.json()}
+        assert rows["unknown-22"]["motion"] is None
+        assert rows["unknown-22"]["objects"] is None
+        assert rows["known-22"]["motion"] == 5
+
+    def test_hourly_summary_totals_known_values(self):
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                "/front_door/recordings/summary",
+                params={"timezone": "utc", "variant": "main"},
+            )
+
+        assert response.status_code == 200
+        hours = {h["hour"]: h for day in response.json() for h in day["hours"]}
+        # mixed hour: the total of the known values
+        assert hours["22"]["motion"] == 5 and hours["22"]["objects"] == 1
+        # every segment unknown: the total is unknown too
+        assert hours["23"]["motion"] is None and hours["23"]["objects"] is None
+        assert hours["23"]["duration"] == 10
+
+    def test_motion_activity_skips_unknown_segments(self):
+        with AuthTestClient(self.app) as client:
+            response = client.get(
+                "/review/activity/motion",
+                params={
+                    "cameras": "front_door",
+                    "after": self.T + 3000,
+                    "before": self.T + 4000,
+                    "scale": 30,
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_timeline_and_playback_include_unknown_segments(self):
+        with AuthTestClient(self.app) as client:
+            ranges = client.get(
+                "/front_door/recordings/ranges",
+                params={
+                    "after": self.T,
+                    "before": self.T + 3700,
+                    "gap": 3,
+                    "variant": "main",
+                },
+            )
+            vod = client.get(f"/vod/front_door/start/{self.T}/end/{self.T + 20}/main")
+
+        assert ranges.status_code == 200
+        assert ranges.json() == [
+            {"start": self.T, "end": self.T + 20},
+            {"start": self.T + 3600, "end": self.T + 3610},
+        ]
+        assert vod.status_code == 200
+        clips = [c["path"] for seq in vod.json()["sequences"] for c in seq["clips"]]
+        assert clips == ["/rec/unknown-22.mp4", "/rec/known-22.mp4"]

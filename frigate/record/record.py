@@ -7,8 +7,10 @@ from playhouse.sqliteq import SqliteQueueDatabase
 
 from frigate.config import FrigateConfig
 from frigate.const import PROCESS_PRIORITY_HIGH
+from frigate.db.maintenance import size_pragmas
 from frigate.models import Recordings, ReviewSegment
 from frigate.record.maintainer import RecordingMaintainer
+from frigate.record.writer import RecordingsWriter, write_clean_shutdown_marker
 from frigate.util.process import FrigateProcess
 
 logger = logging.getLogger(__name__)
@@ -33,7 +35,9 @@ class RecordProcess(FrigateProcess):
                 # 256MB page-cache ceiling (was 512MB). This process is
                 # write-heavy -- one row per camera per variant every segment_time --
                 # so it benefits least of the three from a large read cache.
-                "cache_size": -256 * 1000,
+                # database.cache_size (default 256) and the WAL bound
+                # database.wal_size_limit come from size_pragmas.
+                **size_pragmas(self.config.database),
                 # Read pages through an mmap of the db instead of copying them into
                 # this connection's private cache: the mapping is file-backed, so the
                 # kernel can reclaim it under memory pressure (SQLite's own page cache
@@ -50,8 +54,23 @@ class RecordProcess(FrigateProcess):
         models = [ReviewSegment, Recordings]
         db.bind(models)
 
+        pipeline = self.config.record.pipeline
+        writer = RecordingsWriter(self.config) if pipeline.async_db_writes else None
+
+        if writer is not None:
+            writer.start()
+
         maintainer = RecordingMaintainer(
             self.config,
             self.stop_event,
+            writer,
         )
         maintainer.start()
+        maintainer.join()
+
+        # the mover has stopped: write what it queued, then record a clean stop
+        # so the next start skips the recovery scan
+        drained = writer is None or writer.stop(pipeline.db_flush_timeout)
+
+        if self.stop_event.is_set() and drained:
+            write_clean_shutdown_marker(self.config.database.path)

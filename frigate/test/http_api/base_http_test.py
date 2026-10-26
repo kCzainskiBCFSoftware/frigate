@@ -122,6 +122,12 @@ class BaseTestHttp(unittest.TestCase):
         if not self.db.is_closed():
             self.db.close()
 
+        # the queue's writer thread holds a connection of its own; left running
+        # it keeps the deleted files open, and a later test's fresh test.db can
+        # then fail with "disk I/O error" or "attempt to write a readonly
+        # database", or a write can wait forever on a writer that died
+        self.db.stop()
+
         try:
             for file in TEST_DB_CLEANUPS:
                 os.remove(file)
