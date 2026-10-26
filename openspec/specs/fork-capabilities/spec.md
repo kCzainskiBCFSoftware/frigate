@@ -7,11 +7,7 @@ Let clients on a mixed-version fleet find out which fork-only features a device 
 
 ### Requirement: Fork block on the config endpoint
 
-`GET /api/config` SHALL include a top-level `fork` object with `version`, the build version string, and `features`, a sorted list of feature flags. No existing config key SHALL be changed by adding it. The current flags are:
-
-- `recording_variants`: the `variant` selector on recording endpoints is supported.
-- `recordings_ranges`: `GET /api/recordings/ranges` and `GET /api/{camera}/recordings/ranges` exist.
-- `recordings_hours`: `GET /api/recordings/hours` exists.
+`GET /api/config` SHALL include a top-level `fork` object with `version`, the build version string, and `features`, a sorted list of feature flags. No existing config key SHALL be changed by adding it. The flags and their meaning are listed under "Feature flags and their meaning".
 
 #### Scenario: Client detects the timeline API
 - **WHEN** a client reads `GET /api/config` and finds `recordings_ranges` in `fork.features`
@@ -28,3 +24,16 @@ A feature flag that has shipped SHALL NOT be renamed or removed. A new client-fa
 #### Scenario: Adding a feature
 - **WHEN** a new fork-only endpoint is released
 - **THEN** a new flag is appended to `fork.features`, and all earlier flags are still present
+
+### Requirement: Feature flags and their meaning
+
+A flag in `fork.features` SHALL mean that the build supports the behavior it names:
+
+- `recording_variants`: the `variant` selector on recording endpoints is supported.
+- `recordings_ranges`: `GET /api/recordings/ranges` and `GET /api/{camera}/recordings/ranges` exist.
+- `recordings_hours`: `GET /api/recordings/hours` exists.
+- `recordings_unknown_stats`: `motion` and `objects` in recording listings and summaries can be `null`, meaning unknown, which is not the same as zero.
+
+#### Scenario: Client learns that statistics can be unknown
+- **WHEN** a client finds `recordings_unknown_stats` in `fork.features`
+- **THEN** it treats a `null` `motion` or `objects` value as unknown, not as "no activity"

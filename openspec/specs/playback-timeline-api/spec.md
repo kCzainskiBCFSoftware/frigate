@@ -97,3 +97,7 @@ Ranges MAY come from precomputed data, but answers SHALL be the same as merging 
 #### Scenario: Late-arriving segment
 - **WHEN** a segment is written for a window after part of that window was already precomputed
 - **THEN** later responses for that window include the segment's footage
+
+#### Scenario: Row written long after its segment
+- **WHEN** a segment's row is written 30 minutes after the segment was recorded, because the database was locked or because recovery after an unclean shutdown added it
+- **THEN** once the next rollup tick has run, ranges for that window include the segment's footage, the same as if the row had been written on time
