@@ -5,7 +5,8 @@ upstream `blakeblackshear/frigate`. It is maintained by hand — update it whene
 you change fork-specific behavior.
 
 - **Upstream base:** tag `v0.17.1` (`416a9b76`)
-- **Active branch:** `v17.1-update-with-adaptive`
+- **Active branch:** `dev-fork`, the repo's default branch. It replaced
+  `v17.1-update-with-adaptive` on 2026-10-29; `dev` only mirrors upstream.
 - **Behavior specs:** `openspec/specs/` (one per capability). This file stays the
   code-level changelog.
 - **Branch commits:**
@@ -169,6 +170,19 @@ timeline endpoints). This file documents the **code** changes.
   so query args reach the vod upstream (path-form variant remains canonical).
 - **`.github/workflows/*` and `.github/actions/setup`** — CI workflows trimmed for
   the fork. *(Not feature-related; review before merging upstream.)*
+- **`.github/workflows/release.yml`, `.github/workflows/bump_version.yml`,
+  `docker/release/version-stamp.Dockerfile`** — releases were a pure retag, so the
+  `<Makefile VERSION>-<sha>` baked in at build time shipped unchanged and a device
+  pulling `:0.17.3` reported `0.17.2-7246a15`. `Makefile` `VERSION` now always holds
+  the version being worked toward (`0.17.4` from here). **Release** (run with the
+  tested sha, or on a pushed `v*` tag) adds one layer on top of the tested image that
+  rewrites `frigate/version.py` to the bare version, pushes `:<version>` + `:stable`,
+  creates the tag, and moves the Makefile on `dev-fork` to the next patch version.
+  Guards refuse a commit not on `dev-fork`, a version already tagged, and a tag that
+  disagrees with the Makefile. `bump_version.yml` is only for minor/major jumps.
+- **`.github/workflows/ci.yml`** — `RELEASE_BRANCH` moved from
+  `v17.1-update-with-adaptive` to `dev-fork`. Only pushes to `dev-fork` publish
+  `<version>-<sha>` and move `latest`.
 
 ---
 
