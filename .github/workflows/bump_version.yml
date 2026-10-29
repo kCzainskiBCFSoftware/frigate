@@ -1,20 +1,23 @@
 name: Bump version
 
-# Bumps the Makefile VERSION that CI bakes into every image, on the branch this is
-# dispatched from. The release flow is:
+# The Makefile VERSION on the release branch is the version being worked toward: CI
+# bakes it into every build as <version>-<sha>, and "Release" ships it, then moves it
+# to the next patch version on its own. So this is only needed to jump further — a
+# minor or major release (0.17.5 -> 0.18.0):
 #
-#   1. run this workflow with the new version (e.g. 0.17.3)
-#   2. CI builds and publishes 0.17.3-<sha> — test that image
-#   3. tag the bump commit `v0.17.3` to ship it; release.yml stamps the bare 0.17.3
-#
-# release.yml refuses a tag whose version does not match the Makefile, so step 1 cannot
-# be skipped by accident.
+#   1. run this on the release branch with the new version
+#   2. CI builds and publishes <version>-<sha> — test that image
+#   3. run "Release" with that sha
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'New version, e.g. 0.17.3 (no leading v)'
+        description: 'New version, e.g. 0.18.0 (no leading v)'
         required: true
+
+env:
+  # Must match RELEASE_BRANCH in ci.yml.
+  RELEASE_BRANCH: dev-fork
 
 jobs:
   bump:
@@ -24,6 +27,15 @@ jobs:
       actions: write
 
     steps:
+      # Another branch's Makefile version would not reach a build that can be
+      # released, and would conflict with the release branch on merge.
+      - name: Guard - run on the release branch
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "${RELEASE_BRANCH}" ]; then
+            echo "::error::Run this on ${RELEASE_BRANCH}, not ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
       - name: Check out the branch
         uses: actions/checkout@v6
         with:
@@ -36,7 +48,7 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::'${VERSION}' is not X.Y.Z — no leading v, no suffix"
+            echo "::error::'${VERSION}' is not X.Y.Z (no leading v, no suffix)"
             exit 1
           fi
 
@@ -45,23 +57,28 @@ jobs:
             echo "::error::The Makefile on ${GITHUB_REF_NAME} already says ${VERSION}"
             exit 1
           fi
+          # Going backwards would make builds claim a version older than one already
+          # being worked toward, and could reuse a version number.
+          if [ "$(printf '%s\n%s\n' "${CURRENT}" "${VERSION}" | sort -V | tail -1)" != "${VERSION}" ]; then
+            echo "::error::${VERSION} is lower than the current ${CURRENT}"
+            exit 1
+          fi
 
-          # Releasing a version twice would move the :${VERSION} tag to different bytes
-          # on devices that already pulled it.
+          # Releasing a version twice would move the :${VERSION} image tag to different
+          # bytes on devices that already pulled it.
           if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
             echo "::error::v${VERSION} is already tagged — pick a new version"
             exit 1
           fi
 
           sed -i "s/^VERSION = .*/VERSION = ${VERSION}/" Makefile
-
           if git diff --quiet -- Makefile; then
             echo "::error::Makefile was not changed — the VERSION line did not match"
             exit 1
           fi
 
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
-          echo "CURRENT=${CURRENT}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "CURRENT=${CURRENT}" >> "$GITHUB_ENV"
           git --no-pager diff -- Makefile
 
       - name: Commit and push
@@ -70,13 +87,14 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "Bump version to ${VERSION}" -- Makefile
           git push origin "HEAD:${GITHUB_REF_NAME}"
-          echo "BUMP_SHA=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
+          echo "BUMP_SHA=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
 
       # A push made with GITHUB_TOKEN deliberately does not trigger other workflows, so
-      # CI has to be asked for explicitly or the bump commit would never get built.
+      # CI has to be asked for explicitly, or there would be no <version>-<sha> image to
+      # test until the next merge.
       - name: Trigger CI for the bump commit
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: gh workflow run ci.yml --ref "${GITHUB_REF_NAME}"
 
       - name: Summary
@@ -90,8 +108,5 @@ jobs:
             echo "| Commit | \`${BUMP_SHA}\` |"
             echo "| CI will publish | \`${VERSION}-${BUMP_SHA}\` |"
             echo ""
-            echo "Test that image, then tag this commit to release it:"
-            echo '```'
-            echo "git fetch && git tag v${VERSION} ${BUMP_SHA} && git push origin v${VERSION}"
-            echo '```'
+            echo "Test that image, then run **Release** with sha \`${BUMP_SHA}\`."
           } >> "$GITHUB_STEP_SUMMARY"

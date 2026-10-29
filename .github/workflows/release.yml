@@ -1,77 +1,133 @@
-name: On release
+name: Release
 
-# Promotes an image CI already built, and you already tested, to a deliberate version
-# tag. The image is not rebuilt: a single layer is added on top that rewrites
-# frigate/version.py to the bare tag version, so a released instance reports `0.17.3`
-# and never `0.17.3-abc1234`. Every other layer is the one you tested, and ECR already
-# holds them, so only the new layer is uploaded.
+# Releases a build you have already tested. Run it from the Actions tab with the sha
+# of the image you tested (abc1234 from :0.17.4-abc1234), or push a v* tag yourself;
+# both take the same path:
 #
-# The tagged commit must have been built by CI first, and its Makefile VERSION must
-# match the tag — see the guards below.
+#   1. The version comes from the Makefile at that commit. The Makefile always holds
+#      the version being worked toward, so there is nothing to type.
+#   2. The tested image gets one layer that rewrites frigate/version.py to the bare
+#      version (docker/release/version-stamp.Dockerfile) and is pushed as :<version>
+#      and :stable. Every other layer is the image you tested, byte for byte.
+#   3. The v<version> tag is created, unless you pushed it yourself.
+#   4. The Makefile on the release branch moves to the next patch version, so every
+#      build after the release reports the version being worked toward next.
+#
+# For a minor or major release, run "Bump version" first (e.g. to 0.18.0).
 on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit to release: the sha of the image you tested (abc1234 from :0.17.4-abc1234)'
+        required: true
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Existing version tag to release, e.g. v0.17.3'
-        required: true
+
+# Two releases at once would race on the tag and on the Makefile bump.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # Must match RELEASE_BRANCH in ci.yml.
+  RELEASE_BRANCH: dev-fork
 
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
-      contents: read
+      contents: write
 
     steps:
-      # A manual dispatch has no tag in github.ref_name — it is the branch the workflow
-      # was dispatched from — so the tag comes from the input there and is validated
-      # either way. Deriving it from the branch is how `17.1-update-with-adaptive` ends
-      # up pushed as an image tag.
-      - name: Resolve and validate the tag
-        env:
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: |
-          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "::error::'${TAG}' is not a version tag (expected vX.Y.Z or vX.Y.Z-suffix)"
-            exit 1
-          fi
-
-          CLEAN_VERSION="${TAG#v}"
-          {
-            echo "TAG=${TAG}"
-            echo "CLEAN_VERSION=${CLEAN_VERSION}"
-            # A pre-release tag like v0.18.0-beta1 is built from the 0.18.0 source, so
-            # the Makefile is checked against the base while the image is stamped with
-            # the full tag.
-            echo "BASE_VERSION=${CLEAN_VERSION%%-*}"
-            echo "BUILD_TYPE=$([[ "${CLEAN_VERSION}" == *-* ]] && echo beta || echo stable)"
-            echo "REGISTRY=${{ secrets.ECR_REGISTRY }}"
-            echo "REPOSITORY=${{ vars.ECR_REPOSITORY }}"
-          } >> $GITHUB_ENV
-
-      - name: Check out the tagged commit
+      - name: Check out the release branch
         uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ env.TAG }}
-          persist-credentials: false
+          ref: ${{ env.RELEASE_BRANCH }}
+          fetch-depth: 1
 
-      # The image tags use ${GITHUB_SHA::7}, and git's own abbreviation is 8 chars in
-      # this repo, so the length is pinned rather than left to git.
-      - name: Resolve the build tag
-        run: echo "BUILD_TAG=sha-$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Guard - the Makefile version must match the tag
+      # A tag push names the version and the Makefile has to agree with it. A manual
+      # run names only the commit, and the version is whatever its Makefile says.
+      - name: Resolve the commit and version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_SHA: ${{ inputs.sha }}
         run: |
-          MAKEFILE_VERSION=$(grep -m1 '^VERSION' Makefile | cut -d'=' -f2 | tr -d ' ')
-          if [ "${MAKEFILE_VERSION}" != "${BASE_VERSION}" ]; then
-            echo "::error::Tag ${TAG} was applied to a commit whose Makefile says VERSION = ${MAKEFILE_VERSION}, not ${BASE_VERSION}."
-            echo "::error::Run the 'Bump version' workflow, let CI rebuild, test that image, then tag the bump commit."
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            FULL_SHA="${GITHUB_SHA}"
+            if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+              echo "::error::'${TAG}' is not a version tag (expected vX.Y.Z or vX.Y.Z-suffix)"
+              exit 1
+            fi
+          else
+            if ! [[ "${INPUT_SHA}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+              echo "::error::'${INPUT_SHA}' is not a commit sha"
+              exit 1
+            fi
+            if ! FULL_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}" --jq .sha 2>/dev/null); then
+              echo "::error::No commit ${INPUT_SHA} in ${GITHUB_REPOSITORY}"
+              exit 1
+            fi
+          fi
+
+          git fetch --no-tags --depth 1 origin "${FULL_SHA}"
+          MAKEFILE_VERSION=$(git show "${FULL_SHA}:Makefile" | grep -m1 '^VERSION' | cut -d'=' -f2 | tr -d ' ')
+          if ! [[ "${MAKEFILE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Makefile at ${FULL_SHA::7} has VERSION = '${MAKEFILE_VERSION}', not X.Y.Z"
             exit 1
           fi
-          echo "Makefile VERSION = ${MAKEFILE_VERSION}, matches ${TAG}"
+
+          if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
+            TAG="v${MAKEFILE_VERSION}"
+          fi
+          VERSION="${TAG#v}"
+          # A pre-release tag like v0.18.0-beta1 is built from the 0.18.0 source, so the
+          # Makefile is checked against the base while the image gets the full tag.
+          BASE_VERSION="${VERSION%%-*}"
+
+          if [ "${MAKEFILE_VERSION}" != "${BASE_VERSION}" ]; then
+            echo "::error::Tag ${TAG} was pushed on a commit whose Makefile says VERSION = ${MAKEFILE_VERSION}, not ${BASE_VERSION}."
+            exit 1
+          fi
+
+          {
+            echo "TAG=${TAG}"
+            echo "VERSION=${VERSION}"
+            echo "BASE_VERSION=${BASE_VERSION}"
+            echo "BUILD_TYPE=$([[ "${VERSION}" == *-* ]] && echo beta || echo stable)"
+            echo "FULL_SHA=${FULL_SHA}"
+            # The image tags use ${GITHUB_SHA::7}; git's own abbreviation is 8 chars here.
+            echo "BUILD_TAG=sha-${FULL_SHA::7}"
+            echo "REGISTRY=${{ secrets.ECR_REGISTRY }}"
+            echo "REPOSITORY=${{ vars.ECR_REPOSITORY }}"
+          } >> "$GITHUB_ENV"
+          echo "Releasing ${FULL_SHA::7} as ${VERSION}"
+
+      # Releases come from the baseline: a feature-branch build is not what gets merged,
+      # and the version bump below would land on code that never contained it.
+      - name: Guard - the commit must be on the release branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${FULL_SHA}...${RELEASE_BRANCH}" --jq .status)
+          case "${STATUS}" in
+            ahead|identical) echo "${FULL_SHA::7} is on ${RELEASE_BRANCH}" ;;
+            *)
+              echo "::error::${FULL_SHA::7} is not on ${RELEASE_BRANCH} (compare status: ${STATUS}). Merge it, let CI build ${RELEASE_BRANCH}, and release that build."
+              exit 1
+              ;;
+          esac
+
+      # Only a manual run creates the tag, so only a manual run can collide with one.
+      - name: Guard - the version must not be released already
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::${TAG} is already released, and the Makefile at ${FULL_SHA::7} still says ${VERSION}. Release a build made after the post-release version bump, or move the version with 'Bump version'."
+            exit 1
+          fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -88,48 +144,90 @@ jobs:
           if ! aws ecr describe-images \
                 --repository-name "${REPOSITORY}" \
                 --image-ids imageTag="${BUILD_TAG}" >/dev/null 2>&1; then
-            echo "::error::No image tagged ${BUILD_TAG} in ${REPOSITORY}. That commit was never built by CI — push it to a branch and let CI finish before tagging."
+            echo "::error::No image tagged ${BUILD_TAG} in ${REPOSITORY}. That commit was never built by CI — let CI finish on ${RELEASE_BRANCH} before releasing."
             exit 1
           fi
 
+      # The image goes out before the tag, so a failure here leaves no tag behind and
+      # the run can simply be retried.
       - name: Stamp the release version and push
         run: |
           SOURCE="${REGISTRY}/${REPOSITORY}:${BUILD_TAG}"
-          TAGS=(--tag "${REGISTRY}/${REPOSITORY}:${CLEAN_VERSION}")
+          TAGS=(--tag "${REGISTRY}/${REPOSITORY}:${VERSION}")
           if [ "${BUILD_TYPE}" = "stable" ]; then
             TAGS+=(--tag "${REGISTRY}/${REPOSITORY}:stable")
           fi
 
-          # Empty context: the Dockerfile comes from the checkout via -f and needs
+          # Empty context: the Dockerfile comes from the checkout via --file and needs
           # nothing else, so there is no reason to upload the repo to the builder.
           mkdir -p /tmp/empty-context
 
           # provenance=false keeps this a plain single-platform manifest, matching what
-          # CI pushes — an attestation index confuses the QNAP's Docker.
+          # CI pushes; an attestation index confuses the Docker on the QNAP.
           docker buildx build \
             --file docker/release/version-stamp.Dockerfile \
             --build-arg SOURCE="${SOURCE}" \
-            --build-arg RELEASE_VERSION="${CLEAN_VERSION}" \
+            --build-arg RELEASE_VERSION="${VERSION}" \
             --build-arg BASE_VERSION="${BASE_VERSION}" \
             "${TAGS[@]}" \
             --provenance=false \
             --push \
             /tmp/empty-context
 
+      # A tag pushed with GITHUB_TOKEN does not trigger workflows, so this does not
+      # start a second release.
+      - name: Create the release tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${VERSION}" "${FULL_SHA}"
+          git push origin "refs/tags/${TAG}"
+
+      # Pre-releases are steps toward the same version, so only a stable release moves
+      # it on. If the Makefile has already moved past the release (someone ran "Bump
+      # version"), it is left alone. CI is not triggered for the bump commit: it would
+      # only rebuild the released code, and the next merge builds anyway.
+      - name: Move the release branch to the next version
+        if: env.BUILD_TYPE == 'stable'
+        run: |
+          IFS=. read -r MAJOR MINOR PATCH <<< "${BASE_VERSION}"
+          NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Retry in case a merge lands on the release branch while this runs.
+          for attempt in 1 2 3; do
+            git fetch --no-tags --depth 1 origin "${RELEASE_BRANCH}"
+            git checkout -q -B "${RELEASE_BRANCH}" FETCH_HEAD
+            CURRENT=$(grep -m1 '^VERSION' Makefile | cut -d'=' -f2 | tr -d ' ')
+            if [ "${CURRENT}" != "${BASE_VERSION}" ]; then
+              echo "::notice::Makefile on ${RELEASE_BRANCH} already says ${CURRENT}, not ${BASE_VERSION}; left as is"
+              echo "NEXT_VERSION=${CURRENT}" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sed -i "s/^VERSION = .*/VERSION = ${NEXT}/" Makefile
+            git commit -q -m "Bump version to ${NEXT} after releasing ${TAG}" -- Makefile
+            if git push origin "HEAD:${RELEASE_BRANCH}"; then
+              echo "NEXT_VERSION=${NEXT}" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "Push lost a race with another change to ${RELEASE_BRANCH}, retrying (${attempt}/3)"
+          done
+          echo "::error::Released ${TAG}, but could not push the bump to ${NEXT}. Run 'Bump version' with ${NEXT}."
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
           {
-            echo "### Released \`${CLEAN_VERSION}\`"
+            echo "### Release ${VERSION:-?}"
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| Tag | \`${TAG}\` |"
-            echo "| Built from | \`${BUILD_TAG}\` |"
-            echo "| Instances report | \`${CLEAN_VERSION}\` |"
-            echo ""
-            echo "Pushed:"
-            echo '```'
-            echo "${REGISTRY}/${REPOSITORY}:${CLEAN_VERSION}"
-            if [ "${BUILD_TYPE}" = "stable" ]; then
-              echo "${REGISTRY}/${REPOSITORY}:stable"
-            fi
-            echo '```'
+            echo "| Commit | \`${FULL_SHA::7}\` |"
+            echo "| Tag | \`${TAG:-?}\` |"
+            echo "| Image | \`${REPOSITORY:-?}:${VERSION:-?}\` |"
+            echo "| Instances report | \`${VERSION:-?}\` |"
+            echo "| ${RELEASE_BRANCH} now builds | \`${NEXT_VERSION:-unchanged}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
