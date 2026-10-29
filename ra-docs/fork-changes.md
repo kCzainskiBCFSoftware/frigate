@@ -5,7 +5,8 @@ upstream `blakeblackshear/frigate`. It is maintained by hand — update it whene
 you change fork-specific behavior.
 
 - **Upstream base:** tag `v0.17.1` (`416a9b76`)
-- **Active branch:** `v17.1-update-with-adaptive`
+- **Active branch:** `dev-fork`, the repo's default branch. It replaced
+  `v17.1-update-with-adaptive` on 2026-10-29; `dev` only mirrors upstream.
 - **Behavior specs:** `openspec/specs/` (one per capability). This file stays the
   code-level changelog.
 - **Branch commits:**
@@ -177,6 +178,9 @@ timeline endpoints). This file documents the **code** changes.
   builds keep the `-<sha>` suffix. Two guards refuse a tag whose version does not
   match the Makefile at the tagged commit. `bump_version.yml` bumps the Makefile and
   triggers CI explicitly, since a `GITHUB_TOKEN` push does not.
+- **`.github/workflows/ci.yml`** — `RELEASE_BRANCH` moved from
+  `v17.1-update-with-adaptive` to `dev-fork`. Only pushes to `dev-fork` publish
+  `<version>-<sha>` and move `latest`.
 
 ---
 

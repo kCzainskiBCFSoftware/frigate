@@ -22,9 +22,9 @@ permissions:
 
 env:
   # Branch that publishes the versioned tag and moves `latest` (what the QNAP pulls).
-  # Every other branch publishes only a throwaway sha-<sha> image. Update when the
-  # working branch moves on.
-  RELEASE_BRANCH: v17.1-update-with-adaptive
+  # Every other branch publishes only a throwaway sha-<sha> image. This is the fork's
+  # default branch; `dev` only mirrors upstream.
+  RELEASE_BRANCH: dev-fork
 
 jobs:
   checks:
