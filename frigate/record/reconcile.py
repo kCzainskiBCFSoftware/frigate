@@ -8,17 +8,15 @@ file would never be listed, played or expired.
 
 When the previous run did not leave its clean-shutdown marker, this scans the
 per-variant hour directories of the last ``record.pipeline.reconcile_window``
-hours, finds files that have no row, probes them one at a time and inserts a
-row with unknown (NULL) activity stats. Inserts ignore rows that exist, so
-running it twice changes nothing.
+hours, finds files that have no row, probes them one at a time and inserts
+rows with unknown (NULL) activity stats, in batches. Inserts ignore rows that
+exist, so running it twice changes nothing.
 """
 
 import asyncio
 import datetime
 import logging
 import os
-import random
-import string
 from typing import Any, Optional, get_args
 
 import psutil
@@ -27,7 +25,9 @@ from frigate.config import FrigateConfig
 from frigate.config.camera.ffmpeg import RecordVariant
 from frigate.const import MAX_SEGMENT_DURATION, RECORD_DIR
 from frigate.models import Recordings
-from frigate.record.writer import insert_recording_rows
+from frigate.record.util import recording_row
+from frigate.record.variants import apply_variant_filter
+from frigate.record.writer import BATCH_ROWS, insert_recording_rows
 from frigate.util.services import get_video_properties
 
 logger = logging.getLogger(__name__)
@@ -101,28 +101,65 @@ def _row(
     except OSError:
         size_bytes = 0
 
-    rand_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    # the frames were never matched to this segment: stats unknown, not zero
+    return recording_row(
+        camera,
+        variant,
+        path,
+        start,
+        start + duration,
+        duration,
+        size_bytes,
+        media_info,
+    )
 
-    return {
-        Recordings.id.name: f"{start}-{rand_id}",
-        Recordings.camera.name: camera,
-        Recordings.path.name: path,
-        Recordings.start_time.name: start,
-        Recordings.end_time.name: start + duration,
-        Recordings.duration.name: duration,
-        # the frames were never matched to this segment: unknown, not zero
-        Recordings.motion.name: None,
-        Recordings.objects.name: None,
-        Recordings.regions.name: None,
-        Recordings.dBFS.name: None,
-        Recordings.segment_size.name: round(float(size_bytes) / pow(2, 20), 2),
-        Recordings.variant.name: variant,
-        Recordings.codec_name.name: media_info.get("fourcc"),
-        Recordings.width.name: media_info.get("width") or None,
-        Recordings.height.name: media_info.get("height") or None,
-        Recordings.bitrate.name: int(size_bytes * 8 / duration) if size_bytes else None,
-        Recordings.transcoded_from_main.name: False,
-    }
+
+def _insert(rows: list[dict[str, Any]]) -> int:
+    """Insert one batch of recovered rows. Returns how many were stored."""
+    result = insert_recording_rows(rows)
+
+    if not result["ok"]:
+        logger.error(
+            f"Recovery could not add rows for {len(rows)} segments "
+            f"({rows[0][Recordings.path.name]} to {rows[-1][Recordings.path.name]}): "
+            f"{result.get('error')}"
+        )
+        return 0
+
+    return len(rows)
+
+
+async def _recover(
+    config: FrigateConfig, missing: list[tuple[str, str, str, float]]
+) -> int:
+    """Probe each file in turn and insert the rows in batches."""
+    recovered = 0
+    rows: list[dict[str, Any]] = []
+
+    for camera, variant, path, start in missing:
+        # one at a time: recovery runs while 32 cameras record
+        media_info = await get_video_properties(config.ffmpeg, path, get_duration=True)
+        duration = float(media_info.get("duration", -1))
+
+        if (
+            not media_info.get("has_valid_video", False)
+            or not 0 < duration < MAX_SEGMENT_DURATION
+        ):
+            logger.warning(
+                f"Recovery could not probe {path}; leaving it in place without a row"
+            )
+            continue
+
+        rows.append(_row(camera, variant, path, start, media_info))
+
+        if len(rows) >= BATCH_ROWS:
+            recovered += _insert(rows)
+            rows = []
+
+    if rows:
+        recovered += _insert(rows)
+
+    return recovered
 
 
 def reconcile_recordings(
@@ -142,19 +179,19 @@ def reconcile_recordings(
     )
     since = now - config.record.pipeline.reconcile_window * 3600
     files = segment_files(since, now)
-    recovered = 0
+    missing: list[tuple[str, str, str, float]] = []
 
     for (camera, variant), segments in sorted(files.items()):
         known = {
             path
-            for (path,) in Recordings.select(Recordings.path)
-            .where(
-                Recordings.camera == camera,
-                Recordings.variant == variant,
-                Recordings.start_time >= since - MAX_SEGMENT_DURATION,
-                Recordings.start_time <= now,
-            )
-            .tuples()
+            for (path,) in apply_variant_filter(
+                Recordings.select(Recordings.path).where(
+                    Recordings.camera == camera,
+                    Recordings.start_time >= since - MAX_SEGMENT_DURATION,
+                    Recordings.start_time <= now,
+                ),
+                variant,
+            ).tuples()
         }
 
         for path, start in sorted(segments.items(), key=lambda s: s[1]):
@@ -167,29 +204,15 @@ def reconcile_recordings(
             except OSError:
                 continue
 
-            media_info = asyncio.run(
-                get_video_properties(config.ffmpeg, path, get_duration=True)
-            )
-            duration = float(media_info.get("duration", -1))
+            missing.append((camera, variant, path, start))
 
-            if (
-                not media_info.get("has_valid_video", False)
-                or not 0 < duration < MAX_SEGMENT_DURATION
-            ):
-                logger.warning(
-                    f"Recovery could not probe {path}; leaving it in place without a row"
-                )
-                continue
+    if missing:
+        logger.info(
+            f"Recovery is probing {len(missing)} recording segments that have no "
+            "database row"
+        )
 
-            result = insert_recording_rows(
-                [_row(camera, variant, path, start, media_info)]
-            )
-
-            if not result["ok"]:
-                logger.error(f"Recovery could not add a row for {path}: {result}")
-                continue
-
-            recovered += 1
+    recovered = asyncio.run(_recover(config, missing)) if missing else 0
 
     if recovered:
         logger.warning(

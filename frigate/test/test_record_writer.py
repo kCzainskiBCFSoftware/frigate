@@ -72,6 +72,7 @@ class FakeRequestor:
         self.open = threading.Event()
         self.open.set()
         self.fail_times = 0
+        self.raise_times = 0
         self.batches: list[list[dict]] = []
         self.calls = 0
 
@@ -79,6 +80,10 @@ class FakeRequestor:
         assert topic == INSERT_MANY_RECORDINGS
         self.calls += 1
         self.open.wait()
+
+        if self.raise_times > 0:
+            self.raise_times -= 1
+            raise TypeError("Object of type int64 is not JSON serializable")
 
         if self.fail_times > 0:
             self.fail_times -= 1
@@ -140,26 +145,59 @@ class TestRecordingsWriter(unittest.TestCase):
         assert wait_until(lambda: len(self.requestor.written()) == 20)
         assert writer.stop(5)
 
-    def test_full_queue_applies_backpressure_and_drops_nothing(self):
+    def test_full_queue_holds_the_mover_and_drops_nothing(self):
         writer = self.make_writer(db_write_queue=3)
         self.requestor.open.clear()
+        assert writer.has_room()
         writer.submit([row(n) for n in range(3)], {})
 
         with self.assertLogs("frigate.record.writer", "ERROR") as logs:
-            blocked = threading.Thread(target=writer.submit, args=([row(3)], {}))
-            blocked.start()
-            time.sleep(0.3)
-            assert blocked.is_alive(), "submit should wait while the queue is full"
+            assert not writer.has_room()
+            assert not writer.has_room()
 
-        assert any("queue is full" in line for line in logs.output)
+        # one error per outage, however many passes are held
+        assert len([line for line in logs.output if "queue is full" in line]) == 1
+
+        # a pass already under way may still hand over its rows: submit never
+        # waits, so it cannot hold up the mover or its stop
+        start = time.monotonic()
+        writer.submit([row(3)], {})
+        assert time.monotonic() - start < 0.5
 
         self.requestor.open.set()
-        blocked.join(5)
-        assert not blocked.is_alive()
         assert wait_until(lambda: len(self.requestor.written()) == 4)
         assert sorted(self.requestor.written()) == sorted(
             row(n)["path"] for n in range(4)
         )
+        assert writer.has_room()
+        assert writer.stop(5)
+
+    def test_missing_reply_reconnects(self):
+        # a REQ socket that missed its reply refuses every later send
+        with patch.object(writer_module, "RETRY_INITIAL", 0.02):
+            requestor = FakeRequestor()
+            factory = MagicMock(return_value=requestor)
+            sent_once = []
+
+            def send(topic, data):
+                if not sent_once:
+                    sent_once.append(True)
+                    return ""
+
+                return FakeRequestor.send_data(requestor, topic, data)
+
+            requestor.send_data = send
+            writer = RecordingsWriter(
+                config(), requestor_factory=factory, publisher_factory=FakePublisher
+            )
+            writer.start()
+
+            with self.assertLogs("frigate.record.writer", "WARNING"):
+                writer.submit([row(0)], {})
+                assert wait_until(lambda: len(requestor.written()) == 1)
+
+        # the first connection, then a fresh one after the missing reply
+        assert factory.call_count == 2
         assert writer.stop(5)
 
     def test_failed_batch_is_retried_and_outage_is_logged(self):
@@ -180,6 +218,67 @@ class TestRecordingsWriter(unittest.TestCase):
         # every message carries the queue depth
         assert all("queued" in line for line in logs.output), logs.output
         assert writer.stop(5)
+
+    def test_exception_from_send_is_retried_not_fatal(self):
+        # an exception used to end the thread; rows then queued unwritten until
+        # the full queue stopped the mover for good
+        with patch.object(writer_module, "RETRY_INITIAL", 0.02):
+            writer = self.make_writer()
+            self.requestor.raise_times = 2
+
+            with self.assertLogs("frigate.record.writer", "WARNING") as logs:
+                writer.submit([row(0)], {})
+                assert wait_until(lambda: len(self.requestor.written()) == 1)
+
+        assert writer.is_alive()
+        assert self.requestor.calls == 3
+        assert any("TypeError" in line for line in logs.output)
+        assert writer.stop(5)
+
+    def test_exception_from_saved_publish_is_not_fatal(self):
+        writer = self.make_writer()
+        self.publisher.publish = MagicMock(side_effect=RuntimeError("socket closed"))
+
+        with self.assertLogs("frigate.record.writer", "ERROR") as logs:
+            writer.submit([row(0)], {"back": 1700000000.0})
+            # the log line comes after the publish call, on the writer thread
+            assert wait_until(lambda: logs.output)
+
+        assert self.publisher.publish.called
+
+        writer.submit([row(1)], {})
+        assert wait_until(lambda: len(self.requestor.written()) == 2)
+        assert writer.is_alive()
+        assert writer.stop(5)
+
+    def test_submit_does_not_wait_on_a_stopped_writer(self):
+        def gone():
+            raise SystemExit
+
+        writer = RecordingsWriter(
+            config(db_write_queue=1),
+            requestor_factory=gone,
+            publisher_factory=FakePublisher,
+        )
+        writer.start()
+        writer.join(5)
+        assert not writer.is_alive()
+
+        # in a thread, so a regression fails the test instead of hanging it
+        submitter = threading.Thread(
+            target=writer.submit,
+            args=([row(n) for n in range(3)], {}),
+            daemon=True,
+        )
+        submitter.start()
+        submitter.join(2)
+
+        assert not submitter.is_alive(), "submit waited on a stopped writer"
+        assert [r["path"] for r in writer.take_rows()] == [
+            row(n)["path"] for n in range(3)
+        ]
+        # nothing left to write and the thread is gone: a clean stop
+        assert writer.stop(1)
 
     def test_saved_waits_for_queued_rows(self):
         writer = self.make_writer()

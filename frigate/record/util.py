@@ -3,7 +3,9 @@
 import datetime
 import logging
 import os
-from typing import Iterable
+import random
+import string
+from typing import Any, Iterable, Optional
 
 from peewee import DatabaseError, chunked
 
@@ -11,6 +13,59 @@ from frigate.const import RECORD_DIR
 from frigate.models import Recordings, RecordingsToDelete
 
 logger = logging.getLogger(__name__)
+
+# Recordings sync leaves a file without a row alone until it was moved this long
+# ago. A segment's file is moved before its row is written, and the row can wait
+# in the writer's queue through a database stall. At most 12 h, so the daily
+# limited sync (files of the last 36 h) still sees every file once.
+SYNC_FILE_GRACE = 2 * 3600
+
+
+def recording_row(
+    camera: str,
+    variant: str,
+    path: str,
+    start_time: float,
+    end_time: float,
+    duration: float,
+    size_bytes: int,
+    media_info: Optional[dict[str, Any]],
+    motion: Optional[int] = None,
+    objects: Optional[int] = None,
+    regions: Optional[int] = None,
+    dBFS: Optional[int] = None,
+) -> dict[str, Any]:
+    """The Recordings row for a segment file in recordings/.
+
+    Shared by the mover and unclean-shutdown recovery. Activity stats left out
+    are stored as unknown (NULL), never as 0.
+    """
+    media_info = media_info or {}
+    rand_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+
+    return {
+        Recordings.id.name: f"{start_time}-{rand_id}",
+        Recordings.camera.name: camera,
+        Recordings.path.name: path,
+        Recordings.start_time.name: start_time,
+        Recordings.end_time.name: end_time,
+        Recordings.duration.name: duration,
+        Recordings.motion.name: motion,
+        # TODO: update this to store list of active objects at some point
+        Recordings.objects.name: objects,
+        Recordings.regions.name: regions,
+        Recordings.dBFS.name: dBFS,
+        # stored as MB
+        Recordings.segment_size.name: round(float(size_bytes) / pow(2, 20), 2),
+        Recordings.variant.name: variant,
+        Recordings.codec_name.name: media_info.get("fourcc"),
+        Recordings.width.name: media_info.get("width") or None,
+        Recordings.height.name: media_info.get("height") or None,
+        Recordings.bitrate.name: int(size_bytes * 8 / duration)
+        if duration > 0 and size_bytes > 0
+        else None,
+        Recordings.transcoded_from_main.name: False,
+    }
 
 
 def remove_empty_directories(directory: str) -> None:
@@ -122,9 +177,19 @@ def sync_recordings(limited: bool) -> None:
     def delete_files_without_db_entry(files_on_disk: list[str]):
         """Delete files where file is not inside frigate db."""
         files_to_delete = []
+        # the row of a recently moved segment can still be queued in the
+        # recording process's writer (record.pipeline.async_db_writes) or be
+        # due from unclean-shutdown recovery; such a file is not an orphan yet
+        moved_before = datetime.datetime.now().timestamp() - SYNC_FILE_GRACE
 
         for file in files_on_disk:
             if not Recordings.select().where(Recordings.path == file).exists():
+                try:
+                    if os.path.getmtime(file) >= moved_before:
+                        continue
+                except OSError:
+                    continue
+
                 files_to_delete.append(file)
 
         if len(files_to_delete) == 0:
@@ -142,6 +207,11 @@ def sync_recordings(limited: bool) -> None:
 
         for file in files_to_delete:
             os.unlink(file)
+
+        # the cleanup run removes only directories it emptied itself
+        remove_empty_parent_directories(
+            {os.path.dirname(file) for file in files_to_delete}, RECORD_DIR
+        )
 
         return True
 

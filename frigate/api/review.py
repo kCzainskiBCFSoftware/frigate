@@ -2,6 +2,7 @@
 
 import datetime
 import logging
+import os
 from functools import reduce
 from pathlib import Path
 from typing import List
@@ -34,8 +35,10 @@ from frigate.api.defs.response.review_response import (
 )
 from frigate.api.defs.tags import Tags
 from frigate.config import FrigateConfig
+from frigate.const import RECORD_DIR
 from frigate.embeddings import EmbeddingsContext
 from frigate.models import Recordings, ReviewSegment, UserReviewStatus
+from frigate.record.util import remove_empty_parent_directories
 from frigate.record.variants import recordings_overlap_clause
 from frigate.review.types import SeverityEnum
 from frigate.util.time import get_dst_transitions
@@ -543,6 +546,7 @@ def delete_reviews(body: ReviewModifyMultipleBody):
         .iterator()
     )
     recording_ids = []
+    deleted_dirs: set[str] = set()
 
     for review in reviews:
         start_time = review["start_time"]
@@ -559,6 +563,10 @@ def delete_reviews(body: ReviewModifyMultipleBody):
         for recording in recordings:
             Path(recording["path"]).unlink(missing_ok=True)
             recording_ids.append(recording["id"])
+            deleted_dirs.add(os.path.dirname(recording["path"]))
+
+    # the recordings cleanup run removes only directories it emptied itself
+    remove_empty_parent_directories(deleted_dirs, RECORD_DIR)
 
     # delete recordings and review segments
     Recordings.delete().where(Recordings.id << recording_ids).execute()

@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import shutil
 import tempfile
+import time
 from unittest.mock import patch
 
 from frigate.config import FrigateConfig
@@ -19,6 +20,8 @@ from frigate.models import (
 from frigate.record.cleanup import RecordingCleanup
 from frigate.record.ranges import recording_ranges, reset_late_rows, roll_up_ranges
 from frigate.record.reconcile import reconcile_recordings
+from frigate.record.util import sync_recordings
+from frigate.record.writer import insert_recording_rows
 from frigate.test.http_api.base_http_test import BaseTestHttp
 
 UNPROBEABLE = "unprobeable"
@@ -246,6 +249,52 @@ class TestReconcile(BaseTestHttp):
 
         # unclean: recovery first, then sync; clean: no recovery scan
         assert calls == ["reconcile", "sync", "sync"]
+
+    def test_sync_leaves_recently_moved_files_without_rows(self):
+        # moved into recordings while its row is still queued in the writer
+        queued = self.segment(300, "main")
+        orphan = self.segment(5 * 3600, "main")
+        moved = time.time() - 3 * 3600
+        os.utime(orphan, (moved, moved))
+
+        for i in range(3):
+            age = 600 + i * 10
+            self.with_row(self.segment(age, "sub"), age, "sub")
+
+        with patch("frigate.record.util.RECORD_DIR", self.record_dir):
+            sync_recordings(limited=False)
+
+        assert os.path.exists(queued)
+        assert not os.path.exists(orphan)
+        assert Recordings.select().count() == 3
+        # the orphan's hour directory went with it; the cleanup run would not
+        # see it in scoped mode
+        hour_dir = os.path.dirname(os.path.dirname(os.path.dirname(orphan)))
+        assert not os.path.exists(hour_dir)
+        assert os.path.isdir(self.record_dir)
+
+    def test_recovered_rows_are_inserted_in_batches(self):
+        for age in (300, 310, 320):
+            self.segment(age, "main")
+        batches: list[int] = []
+
+        def counted(rows):
+            batches.append(len(rows))
+            return insert_recording_rows(rows)
+
+        with (
+            patch("frigate.record.reconcile.BATCH_ROWS", 2),
+            patch("frigate.record.reconcile.insert_recording_rows", counted),
+        ):
+            assert (
+                reconcile_recordings(
+                    self.config, now=self.now, written_before=self.now + 60
+                )
+                == 3
+            )
+
+        assert batches == [2, 1]
+        assert Recordings.select().count() == 3
 
     def test_recovery_can_be_turned_off(self):
         calls: list[str] = []

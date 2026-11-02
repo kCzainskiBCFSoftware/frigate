@@ -44,7 +44,7 @@ class RecordPipelineConfig(FrigateBaseModel):
     processing_timeout: int = Field(
         default=30,
         ge=0,
-        title="Seconds a continuous segment waits for frame processing before it is moved with unknown activity stats (0 waits indefinitely, as upstream).",
+        title="Seconds a continuous or retain-all segment waits for frame processing before it is moved with unknown activity stats (0 waits indefinitely, as upstream).",
     )
     move_concurrency: int = Field(
         default=8,
@@ -60,7 +60,7 @@ class RecordPipelineConfig(FrigateBaseModel):
         default=10,
         ge=0,
         lt=100,
-        title="Percent of the cache filesystem kept free by discarding the oldest closed segments (0 is off, as upstream).",
+        title="Percent of the cache tmpfs kept free by discarding the oldest closed segments (0 is off, as upstream; not applied unless the cache is a tmpfs).",
     )
     async_db_writes: bool = Field(
         default=True,
@@ -69,7 +69,7 @@ class RecordPipelineConfig(FrigateBaseModel):
     db_write_queue: int = Field(
         default=8192,
         ge=1,
-        title="Most segment rows the background writer holds before the mover waits.",
+        title="Segment rows the background writer holds before the mover holds segments in the cache.",
     )
     db_flush_timeout: float = Field(
         default=10,

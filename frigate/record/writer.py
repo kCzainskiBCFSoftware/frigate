@@ -10,7 +10,9 @@ thread in the recording process and starts its next pass straight away.
   inter-process request thread that every Frigate process depends on. Inserts
   ignore rows already stored, so a retried batch is harmless.
 - The writer retries failed batches with backoff and never drops a row. When
-  its queue is full, the mover waits.
+  its queue is full, the mover holds segments in the cache (``has_room``)
+  instead of moving more; it never blocks on the writer, so it keeps applying
+  the cache limits and stops promptly.
 - ``recordings/saved`` is published from here, after the rows are written, so
   it never advertises footage that has no row yet.
 - On a clean stop the writer drains its queue, and the recording process then
@@ -121,6 +123,7 @@ class RecordingsWriter(threading.Thread):
         self.stop_requested = threading.Event()
 
         self.full_logged = False
+        self.reply_missing = False
         self.failing_since: Optional[float] = None
         self.failing_error_logged = False
 
@@ -128,36 +131,56 @@ class RecordingsWriter(threading.Thread):
         with self.cond:
             return len(self.rows)
 
+    def has_room(self) -> bool:
+        """Whether the mover may move more segments into the queue.
+
+        False while the queue holds ``db_write_queue`` rows or more; the first
+        time in an outage it logs an error. The mover then holds segments in
+        the cache rather than blocking on the writer, so it keeps applying the
+        cache limits and still sees a stop.
+        """
+        with self.cond:
+            if len(self.rows) < self.capacity:
+                return True
+
+            if not self.full_logged:
+                logger.error(
+                    "The recording row queue is full (%d rows) because the "
+                    "database is not taking writes. The mover holds segments in "
+                    "the cache until there is room; past the cache limits the "
+                    "oldest are discarded",
+                    len(self.rows),
+                )
+                self.full_logged = True
+
+            return False
+
     def submit(
         self, rows: list[dict[str, Any]], saved: dict[str, Optional[float]]
     ) -> None:
-        """Queue a pass's rows and its saved times. Waits while the queue is full.
+        """Queue a pass's rows and its saved times. Never waits.
+
+        The capacity is enforced by the mover through ``has_room`` before a
+        pass, so one pass's rows may take the queue past it.
 
         ``saved`` holds, per camera, the start of the oldest segment still in
         the cache (None if recording is off); it is published once every row
         before it is written.
         """
         with self.cond:
+            # rows first: saved must never be published without them queued
+            self.rows.extend(rows)
             self.saved_candidates.update(saved)
-
-            for row in rows:
-                while len(self.rows) >= self.capacity and not self.stopping:
-                    if not self.full_logged:
-                        logger.error(
-                            "The recording row queue is full (%d rows) because the "
-                            "database is not taking writes. The mover is waiting for "
-                            "room; segments may back up in the cache",
-                            len(self.rows),
-                        )
-                        self.full_logged = True
-
-                    self.cond.wait(timeout=1)
-
-                # while stopping the row is queued anyway, so it is counted
-                # and logged with the unsent rows rather than lost
-                self.rows.append(row)
-
             self.cond.notify_all()
+
+    def take_rows(self) -> list[dict[str, Any]]:
+        """Remove and return every queued row, for a writer that has stopped."""
+        with self.cond:
+            rows = list(self.rows)
+            self.rows.clear()
+            self.cond.notify_all()
+
+        return rows
 
     def stop(self, timeout: float) -> bool:
         """Drain for up to ``timeout`` seconds. True if every row was written."""
@@ -205,6 +228,9 @@ class RecordingsWriter(threading.Thread):
                     batch = list(itertools.islice(self.rows, BATCH_ROWS))
 
                 if batch and not self._send(requestor, batch):
+                    if self.reply_missing:
+                        requestor = self._replace_requestor(requestor)
+
                     # a stop cuts the backoff short; the drain then retries
                     # every half second until stop() stops waiting for it
                     if self.stop_requested.wait(retry_delay):
@@ -224,13 +250,49 @@ class RecordingsWriter(threading.Thread):
 
                     self.cond.notify_all()
 
-                self._publish_saved(publisher)
+                try:
+                    self._publish_saved(publisher)
+                except Exception:
+                    # the rows are written; only this saved update is lost
+                    logger.exception("Failed to publish recordings saved times")
         finally:
             requestor.stop()
             publisher.stop()
 
+    def _replace_requestor(self, requestor: Any) -> Any:
+        """A new connection to the main process, after a send got no reply.
+
+        The requestor's REQ socket answers a ZMQ error with ``""``; one that
+        missed its reply refuses every later send, so retrying on it would
+        never succeed.
+        """
+        try:
+            requestor.stop()
+        except Exception:
+            logger.debug("Closing the recording row requestor failed", exc_info=True)
+
+        try:
+            return self.requestor_factory()
+        except Exception:
+            # the stopped one fails every send, so the next retry comes back here
+            logger.exception("Could not reconnect the recording row writer")
+            return requestor
+
     def _send(self, requestor: Any, batch: list[dict[str, Any]]) -> bool:
-        result = requestor.send_data(INSERT_MANY_RECORDINGS, batch)
+        self.reply_missing = False
+
+        try:
+            result = requestor.send_data(INSERT_MANY_RECORDINGS, batch)
+        except Exception as e:
+            # retried like a refused write: if it ended this thread, rows would
+            # queue unwritten until the full queue stopped the mover
+            if self.failing_since is None:
+                logger.exception("Sending recording rows raised")
+
+            result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        # not a dict: the requestor hit a ZMQ error and returned ""
+        self.reply_missing = not isinstance(result, dict)
 
         if isinstance(result, dict) and result.get("ok"):
             if self.failing_since is not None:

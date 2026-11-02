@@ -13,15 +13,20 @@ mover's progress:
 
 import datetime
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
+from frigate.config.camera.ffmpeg import DEFAULT_RECORD_VARIANT
 from frigate.const import CACHE_DIR, CACHE_SEGMENT_FORMAT
-
-DEFAULT_RECORD_VARIANT = "main"
 
 # Longest startup grace after a recorder starts, is restarted or is enabled.
 RECORDER_GRACE = 90.0
+
+# Filesystems the free-space reserve may act on. On any other one, CACHE_DIR
+# shares space with something else (the recordings volume, the container's
+# root), whose free space says nothing about the recorders' headroom.
+RAM_FILESYSTEMS = frozenset({"tmpfs", "ramfs"})
 
 
 def parse_cache_name(name: str) -> Optional[tuple[str, str, float]]:
@@ -62,6 +67,45 @@ def cache_space(path: str) -> tuple[int, int]:
     """(free bytes, total bytes) of the filesystem holding ``path``."""
     stats = os.statvfs(path)
     return stats.f_bavail * stats.f_frsize, stats.f_blocks * stats.f_frsize
+
+
+def _unescape_mount_field(field: str) -> str:
+    # /proc/mounts writes space, tab, newline and backslash as \ooo
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def filesystem_type(path: str, mounts_file: str = "/proc/mounts") -> Optional[str]:
+    """Type of the filesystem ``path`` is on, from the deepest mount holding it.
+
+    None when the mount table cannot be read.
+    """
+    path = os.path.realpath(path)
+    best_mount: Optional[str] = None
+    fs_type: Optional[str] = None
+
+    try:
+        with open(mounts_file) as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+
+    for line in lines:
+        fields = line.split()
+
+        if len(fields) < 3:
+            continue
+
+        mount_point = _unescape_mount_field(fields[1])
+        prefix = mount_point.rstrip("/") + "/"
+
+        if path != mount_point and not path.startswith(prefix):
+            continue
+
+        # later lines are mounted over earlier ones at the same point
+        if best_mount is None or len(mount_point) >= len(best_mount):
+            best_mount, fs_type = mount_point, fields[2]
+
+    return fs_type
 
 
 def reserve_discards(
