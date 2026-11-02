@@ -20,18 +20,18 @@ camera may override.
 
 | Setting | Default | Upstream | What it does |
 |---|---|---|---|
-| `processing_timeout` | `30` (s) | `0` | A continuous-retention segment waits at most this long after it closed for the camera's frame processing; then it is saved with unknown (`NULL`) activity stats and a rate-limited warning names the camera. `0` waits indefinitely. Cameras without continuous retention always wait. |
+| `processing_timeout` | `30` (s) | `0` | A continuous-retention segment, or one overlapping an alert/detection whose retain mode is `all`, waits at most this long after it closed for the camera's frame processing; then it is saved with unknown (`NULL`) activity stats and a rate-limited warning names the camera. `0` waits indefinitely. Other segments (motion retention, `motion`/`active_objects` retain modes) always wait, because keeping them depends on their stats. |
 | `move_concurrency` | `8` | `0` | Most segment probes and `ffmpeg -c copy` moves the mover runs at once, across all cameras. `0` is unbounded. |
 | `max_cached_segments` | `6` | `6` | Closed segments kept in the cache **per camera and variant** before the oldest are discarded with the existing "Unable to keep up" / "Too many unprocessed" warnings. Applied after each pass's moves, so a backlog the pass can move is never discarded. Raising it costs tmpfs (RAM): ~0.4 GB at 10 per variant on 32 dual-stream cameras. |
-| `cache_free_reserve` | `10` (%) | `0` | At the start and end of every pass, if the cache filesystem has less than this much free, the oldest closed segments across all cameras are discarded until it does, with an error naming the cameras. `0` turns it off. |
-| `async_db_writes` | `true` | `false` | Segment rows go to a bounded writer thread in the recording process instead of a request that blocks the mover until they commit. `false` keeps the blocking request (with the hardened handler). |
-| `db_write_queue` | `8192` (rows) | — | Most rows the writer holds (~21 minutes at 32 dual-stream cameras, ≤ ~12 MB). When full, the mover waits and logs an error; rows are never dropped. |
+| `cache_free_reserve` | `10` (%) | `0` | At the end of every pass, if the cache filesystem has less than this much free, the oldest closed segments across all cameras are discarded until it does, with an error naming the cameras. At the start of a pass only half of it is enforced, since the moves free space without losing footage. Applied only when `/tmp/cache` is a tmpfs (or ramfs); otherwise one warning is logged at startup and the reserve does nothing, since a shared volume's free space says nothing about the cache. `0` turns it off. |
+| `async_db_writes` | `true` | `false` | Segment rows go to a bounded writer thread in the recording process instead of a request that blocks the mover until they commit. `false` keeps the blocking request (with the hardened handler). If the writer thread ever stops, the mover logs an error and goes back to the blocking request, sending the rows the writer still held as well. |
+| `db_write_queue` | `8192` (rows) | — | Rows the writer holds before the mover stops moving (~21 minutes at 32 dual-stream cameras, ≤ ~12 MB; one pass's rows may go past it). While it is full the mover logs one error and holds segments in the cache, where the backlog limit and reserve keep applying; it never blocks, so it still stops promptly. Rows are never dropped. |
 | `db_flush_timeout` | `10` (s) | — | How long the writer drains on shutdown. The main process waits this + 5 s for the recording process before terminating it. |
 | `reconcile_on_unclean_shutdown` | `true` | `false` | After an unclean shutdown (no clean-shutdown marker), segment files of the last `reconcile_window` hours that have no row get one, before `sync_recordings` runs. |
 | `reconcile_window` | `2` (h) | — | How far back that recovery scan looks. |
 | `recorder_watchdog` | `cache` | `mover` | `cache` judges each recorder (camera + variant) by its own files in the cache and restarts only the stale one. `mover` keeps the upstream per-camera signals from the mover's messages. |
 | `recorder_stale_timeout` | `120` (s) | `120` | Seconds without new output before a recorder is restarted; used by both watchdog modes and stated in the restart message. **Camera override allowed.** The startup grace after a recorder starts, is restarted or the camera is enabled is `min(90, timeout)`. |
-| `empty_directory_cleanup` | `scoped` | `full` | `scoped` removes only the directories a cleanup run deleted files from (and their parents up to `recordings/`, once empty). `full` walks the whole recordings tree every run. Directories emptied by hand stay until a `full` run; they are harmless. |
+| `empty_directory_cleanup` | `scoped` | `full` | `scoped` removes only the directories a cleanup run deleted files from (and their parents up to `recordings/`, once empty). `full` walks the whole recordings tree every run. The storage maintainer, recordings sync and delete-reviews API remove the directories they empty in either mode. Directories emptied by hand stay until a `full` run; they are harmless. |
 
 Validation: `processing_timeout + 10 < max_cached_segments × 10`, because a
 segment waiting for processing still counts against the backlog limit. Counts
@@ -68,11 +68,16 @@ upstream values. `cache_size` stays at the fork's 256 MB unless set.
 ## Deployment notes
 
 - **Stop grace period.** Give the container at least 30 s
-  (`stop_grace_period: 30s` in compose; Docker's default is 10 s). Otherwise
-  Docker kills Frigate while the writer drains, the clean-shutdown marker is not
-  written, and the next start runs the recovery scan (cheap, but avoidable).
+  (`stop_grace_period: 30s` in compose; Docker's default is 10 s). The mover
+  stops at once and a healthy drain takes well under a second, but with a slow
+  database the drain can use its whole `db_flush_timeout`; if Docker kills
+  Frigate first, the clean-shutdown marker is not written and the next start
+  runs the recovery scan.
 - **First start after the upgrade** has no marker yet, so it runs the recovery
   scan once. It normally finds nothing.
+- **Recordings sync** (`record.sync_recordings`) leaves files without a row
+  alone until 2 hours after they were moved: a row can still be queued in the
+  writer.
 - **What to watch in the log:** one `Recordings cleanup run took …` info line
   per cleanup run (phase timings, WAL size before and after, checkpoint result);
   `Frame processing for <camera> is Ns behind` (segments saved without stats);

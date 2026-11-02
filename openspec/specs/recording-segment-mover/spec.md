@@ -7,7 +7,7 @@ Move recorded segments from the cache into recordings, without slow frame proces
 
 ### Requirement: Continuous segments do not wait indefinitely for frame processing
 
-For a camera with continuous retention (`record.continuous.days` above 0), the mover SHALL move a closed segment into recordings once frame processing has passed the segment's end, or once `record.pipeline.processing_timeout` seconds (default 30) have passed since that end, whichever is first. A timeout of 0 SHALL restore the upstream wait without a limit. Cameras without continuous retention SHALL keep waiting for frame processing, as upstream does.
+For a camera with continuous retention (`record.continuous.days` above 0), the mover SHALL move a closed segment into recordings once frame processing has passed the segment's end, or once `record.pipeline.processing_timeout` seconds (default 30) have passed since that end, whichever is first. A timeout of 0 SHALL restore the upstream wait without a limit. Cameras without continuous retention SHALL keep waiting for frame processing, as upstream does, except for segments covered by the next requirement.
 
 #### Scenario: Frame processing paused
 - **WHEN** a dual-stream camera with continuous retention has its frame-processing process paused for 3 minutes
@@ -20,7 +20,20 @@ For a camera with continuous retention (`record.continuous.days` above 0), the m
 
 #### Scenario: Camera without continuous retention
 - **WHEN** a camera has `record.continuous.days: 0` and `record.motion.days: 7`, and its frame processing is paused
-- **THEN** its segments are not moved on the timeout
+- **THEN** its segments that do not overlap a retain-all alert or detection are not moved on the timeout
+
+### Requirement: Retain-all review segments do not wait indefinitely for frame processing
+
+A segment that overlaps an alert or detection whose retain mode is `all` is kept whatever its statistics. The mover SHALL move it once frame processing has passed its end, or once `record.pipeline.processing_timeout` seconds have passed since that end, whichever is first, on any camera. A timeout of 0 SHALL wait without a limit. Segments overlapping a review item whose retain mode is `motion` or `active_objects` SHALL keep waiting for frame processing.
+
+#### Scenario: Alert during a processing stall
+- **WHEN** a camera without continuous retention has `alerts.retain.mode: all`, an alert is in progress, and its frame processing is paused for 3 minutes
+- **THEN** each segment overlapping the alert is in recordings within `processing_timeout` plus one mover pass after it closed, with null statistics
+- **AND** none of them is discarded by the cache backlog limit
+
+#### Scenario: Activity-based retain mode
+- **WHEN** the same stall happens with `alerts.retain.mode: motion`
+- **THEN** the overlapping segments are not moved on the timeout
 
 ### Requirement: Segments moved on the timeout have unknown statistics
 
@@ -109,11 +122,21 @@ The mover SHALL apply its cache backlog limit only to segments that are still in
 
 ### Requirement: The cache keeps a free-space reserve
 
-At the start and at the end of each pass, the mover SHALL check free space on the cache filesystem. When it is below `record.pipeline.cache_free_reserve` percent, the mover SHALL discard the oldest closed segments across all cameras until the reserve is restored. It SHALL log an error saying how many segments it discarded from which cameras. The default SHALL be 10. A value of 0 SHALL disable the reserve.
+At the end of each pass, the mover SHALL check free space on the cache filesystem. When it is below `record.pipeline.cache_free_reserve` percent, the mover SHALL discard the oldest closed segments across all cameras until the reserve is restored. At the start of each pass it SHALL do the same against half the reserve only: moving a segment frees its space without losing it, so before the moves only a critically full cache is relieved. It SHALL log an error saying how many segments it discarded from which cameras. The default SHALL be 10. A value of 0 SHALL disable the reserve.
+
+The reserve SHALL apply only when the cache directory is on a RAM filesystem (tmpfs or ramfs). On any other filesystem, or when the filesystem cannot be determined, the mover SHALL log one warning naming the filesystem and SHALL NOT discard segments for the reserve.
 
 #### Scenario: Cache nearly full
-- **WHEN** the cache filesystem is 92% full, with `cache_free_reserve: 10`
+- **WHEN** the cache filesystem is 92% full after a pass's moves, with `cache_free_reserve: 10`
 - **THEN** the oldest closed segments are discarded until at least 10% is free, and an error lists the cameras affected
+
+#### Scenario: Backlog the pass can move
+- **WHEN** a pass starts with the cache 93% full of closed segments it is about to move, with `cache_free_reserve: 10`
+- **THEN** no segment is discarded before the moves, and the moved segments are in recordings
+
+#### Scenario: Cache on a shared disk volume
+- **WHEN** no tmpfs is mounted at `/tmp/cache` and the volume it is on is 95% full
+- **THEN** no segment is discarded for the reserve, and one warning says the reserve is not applied
 
 ### Requirement: Pipeline settings are validated
 

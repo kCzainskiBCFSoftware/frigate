@@ -41,14 +41,18 @@ After each recordings cleanup run, Frigate SHALL log one info line with:
 
 ### Requirement: Empty-directory removal is limited to what the run deleted
 
-With `record.pipeline.empty_directory_cleanup: scoped`, which is the default, a cleanup run SHALL remove only the directories it deleted a file from, and their parents up to the recordings root, and only once they are empty. It SHALL NOT walk the whole recordings tree. The value `full` SHALL restore the upstream whole-tree walk.
+With `record.pipeline.empty_directory_cleanup: scoped`, which is the default, a cleanup run SHALL remove only the directories it deleted a file from, and their parents up to the recordings root, and only once they are empty. It SHALL NOT walk the whole recordings tree. The value `full` SHALL restore the upstream whole-tree walk. Whatever the setting, the storage maintainer, the recordings sync and the delete-reviews API SHALL remove in the same way the directories they deleted recording files from.
 
 #### Scenario: An hour of footage expires
 - **WHEN** a run deletes the last segments in `recordings/2026-09-23/04/cam1/main`
 - **THEN** that directory is removed, along with `cam1` and `04` if they become empty
 - **AND** no other directory under `recordings/` is listed
 
-#### Scenario: Directory emptied outside cleanup
+#### Scenario: Storage runs low
+- **WHEN** the storage maintainer deletes the last segments in `recordings/2026-09-23/04/cam1/main` to free space
+- **THEN** that directory is removed, along with `cam1` and `04` if they become empty
+
+#### Scenario: Directory emptied outside Frigate
 - **WHEN** a directory under `recordings/` was emptied by hand
 - **THEN** a scoped run leaves it in place, and a `full` run removes it
 

@@ -16,16 +16,37 @@ With `record.pipeline.async_db_writes` enabled, which is the default, the mover 
 
 ### Requirement: Queued rows are bounded and never dropped silently
 
-The writer SHALL hold at most `record.pipeline.db_write_queue` rows. The default SHALL be 8192. When the queue is full, the mover SHALL wait for room and log an error. It SHALL NOT drop rows. A failed write SHALL be retried with backoff until it succeeds. The writer SHALL log, each time with the queue depth: a warning on the first failure, an error once writes have been failing for 60 seconds, and an info message when writes succeed again.
+The writer SHALL hold `record.pipeline.db_write_queue` rows, plus at most the rows of the one mover pass that filled it. The default SHALL be 8192. While the queue is full, the mover SHALL move no segments and SHALL log an error once per outage. It SHALL NOT block on the writer: it SHALL keep applying the cache backlog limit and free-space reserve to the segments it holds, without a warning per discard, and SHALL stop promptly when Frigate stops. While holding, it SHALL NOT publish its `latest` heartbeat, as a blocked mover would not. The writer SHALL NOT drop rows. A failed write SHALL be retried with backoff until it succeeds. The writer SHALL log, each time with the queue depth: a warning on the first failure, an error once writes have been failing for 60 seconds, and an info message when writes succeed again.
 
 #### Scenario: Long outage fills the queue
 - **WHEN** the database refuses writes long enough for the queue to fill
-- **THEN** the mover logs an error and stops taking new rows until the queue has room
+- **THEN** the mover logs one error and moves no segments until the queue has room
 - **AND** no queued row is discarded
+- **AND** each recorder keeps its newest `max_cached_segments` segments in the cache, which move once the queue has room
+
+#### Scenario: Stop while the queue is full
+- **WHEN** Frigate stops while the queue is full
+- **THEN** the mover exits without waiting for room, and the writer drains for up to `db_flush_timeout`
 
 #### Scenario: Recovery is logged
 - **WHEN** writes have failed for 2 minutes and then succeed
 - **THEN** one warning, one error and one info message are logged for that outage, each with the queue depth
+
+### Requirement: The writer keeps running
+
+An exception while the writer sends a batch SHALL be retried like a failed write. A send that gets no reply SHALL be retried on a new connection to the main process. An exception while it publishes `recordings/saved` SHALL be logged, and SHALL NOT stop it. If the writer thread stops anyway, the mover SHALL log an error once and write each pass's rows with the blocking request, together with the rows the writer still held. It SHALL NOT wait for room in a stopped writer's queue.
+
+#### Scenario: Send raises
+- **WHEN** sending a batch raises an exception twice and then succeeds
+- **THEN** the batch is written, and the writer keeps taking rows
+
+#### Scenario: No reply
+- **WHEN** a send gets no reply from the main process
+- **THEN** the writer retries the batch on a new connection
+
+#### Scenario: Writer thread gone
+- **WHEN** the writer thread has stopped while holding queued rows
+- **THEN** the next pass writes those rows and its own with the blocking request, and an error is logged once
 
 ### Requirement: Row writes are acknowledged and idempotent
 
@@ -42,7 +63,7 @@ The main process SHALL acknowledge each batch of rows with its outcome. It SHALL
 
 ### Requirement: Rows are flushed on shutdown
 
-On a normal shutdown, Frigate SHALL write every queued row before the recording process exits. It SHALL wait up to `record.pipeline.db_flush_timeout` seconds for this, with a default of 10. If rows cannot be written in that time, Frigate SHALL log an error with their count and the paths of the oldest and newest segment, and SHALL treat the shutdown as unclean.
+On a normal shutdown, Frigate SHALL write every queued row before the recording process exits. The mover SHALL stop as soon as Frigate stops, without finishing its wait between passes, so the drain starts at once. Frigate SHALL wait up to `record.pipeline.db_flush_timeout` seconds for this, with a default of 10. If rows cannot be written in that time, Frigate SHALL log an error with their count and the paths of the oldest and newest segment, and SHALL treat the shutdown as unclean.
 
 #### Scenario: Restart from the UI with rows queued
 - **WHEN** Frigate is restarted while 200 rows are queued and the database is writable
@@ -60,9 +81,17 @@ When the previous run did not shut down cleanly, and `record.pipeline.reconcile_
 - **WHEN** Frigate restarts after a clean shutdown
 - **THEN** no recovery scan runs
 
+### Requirement: Recordings sync does not delete files whose rows are pending
+
+A segment's file is moved into recordings before its row is written. The recordings sync (`record.sync_recordings`) SHALL NOT delete a file that has no row if the file was moved less than 2 hours ago.
+
+#### Scenario: Sync during a database stall
+- **WHEN** the recordings sync runs while segments moved in the last 20 minutes still have their rows queued
+- **THEN** those files are not deleted, and they are listed once their rows are written
+
 ### Requirement: Recovered rows carry probed metadata and unknown statistics
 
-Each row added by recovery SHALL have the file's probed duration and stream metadata, the variant taken from the file's directory, and null activity statistics. A file that cannot be probed SHALL be logged and left in place, without a row.
+Each row added by recovery SHALL have the file's probed duration and stream metadata, the variant taken from the file's directory, and null activity statistics. A file that cannot be probed SHALL be logged and left in place, without a row. Recovery SHALL probe files one at a time and insert their rows in batches of at most 500.
 
 #### Scenario: Recovered sub segment
 - **WHEN** recovery finds `recordings/2026-09-23/04/cam1/sub/22.34.mp4` without a row

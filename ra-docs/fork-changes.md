@@ -418,6 +418,57 @@ defaults and upstream values: [recording-pipeline-config.md](recording-pipeline-
 - `recordings_unknown_stats` appended to `FORK_FEATURES` (`frigate/const.py`):
   `motion`/`objects` in recording listings and summaries can be `null`.
 
+### Fixes from the PR review
+- **Memory leak (also upstream):** `move_segment` returned a moved segment's row
+  before `end_time_cache.pop()`, so every moved segment's probe result stayed in
+  the mover's memory — ~550 B each, ~300 MB a day on 32 dual-stream cameras.
+  It is now popped once the cache file is removed.
+- **Retain-all review segments:** a segment overlapping an alert/detection whose
+  retain mode is `all` no longer waits for frame processing beyond
+  `processing_timeout`; on the timeout it is moved with `NULL` stats, like a
+  continuous segment. Before, a processing lag longer than the backlog window
+  let `discard_backlog` delete alert footage that upstream kept. Activity-based
+  modes (`motion`, `active_objects`) still wait for complete stats.
+- **Cache reserve only on a RAM cache:** `enforce_cache_reserve` acts only when
+  `CACHE_DIR` is a tmpfs/ramfs (`filesystem_type()` in `cache_watch.py`, read
+  from `/proc/mounts` once). On a disk-backed cache it logs one warning and does
+  nothing; before, the free space of a nearly full shared volume made it
+  discard every closed segment on every pass.
+- **Writer cannot die silently:** an exception from a send is retried like a
+  refused write, and one from the `saved` publish is logged; `submit()` no
+  longer waits on a writer thread that has stopped. If it has stopped anyway,
+  the mover writes with the blocking request again, including the rows the
+  writer still held (`take_rows()`), in batches of `BATCH_ROWS`.
+- **Recordings sync and queued rows:** `sync_recordings` no longer deletes a
+  file without a row that was moved within the last 2 hours
+  (`SYNC_FILE_GRACE` in `frigate/record/util.py`); its row can still be queued
+  in the writer.
+- **Full row queue holds the mover instead of blocking it:** `submit()` never
+  waits; the mover asks `RecordingsWriter.has_room()` before a pass and, while
+  the queue is full, moves nothing, publishes no `latest` heartbeat (so the
+  cache watchdog does not restart recorders for the missing `valid` messages)
+  and keeps trimming frame info and applying `discard_backlog` (quietly) and the
+  reserve. Before, it blocked inside `submit()`: no stop, no cache limits, a
+  filling tmpfs. `submit()` also queues the rows before the `saved` times.
+- **Prompt stop:** the wait between mover passes is `stop_event.wait()`, so the
+  writer drain starts at once instead of up to 5 s later.
+- **Start-of-pass reserve:** only half of `cache_free_reserve`
+  (`START_RESERVE_FACTOR`) is enforced before a pass's moves, so a backlog the
+  pass can move is no longer discarded first.
+- **Directories emptied elsewhere:** `StorageMaintainer.reduce_storage_consumption`,
+  `sync_recordings` and the delete-reviews API (`frigate/api/review.py`) call
+  `remove_empty_parent_directories()` for what they delete; in `scoped` mode
+  nothing else would remove those directories.
+- **Writer reconnects:** a send answered with `""` (a ZMQ error, which can leave
+  the REQ socket refusing every later send) is retried on a new requestor.
+- **Recovery:** probes in one event loop and inserts in batches of
+  `BATCH_ROWS` instead of one request per row.
+- **Shared code:** `recording_row()` in `frigate/record/util.py` builds the row
+  for both the mover and recovery; the mover parses cache names with
+  `cache_watch.parse_cache_name` (its own `_parse_cache_segment` is gone) and
+  takes `DEFAULT_RECORD_VARIANT` from `frigate/config/camera/ffmpeg.py`; recovery
+  filters variants with `apply_variant_filter`.
+
 ### Upstream files touched
 High rebase-conflict risk: `frigate/record/maintainer.py`,
 `frigate/record/cleanup.py`, `frigate/video.py`. Low to medium:
