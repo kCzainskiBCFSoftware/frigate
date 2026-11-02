@@ -1,6 +1,7 @@
 """Handle storage retention and usage."""
 
 import logging
+import os
 import shutil
 import threading
 from pathlib import Path
@@ -10,6 +11,7 @@ from peewee import SQL, fn
 from frigate.config import FrigateConfig
 from frigate.const import RECORD_DIR
 from frigate.models import Event, Recordings
+from frigate.record.util import remove_empty_parent_directories
 from frigate.util.builtin import clear_and_unlink
 
 logger = logging.getLogger(__name__)
@@ -280,6 +282,12 @@ class StorageMaintainer(threading.Thread):
             Recordings.delete().where(
                 Recordings.id << deleted_recordings_list[i : i + max_deletes]
             ).execute()
+
+        # the recordings cleanup run removes only directories it emptied itself
+        # (record.pipeline.empty_directory_cleanup: scoped), so remove these here
+        remove_empty_parent_directories(
+            {os.path.dirname(r.path) for r in deleted_recordings}, RECORD_DIR
+        )
 
     def run(self):
         """Check every 5 minutes if storage needs to be cleaned up."""

@@ -681,6 +681,128 @@ class TestConfig(unittest.TestCase):
         }
         self.assertRaises(ValidationError, lambda: FrigateConfig(**config))
 
+    def _dual_stream_config(self, **extra) -> dict:
+        return {
+            "mqtt": {"host": "mqtt"},
+            "record": {"enabled": True},
+            "cameras": {
+                "back": {
+                    "ffmpeg": {
+                        "inputs": [
+                            {
+                                "path": "rtsp://10.0.0.1:554/video",
+                                "roles": ["detect", "record"],
+                                "record_variant": "main",
+                            },
+                            {
+                                "path": "rtsp://10.0.0.1:554/video2",
+                                "roles": ["record"],
+                                "record_variant": "sub",
+                            },
+                        ]
+                    },
+                    "detect": {
+                        "height": 1080,
+                        "width": 1920,
+                        "fps": 5,
+                    },
+                },
+                "front": {
+                    "ffmpeg": {
+                        "inputs": [
+                            {
+                                "path": "rtsp://10.0.0.2:554/video",
+                                "roles": ["detect", "record"],
+                            },
+                        ]
+                    },
+                    "detect": {
+                        "height": 1080,
+                        "width": 1920,
+                        "fps": 5,
+                    },
+                },
+            },
+            **extra,
+        }
+
+    def test_record_pipeline_and_database_defaults(self):
+        frigate_config = FrigateConfig(**self._dual_stream_config())
+        pipeline = frigate_config.record.pipeline
+        assert pipeline.processing_timeout == 30
+        assert pipeline.move_concurrency == 8
+        assert pipeline.max_cached_segments == 6
+        assert pipeline.cache_free_reserve == 10
+        assert pipeline.async_db_writes
+        assert pipeline.db_write_queue == 8192
+        assert pipeline.db_flush_timeout == 10
+        assert pipeline.reconcile_on_unclean_shutdown
+        assert pipeline.reconcile_window == 2
+        assert pipeline.recorder_watchdog == "cache"
+        assert pipeline.recorder_stale_timeout == 120
+        assert pipeline.empty_directory_cleanup == "scoped"
+        assert frigate_config.cameras["back"].record.pipeline == pipeline
+
+        database = frigate_config.database
+        assert database.wal_checkpoint == "passive"
+        assert database.wal_size_limit == 64
+        assert database.cache_size == 256
+
+    def test_processing_wait_longer_than_backlog_window_throws_error(self):
+        config = self._dual_stream_config(
+            record={
+                "enabled": True,
+                "pipeline": {"processing_timeout": 60, "max_cached_segments": 6},
+            }
+        )
+
+        with self.assertRaises(ValidationError) as ctx:
+            FrigateConfig(**config)
+
+        assert "shorter than the cache backlog window" in str(ctx.exception)
+
+    def test_negative_pipeline_values_throw_error(self):
+        for key in ("processing_timeout", "move_concurrency", "cache_free_reserve"):
+            config = self._dual_stream_config(
+                record={"enabled": True, "pipeline": {key: -1}}
+            )
+            self.assertRaises(ValidationError, lambda: FrigateConfig(**config))
+
+    def test_camera_overrides_only_recorder_stale_timeout(self):
+        config = self._dual_stream_config(
+            record={"enabled": True, "pipeline": {"move_concurrency": 4}}
+        )
+        config["cameras"]["back"]["record"] = {
+            "pipeline": {"recorder_stale_timeout": 300, "move_concurrency": 2}
+        }
+        frigate_config = FrigateConfig(**config)
+
+        back = frigate_config.cameras["back"].record.pipeline
+        front = frigate_config.cameras["front"].record.pipeline
+        assert back.recorder_stale_timeout == 300
+        assert front.recorder_stale_timeout == 120
+        # every other pipeline setting is global-only
+        assert back.move_concurrency == 4
+        assert front.move_concurrency == 4
+
+    def test_ffmpeg_cmds_carry_record_variant(self):
+        frigate_config = FrigateConfig(**self._dual_stream_config())
+
+        back = frigate_config.cameras["back"].ffmpeg_cmds
+        assert [c["record_variant"] for c in back] == ["main", "sub"]
+        front = frigate_config.cameras["front"].ffmpeg_cmds
+        assert [c["record_variant"] for c in front] == ["main"]
+
+    def test_ffmpeg_cmds_without_record_role_have_no_variant(self):
+        config = self._dual_stream_config()
+        inputs = config["cameras"]["back"]["ffmpeg"]["inputs"]
+        inputs[0]["roles"] = ["detect"]
+        inputs[1]["record_variant"] = "main"
+        frigate_config = FrigateConfig(**config)
+
+        back = frigate_config.cameras["back"].ffmpeg_cmds
+        assert [c["record_variant"] for c in back] == [None, "main"]
+
     def test_zone_matching_camera_name_throws_error(self):
         config = {
             "mqtt": {"host": "mqtt"},

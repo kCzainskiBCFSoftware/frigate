@@ -119,9 +119,10 @@ dimension and use the helpers in `record/variants.py` rather than filtering on t
 
 `openspec/specs/` specifies only the behavior this fork adds or changes on top of upstream v0.17.1. It
 has one spec per capability: `recording-variants`, `variant-retention`, `variant-media-api`,
-`playback-timeline-api`, `playback-serving`, `fork-capabilities`, `web-navigation` and
-`playback-variant-preference`. The baseline that produced them is archived under
-`openspec/changes/archive/`. Fork-wide constraints and artifact rules are in `openspec/config.yaml`.
+`playback-timeline-api`, `playback-serving`, `fork-capabilities`, `web-navigation`,
+`playback-variant-preference`, `recording-segment-mover`, `recording-db-writes`,
+`recorder-watchdog` and `database-maintenance`. The changes that produced them are archived
+under `openspec/changes/archive/`. Fork-wide constraints and artifact rules are in `openspec/config.yaml`.
 
 Make fork behavior changes as OpenSpec changes: `/opsx:propose` → `/opsx:apply` → `/opsx:archive`.
 Archiving merges the change's deltas into `openspec/specs/`. Specs are the behavior contract, and

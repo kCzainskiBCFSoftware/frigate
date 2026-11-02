@@ -12,27 +12,56 @@ from typing import Optional
 from playhouse.sqlite_ext import SqliteExtDatabase
 
 from frigate.config import CameraConfig, FrigateConfig, RetainModeEnum
-from frigate.const import CACHE_DIR, CLIPS_DIR, MAX_WAL_SIZE, RECORD_DIR
+from frigate.config.camera.record_pipeline import EmptyDirectoryCleanupEnum
+from frigate.const import CACHE_DIR, CLIPS_DIR, RECORD_DIR
+from frigate.db.maintenance import (
+    CheckpointResult,
+    CleanupRunSummary,
+    maintain_wal,
+    size_pragmas,
+)
 from frigate.models import Previews, Recordings, ReviewSegment, UserReviewStatus
 from frigate.record.ranges import (
     backfill_ranges,
     roll_up_ranges,
     trim_ranges,
 )
-from frigate.record.util import remove_empty_directories, sync_recordings
+from frigate.record.reconcile import reconcile_recordings
+from frigate.record.util import (
+    remove_empty_directories,
+    remove_empty_parent_directories,
+    sync_recordings,
+)
 from frigate.util.builtin import clear_and_unlink
 from frigate.util.time import get_tomorrow_at_time
 
 logger = logging.getLogger(__name__)
 
 
+def expiry_seek_bound(cutoff: float):
+    """start_time < cutoff for an expiry query whose end_time cutoffs are <= it.
+
+    Changes no result, since a segment starts before it ends, but it gives
+    SQLite a start_time range to seek instead of reading the whole history.
+    """
+    return Recordings.start_time < cutoff
+
+
 class RecordingCleanup(threading.Thread):
     """Cleanup existing recordings based on retention config."""
 
-    def __init__(self, config: FrigateConfig, stop_event: MpEvent) -> None:
+    def __init__(
+        self,
+        config: FrigateConfig,
+        stop_event: MpEvent,
+        unclean_shutdown: bool = False,
+    ) -> None:
         super().__init__(name="recording_cleanup")
         self.config = config
         self.stop_event = stop_event
+        # the previous run left no clean-shutdown marker (frigate.record.writer)
+        self.unclean_shutdown = unclean_shutdown
+        self.expired_dirs: set[str] = set()
 
     def clean_tmp_previews(self) -> None:
         """delete any previews in the cache that are more than 1 hour old."""
@@ -50,22 +79,16 @@ class RecordingCleanup(threading.Thread):
                 logger.debug("Deleting tmp clip.")
                 clear_and_unlink(p)
 
-    def truncate_wal(self) -> None:
-        """check if the WAL needs to be manually truncated."""
+    def truncate_wal(self) -> CheckpointResult:
+        """checkpoint the WAL at the end of a run without blocking writers."""
 
         # by default the WAL should be check-pointed automatically
         # however, high levels of activity can prevent an opportunity
         # for the checkpoint to be finished which means the WAL will grow
         # without bound
 
-        # with auto checkpoint most users should never hit this
-
-        if (
-            os.stat(f"{self.config.database.path}-wal").st_size / (1024 * 1024)
-        ) > MAX_WAL_SIZE:
-            db = SqliteExtDatabase(self.config.database.path)
-            db.execute_sql("PRAGMA wal_checkpoint(TRUNCATE);")
-            db.close()
+        # database.wal_checkpoint: truncate restores the upstream blocking form
+        return maintain_wal(self.config.database)
 
     def roll_up_recording_ranges(self) -> None:
         """Materialize newly settled playback-timeline ranges.
@@ -99,7 +122,9 @@ class RecordingCleanup(threading.Thread):
         low-selectivity index and turn playback queries into large scans.
         analysis_limit keeps the re-sample cheap enough to run hourly.
         """
-        db = SqliteExtDatabase(self.config.database.path)
+        db = SqliteExtDatabase(
+            self.config.database.path, pragmas=size_pragmas(self.config.database)
+        )
         db.execute_sql("PRAGMA analysis_limit=1000;")
         db.execute_sql("ANALYZE recordings;")
         db.close()
@@ -165,27 +190,16 @@ class RecordingCleanup(threading.Thread):
         # Get the timestamp for cutoff of retained days
 
         # Get recordings to check for expiration
-        query = Recordings.select(
-            Recordings.id,
-            Recordings.start_time,
-            Recordings.end_time,
-            Recordings.path,
-            Recordings.objects,
-            Recordings.motion,
-            Recordings.dBFS,
-        ).where(Recordings.camera == config.name)
-        if variant is not None:
-            query = query.where(Recordings.variant == variant)
-        query = query.where(
-            (
-                (Recordings.end_time < continuous_expire_date)
-                & (Recordings.motion == 0)
-                & (Recordings.dBFS == 0)
-            )
-            | (Recordings.end_time < motion_expire_date)
-        )
         recordings: Recordings = (
-            query.order_by(Recordings.start_time).namedtuples().iterator()
+            self.variant_expiry_query(
+                config.name,
+                continuous_expire_date,
+                motion_expire_date,
+                variant,
+                hard_cap_date,
+            )
+            .namedtuples()
+            .iterator()
         )
 
         # loop over recordings and see if they overlap with any non-expired reviews
@@ -198,7 +212,7 @@ class RecordingCleanup(threading.Thread):
             # Hard cap: per-variant retain_days deletes anything older than the
             # cap regardless of motion or event overlap.
             if hard_cap_date is not None and recording.end_time < hard_cap_date:
-                Path(recording.path).unlink(missing_ok=True)
+                self.unlink_recording(recording.path)
                 deleted_recordings.add(recording.id)
                 continue
 
@@ -249,7 +263,7 @@ class RecordingCleanup(threading.Thread):
                 )
                 or (mode == RetainModeEnum.active_objects and recording.objects == 0)
             ):
-                Path(recording.path).unlink(missing_ok=True)
+                self.unlink_recording(recording.path)
                 deleted_recordings.add(recording.id)
             else:
                 kept_recordings.append((recording.start_time, recording.end_time))
@@ -335,8 +349,80 @@ class RecordingCleanup(threading.Thread):
                 Previews.id << deleted_previews_list[i : i + max_deletes]
             ).execute()
 
-    def expire_recordings(self) -> None:
-        """Delete recordings based on retention config."""
+    def unlink_recording(self, path: str) -> None:
+        Path(path).unlink(missing_ok=True)
+        # scoped empty-directory removal visits only these
+        self.expired_dirs.add(os.path.dirname(path))
+
+    def removed_camera_query(self, expire_before: float):
+        """Expired rows of cameras that are no longer configured."""
+        return Recordings.select(Recordings.id, Recordings.path).where(
+            Recordings.camera.not_in(list(self.config.cameras.keys())),
+            Recordings.end_time < expire_before,
+            expiry_seek_bound(expire_before),
+        )
+
+    def variant_expiry_query(
+        self,
+        camera: str,
+        continuous_expire_date: float,
+        motion_expire_date: float,
+        variant: Optional[str] = None,
+        hard_cap_date: Optional[float] = None,
+    ):
+        """Rows of one camera (and variant) that may expire in this run."""
+        query = Recordings.select(
+            Recordings.id,
+            Recordings.start_time,
+            Recordings.end_time,
+            Recordings.path,
+            Recordings.objects,
+            Recordings.motion,
+            Recordings.dBFS,
+        ).where(Recordings.camera == camera)
+        if variant is not None:
+            query = query.where(Recordings.variant == variant)
+        expiring = (
+            (Recordings.end_time < continuous_expire_date)
+            & (Recordings.motion == 0)
+            & (Recordings.dBFS == 0)
+        ) | (Recordings.end_time < motion_expire_date)
+        cutoffs = [continuous_expire_date, motion_expire_date]
+        if hard_cap_date is not None:
+            # the hard cap deletes whatever motion a segment has, so its rows
+            # must be read even when the motion window is longer
+            expiring = expiring | (Recordings.end_time < hard_cap_date)
+            cutoffs.append(hard_cap_date)
+        query = query.where(expiring, expiry_seek_bound(max(cutoffs)))
+        return query.order_by(Recordings.start_time)
+
+    def orphan_variant_query(
+        self, camera: str, variants: list[str], base_expire_date: float
+    ):
+        """Expired rows of variants no longer configured for a camera."""
+        return Recordings.select(Recordings.id, Recordings.path).where(
+            Recordings.camera == camera,
+            Recordings.variant.not_in(variants),
+            Recordings.end_time < base_expire_date,
+            expiry_seek_bound(base_expire_date),
+        )
+
+    def remove_expired_directories(self, directories: set[str]) -> None:
+        """Remove directories left empty by expiry (all of them in full mode)."""
+        if (
+            self.config.record.pipeline.empty_directory_cleanup
+            == EmptyDirectoryCleanupEnum.full
+        ):
+            remove_empty_directories(RECORD_DIR)
+        else:
+            remove_empty_parent_directories(directories, RECORD_DIR)
+
+    def expire_recordings(self) -> set[str]:
+        """Delete recordings based on retention config.
+
+        Returns the directories files were deleted from.
+        """
+        self.expired_dirs = set()
         logger.debug("Start expire recordings.")
         logger.debug("Start deleted cameras.")
 
@@ -348,21 +434,12 @@ class RecordingCleanup(threading.Thread):
             datetime.datetime.now() - datetime.timedelta(days=expire_days)
         ).timestamp()
         no_camera_recordings: Recordings = (
-            Recordings.select(
-                Recordings.id,
-                Recordings.path,
-            )
-            .where(
-                Recordings.camera.not_in(list(self.config.cameras.keys())),
-                Recordings.end_time < expire_before,
-            )
-            .namedtuples()
-            .iterator()
+            self.removed_camera_query(expire_before).namedtuples().iterator()
         )
 
         deleted_recordings = set()
         for recording in no_camera_recordings:
-            Path(recording.path).unlink(missing_ok=True)
+            self.unlink_recording(recording.path)
             deleted_recordings.add(recording.id)
 
         logger.debug(f"Expiring {len(deleted_recordings)} recordings")
@@ -475,18 +552,13 @@ class RecordingCleanup(threading.Thread):
                 now - datetime.timedelta(days=base_motion_days)
             ).timestamp()
             orphan_recordings = (
-                Recordings.select(Recordings.id, Recordings.path)
-                .where(
-                    Recordings.camera == config.name,
-                    Recordings.variant.not_in(variants),
-                    Recordings.end_time < base_expire_date,
-                )
+                self.orphan_variant_query(config.name, variants, base_expire_date)
                 .namedtuples()
                 .iterator()
             )
             orphan_ids = []
             for recording in orphan_recordings:
-                Path(recording.path).unlink(missing_ok=True)
+                self.unlink_recording(recording.path)
                 orphan_ids.append(recording.id)
             if orphan_ids:
                 logger.debug(
@@ -513,11 +585,23 @@ class RecordingCleanup(threading.Thread):
 
         logger.debug("End all cameras.")
         logger.debug("End expire recordings.")
+        return self.expired_dirs
 
     def run(self) -> None:
         if self.config.safe_mode:
             logger.info("Safe mode enabled, skipping recording cleanup")
             return
+
+        # give rows to segment files a crash left without one; before
+        # sync_recordings, which deletes files that have no row
+        if (
+            self.unclean_shutdown
+            and self.config.record.pipeline.reconcile_on_unclean_shutdown
+        ):
+            try:
+                reconcile_recordings(self.config)
+            except Exception:
+                logger.exception("Failed to recover recording rows")
 
         # on startup sync recordings with disk if enabled
         if self.config.record.sync_recordings:
@@ -542,12 +626,19 @@ class RecordingCleanup(threading.Thread):
                 next_sync = get_tomorrow_at_time(3)
 
             if counter == 0:
+                summary = CleanupRunSummary()
                 self.clean_tmp_clips()
-                self.expire_recordings()
-                remove_empty_directories(RECORD_DIR)
-                self.truncate_wal()
-                self.refresh_recordings_stats()
+                with summary.phase("expire"):
+                    expired_dirs = self.expire_recordings()
+                with summary.phase("directories"):
+                    self.remove_expired_directories(expired_dirs)
+                with summary.phase("checkpoint"):
+                    summary.checkpoint = self.truncate_wal()
+                with summary.phase("stats"):
+                    self.refresh_recordings_stats()
                 # after expire_recordings, so the precomputed ranges follow the
                 # recordings table rather than advertising footage that is gone
-                self.trim_recording_ranges()
-                self.backfill_recording_ranges()
+                with summary.phase("ranges"):
+                    self.trim_recording_ranges()
+                    self.backfill_recording_ranges()
+                summary.log()

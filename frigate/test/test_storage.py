@@ -3,7 +3,7 @@ import logging
 import os
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from peewee import DoesNotExist
 from peewee_migrate import Router
@@ -259,6 +259,41 @@ class TestHttp(unittest.TestCase):
         assert Recordings.get(Recordings.id == rec_k_id)
         assert Recordings.get(Recordings.id == rec_k2_id)
         assert Recordings.get(Recordings.id == rec_k3_id)
+
+    def test_emptied_directories_are_removed(self):
+        # the cleanup run's scoped directory removal never sees these deletes
+        config = FrigateConfig(**self.minimal_config)
+        storage = StorageMaintainer(config, MagicMock())
+        old = datetime.datetime.now().timestamp() - 7200
+        emptied = os.path.join(self.test_dir, "2026-10-01", "03", "front_door", "main")
+        shared = os.path.join(self.test_dir, "2026-10-01", "04", "front_door", "main")
+        os.makedirs(emptied)
+        os.makedirs(shared)
+
+        for i in range(3):
+            _insert_mock_recording(
+                f"{i}.old",
+                os.path.join(emptied, f"0{i}.00.mp4"),
+                old + i * 10,
+                old + i * 10 + 10,
+                seg_size=1,
+            )
+
+        # far newer and large enough that one hour of bandwidth is freed first
+        now = datetime.datetime.now().timestamp()
+        _insert_mock_recording(
+            "kept", os.path.join(shared, "00.00.mp4"), now, now + 10, seg_size=10**6
+        )
+
+        storage.calculate_camera_bandwidth()
+        storage.camera_storage_stats["front_door"]["bandwidth"] = 2
+
+        with patch("frigate.storage.RECORD_DIR", self.test_dir):
+            storage.reduce_storage_consumption()
+
+        assert not os.path.exists(os.path.join(self.test_dir, "2026-10-01", "03"))
+        assert os.path.exists(os.path.join(shared, "00.00.mp4"))
+        assert os.path.exists(self.test_dir)
 
 
 def _insert_mock_event(

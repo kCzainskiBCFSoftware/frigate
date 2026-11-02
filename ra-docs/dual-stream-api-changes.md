@@ -10,6 +10,7 @@ clients need to adjust.
 > - **Backward-compatible**: clients that don't pass `?variant=` will keep working, but on dual-stream cameras they will silently start receiving the SD stream for playback. Clients that need HD must explicitly pass `?variant=main`.
 > - **Built-in fallback**: VOD/clip endpoints automatically fall back to the other variant if the requested one has no overlapping recordings. Playback never breaks just because a variant has a gap.
 > - **Live streams, event thumbnails, scrubbing previews**: unaffected. Nothing to change for those.
+> - **BREAKING for strict clients: `motion` and `objects` can be `null`** in recording listings and hourly summaries. `null` means *unknown*, not *no activity*. Builds that can return it advertise `recordings_unknown_stats` in `fork.features` on `GET /api/config`. See §2.1.1.
 
 ---
 
@@ -85,6 +86,39 @@ be empty unless that variant exists.
 ```
 The first 7 fields are unchanged. The last 5 are new and may be `null` for
 legacy recordings.
+
+#### 2.1.1 Unknown activity statistics (`null` `motion` / `objects`) — **BREAKING** for strict clients
+
+A continuous-retention segment no longer waits indefinitely for the camera's
+frame processing before it is saved. If processing has not caught up
+`record.pipeline.processing_timeout` seconds (default 30) after the segment
+closed, the segment is saved without activity statistics. Segments recovered
+after an unclean shutdown are saved the same way. Such rows have `motion`,
+`objects`, `regions` and `dBFS` set to `null` in the database.
+
+What clients see:
+
+| Endpoint | Field | Value |
+|---|---|---|
+| `GET /api/{camera}/recordings` | `motion`, `objects` | `null` for such a segment, never `0`. |
+| `GET /api/{camera}/recordings/summary` | per-hour `motion`, `objects` | The total of the known values. `null` only when **every** segment in that hour is unknown. `duration` is unaffected. |
+| `GET /api/review/activity/motion` | — | Unknown segments are left out, like segments without motion. The motion graph shows no activity for that span. |
+| `GET /api/{camera}/recordings/ranges`, `/api/recordings/ranges`, `/api/recordings/hours`, `/vod/...` | — | **Unchanged.** The footage is on the timeline and plays. |
+
+How to handle it:
+
+- Detect it: `recordings_unknown_stats` is in `fork.features` on
+  `GET /api/config` (feature list is append-only; older builds lack the flag
+  and never return `null` here).
+- Treat `null` as *unknown*. Do **not** coerce it to `0`: a `0` means "no
+  motion was seen", and some clients use that to hide or skip footage.
+- Clients that deserialize these fields into a non-nullable integer must make
+  them nullable. That is the breaking part; endpoints and parameters did not
+  change.
+
+Retention keeps an unknown segment until its camera's and variant's **outer**
+window (the motion window, or `retain_days` where set, which still acts as a
+hard cap); it is never expired early as "no motion".
 
 ### 2.2 VOD / HLS playback
 
@@ -339,6 +373,10 @@ If you build any of the following, here is what to consider:
       value through to all recording-related calls for that camera/session.
 - [ ] Read the new `variant`, `codec_name`, `width`, `height`, `bitrate`
       fields from `/api/{camera}/recordings` if you display stream metadata.
+- [ ] Accept `null` for `motion` and `objects` in `/api/{camera}/recordings`
+      rows and `/api/{camera}/recordings/summary` hours, and show it as
+      "unknown" rather than "no activity" (§2.1.1, flag
+      `recordings_unknown_stats`).
 
 ### Custom export / clip download
 - [ ] Add `?variant=main` to keep getting HD .mp4 exports.
@@ -454,6 +492,11 @@ You should not need to query these directly; use `/api/recordings/ranges`:
 - `recording_ranges (id, camera, variant, start_time, end_time)`
 - `recording_range_coverage (camera, variant, covered_from, covered_to)`
 
+`motion`, `objects`, `regions` and `dBFS` have always been nullable columns.
+Since the recording-path resilience change (no migration), new rows can carry
+`NULL` in all four at once, meaning the segment was saved before its frames
+were processed (§2.1.1). `SUM()` ignores them; `= 0` does not match them.
+
 If you have external SQL queries against `recordings`, decide whether you
 want to add `AND variant = 'main'` (or `'sub'`) to them. Without the filter,
 dual-stream cameras will return roughly 2× the row count compared to before
@@ -511,4 +554,5 @@ ws://frigate.example:8555/api/ws?src=3-Cam-3-SD     # SD
 | Download a clip via `/api/{cam}/start/{s}/end/{e}/clip.mp4` | If you need HD output, add `?variant=main`. Default is now SD. |
 | Extract a thumbnail from a specific recording timestamp | **No change** (already defaults to HD). |
 | List recordings for a calendar/summary UI | If you want HD-only or both, add `?variant=main` or `?variant=all`. |
+| Read `motion` / `objects` from recording rows or hourly summaries | **BREAKING if your types are non-nullable:** accept `null` (unknown). Detect via `recordings_unknown_stats`. |
 | Query the DB directly | Add `AND variant=...` to queries; consume the new columns. |

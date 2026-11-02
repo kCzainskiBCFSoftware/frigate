@@ -50,6 +50,7 @@ from .camera.motion import MotionConfig
 from .camera.notification import NotificationConfig
 from .camera.objects import FilterConfig, ObjectConfig
 from .camera.record import RecordConfig
+from .camera.record_pipeline import apply_global_pipeline
 from .camera.review import ReviewConfig
 from .camera.snapshots import SnapshotsConfig
 from .camera.timestamp import TimestampStyleConfig
@@ -674,6 +675,9 @@ class FrigateConfig(FrigateBaseModel):
             # Set live view stream if none is set
             if not camera_config.live.streams:
                 camera_config.live.streams = {name: name}
+
+            # record.pipeline is process-wide; only the stale timeout is per camera
+            apply_global_pipeline(camera_config.record, self.record)
 
             # generate the ffmpeg commands
             camera_config.create_ffmpeg_cmds()

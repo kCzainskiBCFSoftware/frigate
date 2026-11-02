@@ -28,10 +28,12 @@ from frigate.record.ranges import (
     live_ranges,
     merge_ranges,
     recording_ranges,
+    reset_late_rows,
     roll_up_ranges,
     trim_ranges,
 )
 from frigate.record.variants import recordings_overlap_clause
+from frigate.record.writer import insert_recording_rows
 from frigate.test.http_api.base_http_test import BaseTestHttp
 
 DAY = 24 * 60 * 60
@@ -402,6 +404,56 @@ class TestRollup(RangesTestBase):
         served = recording_ranges(["back"], first_tick - 2000, now, "sub", 3.0)["back"]
         direct = live_ranges(["back"], first_tick - 2000, now, "sub", 3.0)["back"]
         assert served == direct
+
+    def test_row_written_30_minutes_late_appears_after_one_tick(self):
+        reset_late_rows()
+        now = datetime.datetime.now().timestamp()
+        self.add_run(now - 3000, 30)
+        roll_up_ranges(self.config, now=now)
+        covered_to = RecordingRangeCoverage.get(
+            RecordingRangeCoverage.camera == "back",
+            RecordingRangeCoverage.variant == "sub",
+        ).covered_to
+
+        # recorded 30 minutes behind the watermark, written only now (a
+        # database stall, or recovery after an unclean shutdown)
+        late = covered_to - 1800
+        insert_recording_rows(
+            [
+                {
+                    "id": "late",
+                    "path": "/rec/late",
+                    "camera": "back",
+                    "variant": "sub",
+                    "start_time": late,
+                    "end_time": late + 10,
+                    "duration": 10,
+                }
+            ]
+        )
+
+        # the next tick: too soon to roll forward, but the late row is merged
+        roll_up_ranges(self.config, now=now + 60)
+
+        window = (late - 100, late + 100)
+        served = recording_ranges(["back"], *window, "sub", 3.0)["back"]
+        assert served == live_ranges(["back"], *window, "sub", 3.0)["back"]
+        assert (late, late + 10) in served
+
+    def test_late_row_without_note_is_missed(self):
+        # why the handler notes late rows: the rollup alone never re-merges
+        # this far behind its watermark
+        reset_late_rows()
+        now = datetime.datetime.now().timestamp()
+        self.add_run(now - 3000, 30)
+        roll_up_ranges(self.config, now=now)
+        late = now - 600 - 1800
+        self.add(late, late + 10)
+
+        roll_up_ranges(self.config, now=now + 60)
+
+        window = (late - 100, late + 100)
+        assert recording_ranges(["back"], *window, "sub", 3.0)["back"] == []
 
     def test_partial_coverage_stitches_live_tail(self):
         now = datetime.datetime.now().timestamp()

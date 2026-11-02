@@ -15,9 +15,10 @@ export type Recording = {
   path: string;
   segment_size: number;
   duration: number;
-  motion: number;
-  objects: number;
-  dBFS: number;
+  // null: unknown (segment moved before its frames were processed), not zero
+  motion: number | null;
+  objects: number | null;
+  dBFS: number | null;
   variant?: RecordingVariant | string;
   codec_name?: string | null;
   width?: number | null;
@@ -29,8 +30,9 @@ export type RecordingSegment = {
   id: string;
   start_time: number;
   end_time: number;
-  motion: number;
-  objects: number;
+  // null: unknown (segment moved before its frames were processed), not zero
+  motion: number | null;
+  objects: number | null;
   segment_size: number;
   duration: number;
   variant?: RecordingVariant | string;

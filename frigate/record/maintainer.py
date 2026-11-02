@@ -4,11 +4,9 @@ import asyncio
 import datetime
 import logging
 import os
-import random
-import string
 import threading
-import time
-from collections import defaultdict
+from collections import Counter, defaultdict
+from contextlib import AbstractAsyncContextManager, nullcontext
 from multiprocessing.synchronize import Event as MpEvent
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -23,43 +21,43 @@ from frigate.comms.recordings_updater import (
     RecordingsDataTypeEnum,
 )
 from frigate.config import FrigateConfig, RetainModeEnum
+from frigate.config.camera.ffmpeg import DEFAULT_RECORD_VARIANT
 from frigate.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateSubscriber,
 )
 from frigate.const import (
     CACHE_DIR,
-    CACHE_SEGMENT_FORMAT,
     FAST_QUEUE_TIMEOUT,
     INSERT_MANY_RECORDINGS,
     MAX_SEGMENT_DURATION,
-    MAX_SEGMENTS_IN_CACHE,
     RECORD_DIR,
 )
 from frigate.models import Recordings, ReviewSegment
+from frigate.record.cache_watch import (
+    RAM_FILESYSTEMS,
+    CachedSegment,
+    cache_space,
+    filesystem_type,
+    parse_cache_name,
+    reserve_discards,
+)
+from frigate.record.util import recording_row
+from frigate.record.writer import BATCH_ROWS, RecordingsWriter
 from frigate.review.types import SeverityEnum
 from frigate.util.services import get_video_properties
 
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_RECORD_VARIANT = "main"
+# at most one "frame processing is behind" warning per camera in this window
+PROCESSING_LAG_LOG_INTERVAL = 300
 
-
-def _parse_cache_segment(basename: str) -> Optional[Tuple[str, str, str]]:
-    """Parse a cache filename and return (camera, variant, date_str).
-
-    Supports both legacy `camera@date` and new `camera@variant@date` formats.
-    Returns None if the format is not recognized.
-    """
-    parts = basename.rsplit("@", maxsplit=2)
-    if len(parts) == 3:
-        camera, variant, date = parts
-        return camera, variant, date
-    if len(parts) == 2:
-        camera, date = parts
-        return camera, DEFAULT_RECORD_VARIANT, date
-    return None
+# Share of record.pipeline.cache_free_reserve enforced before a pass's moves.
+# Moving frees the same space without losing footage, so before the moves only
+# a cache with less than half its reserve free is relieved; the whole reserve is
+# enforced after them.
+START_RESERVE_FACTOR = 0.5
 
 
 class SegmentInfo:
@@ -98,9 +96,18 @@ class SegmentInfo:
 
 
 class RecordingMaintainer(threading.Thread):
-    def __init__(self, config: FrigateConfig, stop_event: MpEvent):
+    def __init__(
+        self,
+        config: FrigateConfig,
+        stop_event: MpEvent,
+        writer: Optional[RecordingsWriter] = None,
+    ):
         super().__init__(name="recording_maintainer")
         self.config = config
+        # record.pipeline.async_db_writes: rows go to the writer thread instead
+        # of a request that blocks the pass until they commit
+        self.writer = writer
+        self.writer_down_logged = False
 
         # create communication for retained recordings
         self.requestor = InterProcessRequestor()
@@ -119,6 +126,12 @@ class RecordingMaintainer(threading.Thread):
             str, Tuple[datetime.datetime, float, dict[str, Any]]
         ] = {}
         self.unexpected_cache_files_logged: bool = False
+        self.processing_lag_logged: dict[str, float] = {}
+        # whether CACHE_DIR is a tmpfs/ramfs; the free-space reserve acts only
+        # then. Looked up on the first pass: mounts do not change while running
+        self.cache_on_ram: Optional[bool] = None
+        # created per pass: each pass runs in its own event loop
+        self.move_slots: Optional[asyncio.Semaphore] = None
 
     async def move_files(self) -> None:
         cache_files = [
@@ -129,28 +142,30 @@ class RecordingMaintainer(threading.Thread):
             and not d.startswith("preview_")
         ]
 
-        # publish newest cached segment per camera (across all variants)
-        newest_cache_segments: dict[str, dict[str, Any]] = {}
+        # (file name, camera, variant, start time) of every segment in the cache
+        cache_segments: list[tuple[str, str, str, datetime.datetime]] = []
         for cache in cache_files:
-            cache_path = os.path.join(CACHE_DIR, cache)
-            basename = os.path.splitext(cache)[0]
-            parsed = _parse_cache_segment(basename)
+            parsed = parse_cache_name(cache)
             if parsed is None:
                 if not self.unexpected_cache_files_logged:
                     logger.warning("Skipping unexpected files in cache")
                     self.unexpected_cache_files_logged = True
                 continue
-            camera, _variant, date = parsed
+            camera, variant, start = parsed
+            # important that start_time is utc because recordings are stored and compared in utc
+            cache_segments.append(
+                (
+                    cache,
+                    camera,
+                    variant,
+                    datetime.datetime.fromtimestamp(start, datetime.timezone.utc),
+                )
+            )
 
-            try:
-                start_time = datetime.datetime.strptime(
-                    date, CACHE_SEGMENT_FORMAT
-                ).astimezone(datetime.timezone.utc)
-            except ValueError:
-                if not self.unexpected_cache_files_logged:
-                    logger.warning("Skipping unexpected files in cache")
-                    self.unexpected_cache_files_logged = True
-                continue
+        # publish newest cached segment per camera (across all variants)
+        newest_cache_segments: dict[str, dict[str, Any]] = {}
+        for cache, camera, _variant, start_time in cache_segments:
+            cache_path = os.path.join(CACHE_DIR, cache)
             if (
                 camera not in newest_cache_segments
                 or start_time > newest_cache_segments[camera]["start_time"]
@@ -160,7 +175,18 @@ class RecordingMaintainer(threading.Thread):
                     "cache_path": cache_path,
                 }
 
+        use_writer = self.writer_available()
+        # the database is not taking writes: moving more would only queue more
+        # rows, so segments wait in the cache under its limits (has_room logs).
+        # Like a blocked mover, a holding one sends no "latest" heartbeat: it
+        # probes nothing, and the cache watchdog must not read the missing
+        # valid messages as dead recorders
+        hold = use_writer and not self.writer.has_room()
+
         for camera, newest in newest_cache_segments.items():
+            if hold:
+                break
+
             self.recordings_publisher.publish(
                 (
                     camera,
@@ -171,7 +197,7 @@ class RecordingMaintainer(threading.Thread):
             )
         # publish None for cameras with no cache files (but only if we know the camera exists)
         for camera_name in self.config.cameras:
-            if camera_name not in newest_cache_segments:
+            if not hold and camera_name not in newest_cache_segments:
                 self.recordings_publisher.publish(
                     (camera_name, None, None),
                     RecordingsDataTypeEnum.latest.value,
@@ -192,100 +218,42 @@ class RecordingMaintainer(threading.Thread):
 
         # group recordings by camera (skip in-use for validation/moving)
         grouped_recordings: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
-        for cache in cache_files:
+        for cache, camera, variant, start_time in cache_segments:
             # Skip files currently in use
             if cache in files_in_use:
                 continue
 
-            cache_path = os.path.join(CACHE_DIR, cache)
-            basename = os.path.splitext(cache)[0]
-            parsed = _parse_cache_segment(basename)
-            if parsed is None:
-                if not self.unexpected_cache_files_logged:
-                    logger.warning("Skipping unexpected files in cache")
-                    self.unexpected_cache_files_logged = True
-                continue
-            camera, variant, date = parsed
-
-            # important that start_time is utc because recordings are stored and compared in utc
-            try:
-                start_time = datetime.datetime.strptime(
-                    date, CACHE_SEGMENT_FORMAT
-                ).astimezone(datetime.timezone.utc)
-            except ValueError:
-                if not self.unexpected_cache_files_logged:
-                    logger.warning("Skipping unexpected files in cache")
-                    self.unexpected_cache_files_logged = True
-                continue
-
             grouped_recordings[camera].append(
                 {
-                    "cache_path": cache_path,
+                    "cache_path": os.path.join(CACHE_DIR, cache),
                     "start_time": start_time,
                     "variant": variant,
                 }
             )
 
-        # delete all cached files past the most recent MAX_SEGMENTS_IN_CACHE
         for camera in grouped_recordings.keys():
             # sort based on start time
             grouped_recordings[camera] = sorted(
                 grouped_recordings[camera], key=lambda s: s["start_time"]
             )
 
-            # the cache holds one segment list per (camera, variant); scale the
-            # cap so a dual-stream camera gets the same wall-clock backlog
-            variant_count = max(
-                1, len({r["variant"] for r in grouped_recordings[camera]})
-            )
-            keep_count = MAX_SEGMENTS_IN_CACHE * variant_count
-
-            camera_info = self.object_recordings_info[camera]
-            most_recently_processed_frame_time = (
-                camera_info[-1][0] if len(camera_info) > 0 else 0
-            )
-
-            processed_segment_count = len(
-                list(
-                    filter(
-                        lambda r: (
-                            r["start_time"].timestamp()
-                            < most_recently_processed_frame_time
-                        ),
-                        grouped_recordings[camera],
-                    )
-                )
-            )
-
-            # see if the recording mover is too slow and segments need to be deleted
-            if processed_segment_count > keep_count:
-                logger.warning(
-                    f"Unable to keep up with recording segments in cache for {camera}. Keeping the {keep_count} most recent segments out of {processed_segment_count} and discarding the rest..."
-                )
-                to_remove = grouped_recordings[camera][:-keep_count]
-                for rec in to_remove:
-                    cache_path = rec["cache_path"]
-                    Path(cache_path).unlink(missing_ok=True)
-                    self.end_time_cache.pop(cache_path, None)
-                grouped_recordings[camera] = grouped_recordings[camera][-keep_count:]
-
-            # see if detection has failed and unprocessed segments need to be deleted
-            unprocessed_segment_count = (
-                len(grouped_recordings[camera]) - processed_segment_count
-            )
-            if unprocessed_segment_count > keep_count:
-                logger.warning(
-                    f"Too many unprocessed recording segments in cache for {camera}. This likely indicates an issue with the detect stream, keeping the {keep_count} most recent segments out of {unprocessed_segment_count} and discarding the rest..."
-                )
-                to_remove = grouped_recordings[camera][:-keep_count]
-                for rec in to_remove:
-                    cache_path = rec["cache_path"]
-                    Path(cache_path).unlink(missing_ok=True)
-                    self.end_time_cache.pop(cache_path, None)
-                grouped_recordings[camera] = grouped_recordings[camera][-keep_count:]
+        # the backlog limit is applied after the moves (discard_backlog), so a
+        # backlog this pass can move is never discarded. Before the moves only
+        # a critically full cache is relieved, since moving frees the same
+        # space without losing footage; the full reserve applies after them
+        self.enforce_cache_reserve(grouped_recordings, START_RESERVE_FACTOR)
+        self.move_slots = (
+            asyncio.Semaphore(self.config.record.pipeline.move_concurrency)
+            if self.config.record.pipeline.move_concurrency > 0
+            else None
+        )
 
         tasks = []
+        saved: dict[str, Optional[float]] = {}
         for camera, recordings in grouped_recordings.items():
+            if not recordings:
+                continue
+
             # clear out all the object recording info for old frames
             while (
                 len(self.object_recordings_info[camera]) > 0
@@ -301,6 +269,9 @@ class RecordingMaintainer(threading.Thread):
                 < recordings[0]["start_time"].timestamp()
             ):
                 self.audio_recordings_info[camera].pop(0)
+
+            if hold:
+                continue
 
             # get all reviews with the end time after the start of the oldest cache file
             # or with end_time None
@@ -327,28 +298,240 @@ class RecordingMaintainer(threading.Thread):
             )
 
             # publish most recently available recording time and None if disabled
-            self.recordings_publisher.publish(
-                (
-                    camera,
-                    recordings[0]["start_time"].timestamp()
-                    if self.config.cameras[camera].record.enabled
-                    else None,
-                    None,
-                ),
-                RecordingsDataTypeEnum.saved.value,
+            saved[camera] = (
+                recordings[0]["start_time"].timestamp()
+                if self.config.cameras[camera].record.enabled
+                else None
             )
+
+            # with the writer, saved is published once earlier rows are written
+            if not use_writer:
+                self.recordings_publisher.publish(
+                    (camera, saved[camera], None),
+                    RecordingsDataTypeEnum.saved.value,
+                )
 
         recordings_to_insert: list[Optional[Recordings]] = await asyncio.gather(*tasks)
 
-        # fire and forget recordings entries
-        self.requestor.send_data(
-            INSERT_MANY_RECORDINGS,
-            [r for r in recordings_to_insert if r is not None],
-        )
+        for camera, recordings in grouped_recordings.items():
+            # while holding, has_room has logged why the cache backs up
+            self.discard_backlog(camera, recordings, quiet=hold)
+
+        self.enforce_cache_reserve(grouped_recordings)
+
+        rows = [r for r in recordings_to_insert if r is not None]
+
+        if use_writer:
+            if not hold:
+                self.writer.submit(rows, saved)
+
+            return
+
+        if self.writer is not None:
+            # the writer thread has stopped: send what it still held as well
+            rows = self.writer.take_rows() + rows
+
+        # fire and forget recordings entries; batched so rows a stopped writer
+        # held stay under SQLite's bound-variable limit
+        for i in range(0, max(len(rows), 1), BATCH_ROWS):
+            batch = rows[i : i + BATCH_ROWS]
+            result = self.requestor.send_data(INSERT_MANY_RECORDINGS, batch)
+
+            if isinstance(result, dict) and not result.get("ok", True):
+                logger.error(
+                    f"Failed to write {len(batch)} recording rows: {result.get('error')}"
+                )
+
+    def writer_available(self) -> bool:
+        """Whether this pass hands its rows to the background writer.
+
+        If the writer thread has died, its queue would fill and then stop the
+        mover for good; the pass falls back to the blocking request instead.
+        """
+        if self.writer is None:
+            return False
+
+        if self.writer.is_alive():
+            return True
+
+        if not self.writer_down_logged:
+            logger.error(
+                "The recording row writer has stopped. Writing segment rows, and "
+                "the rows it still held, with a blocking request instead"
+            )
+            self.writer_down_logged = True
+
+        return False
 
     def drop_segment(self, cache_path: str) -> None:
         Path(cache_path).unlink(missing_ok=True)
         self.end_time_cache.pop(cache_path, None)
+
+    def discard_backlog(
+        self, camera: str, recordings: list[dict[str, Any]], quiet: bool = False
+    ) -> None:
+        """Apply the cache backlog limit to what is still cached, per variant.
+
+        ``quiet`` logs the discards at debug level, for passes whose reason has
+        been logged already.
+        """
+        keep_count = self.config.record.pipeline.max_cached_segments
+        most_recently_processed_frame_time = self.processed_frame_time(camera)
+        log = logger.debug if quiet else logger.warning
+
+        by_variant: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+        for rec in recordings:
+            if os.path.exists(rec["cache_path"]):
+                by_variant[rec["variant"]].append(rec)
+
+        for remaining in by_variant.values():
+            processed_segment_count = len(
+                [
+                    r
+                    for r in remaining
+                    if r["start_time"].timestamp() < most_recently_processed_frame_time
+                ]
+            )
+
+            # see if the recording mover is too slow and segments need to be deleted
+            if processed_segment_count > keep_count:
+                log(
+                    f"Unable to keep up with recording segments in cache for {camera}. Keeping the {keep_count} most recent segments out of {processed_segment_count} and discarding the rest..."
+                )
+                for rec in remaining[:-keep_count]:
+                    self.drop_segment(rec["cache_path"])
+                remaining = remaining[-keep_count:]
+
+            # see if detection has failed and unprocessed segments need to be deleted
+            unprocessed_segment_count = len(remaining) - processed_segment_count
+            if unprocessed_segment_count > keep_count:
+                log(
+                    f"Too many unprocessed recording segments in cache for {camera}. This likely indicates an issue with the detect stream, keeping the {keep_count} most recent segments out of {unprocessed_segment_count} and discarding the rest..."
+                )
+                for rec in remaining[:-keep_count]:
+                    self.drop_segment(rec["cache_path"])
+
+    def enforce_cache_reserve(
+        self,
+        grouped_recordings: dict[str, list[dict[str, Any]]],
+        factor: float = 1.0,
+    ) -> None:
+        """Discard the oldest closed segments while the cache is below its reserve.
+
+        ``factor`` scales the reserve: the check before a pass's moves uses
+        START_RESERVE_FACTOR, so it discards only what the moves could not free
+        in time, not segments the pass is about to move anyway.
+        """
+        reserve = self.config.record.pipeline.cache_free_reserve * factor
+
+        if reserve <= 0 or not self.cache_reserve_applies():
+            return
+
+        try:
+            free_bytes, total_bytes = cache_space(CACHE_DIR)
+        except OSError:
+            return
+
+        discards = reserve_discards(
+            [
+                CachedSegment(
+                    camera, r["variant"], r["start_time"].timestamp(), r["cache_path"]
+                )
+                for camera, recordings in grouped_recordings.items()
+                for r in recordings
+            ],
+            free_bytes,
+            total_bytes,
+            reserve,
+        )
+
+        if not discards:
+            return
+
+        for segment in discards:
+            self.drop_segment(segment.path)
+
+        dropped = {segment.path for segment in discards}
+        for camera, recordings in grouped_recordings.items():
+            grouped_recordings[camera] = [
+                r for r in recordings if r["cache_path"] not in dropped
+            ]
+
+        per_camera = Counter(segment.camera for segment in discards)
+        logger.error(
+            "Recording cache is %.0f%% free, below the %g%% reserve. Discarded the "
+            "%d oldest segments (%s)",
+            free_bytes / total_bytes * 100,
+            reserve,
+            len(discards),
+            ", ".join(f"{camera}: {count}" for camera, count in per_camera.items()),
+        )
+
+    def cache_reserve_applies(self) -> bool:
+        """Whether CACHE_DIR is RAM-backed, so its free space is the cache's own.
+
+        On a disk-backed cache (no tmpfs mounted at CACHE_DIR) free space is
+        that of the shared volume -- often a recordings volume kept nearly full
+        -- and the reserve would discard every closed segment on every pass.
+        """
+        if self.cache_on_ram is None:
+            fs_type = filesystem_type(CACHE_DIR)
+            self.cache_on_ram = fs_type in RAM_FILESYSTEMS
+
+            if not self.cache_on_ram:
+                logger.warning(
+                    f"record.pipeline.cache_free_reserve is not applied: {CACHE_DIR} "
+                    f"is on {fs_type or 'an unknown filesystem'}, not a tmpfs. "
+                    f"Mount a tmpfs at {CACHE_DIR} to use it"
+                )
+
+        return self.cache_on_ram
+
+    def processed_frame_time(self, camera: str) -> float:
+        """Time of the newest frame processed for a camera, 0 if none yet."""
+        camera_info = self.object_recordings_info[camera]
+        return camera_info[-1][0] if len(camera_info) > 0 else 0
+
+    def frames_processed(self, camera: str, end_time: datetime.datetime) -> bool:
+        """Whether frame processing has passed the end of a segment."""
+        return (
+            datetime.datetime.fromtimestamp(
+                self.processed_frame_time(camera)
+            ).astimezone(datetime.timezone.utc)
+            >= end_time
+        )
+
+    def processing_timed_out(self, end_time: datetime.datetime) -> bool:
+        """Whether a continuous segment has waited long enough for processing."""
+        timeout = self.config.record.pipeline.processing_timeout
+        return (
+            timeout > 0
+            and datetime.datetime.now().timestamp() - end_time.timestamp() >= timeout
+        )
+
+    def warn_processing_lag(self, camera: str) -> None:
+        now = datetime.datetime.now().timestamp()
+
+        if (
+            now - self.processing_lag_logged.get(camera, 0)
+            < PROCESSING_LAG_LOG_INTERVAL
+        ):
+            return
+
+        self.processing_lag_logged[camera] = now
+        processed_time = self.processed_frame_time(camera)
+        behind = (
+            f"is {now - processed_time:.0f}s behind"
+            if processed_time > 0
+            else "has not reported any frames"
+        )
+        logger.warning(
+            f"Frame processing for {camera} {behind}. Moving its continuous and retain-all recording segments without activity stats"
+        )
+
+    def move_slot(self) -> AbstractAsyncContextManager:
+        """One of record.pipeline.move_concurrency slots for a probe or copy."""
+        return self.move_slots if self.move_slots is not None else nullcontext()
 
     async def validate_and_move_segment(
         self, camera: str, reviews: list[ReviewSegment], recording: dict[str, Any]
@@ -370,9 +553,10 @@ class RecordingMaintainer(threading.Thread):
         if cache_path in self.end_time_cache:
             end_time, duration, media_info = self.end_time_cache[cache_path]
         else:
-            segment_info = await get_video_properties(
-                self.config.ffmpeg, cache_path, get_duration=True
-            )
+            async with self.move_slot():
+                segment_info = await get_video_properties(
+                    self.config.ffmpeg, cache_path, get_duration=True
+                )
 
             if not segment_info.get("has_valid_video", False):
                 logger.warning(
@@ -423,18 +607,8 @@ class RecordingMaintainer(threading.Thread):
         # and avoid any DB calls
         if highest is not None:
             # assume that empty means the relevant recording info has not been received yet
-            camera_info = self.object_recordings_info[camera]
-            most_recently_processed_frame_time = (
-                camera_info[-1][0] if len(camera_info) > 0 else 0
-            )
-
             # ensure delayed segment info does not lead to lost segments
-            if (
-                datetime.datetime.fromtimestamp(
-                    most_recently_processed_frame_time
-                ).astimezone(datetime.timezone.utc)
-                >= end_time
-            ):
+            if self.frames_processed(camera, end_time):
                 record_mode = (
                     RetainModeEnum.all
                     if highest == "continuous"
@@ -450,6 +624,27 @@ class RecordingMaintainer(threading.Thread):
                     variant,
                     media_info,
                 )
+
+            if highest == "continuous":
+                # continuous retention keeps the segment whatever its stats, so
+                # it need not wait for frame processing beyond the timeout
+                if self.processing_timed_out(end_time):
+                    self.warn_processing_lag(camera)
+                    return await self.move_segment(
+                        camera,
+                        start_time,
+                        end_time,
+                        duration,
+                        cache_path,
+                        RetainModeEnum.all,
+                        variant,
+                        media_info,
+                        stats_known=False,
+                    )
+
+                # wait in the cache: a review-based move now would decide on
+                # incomplete stats and could discard the segment
+                return None
 
         # we fell through the continuous / motion check, so we need to check the review items
         # if the cached segment overlaps with the review items:
@@ -481,6 +676,20 @@ class RecordingMaintainer(threading.Thread):
                 if review.severity == "alert"
                 else record_config.detections.retain.mode
             )
+            stats_known = self.frames_processed(camera, end_time)
+
+            if not stats_known:
+                # keep or discard on activity only with complete stats. "all"
+                # keeps the segment whatever its stats, so, like a continuous
+                # segment, it waits no longer than the processing timeout
+                # instead of until the backlog limit discards it
+                if record_mode != RetainModeEnum.all or not self.processing_timed_out(
+                    end_time
+                ):
+                    return None
+
+                self.warn_processing_lag(camera)
+
             # move from cache to recordings immediately
             return await self.move_segment(
                 camera,
@@ -491,17 +700,14 @@ class RecordingMaintainer(threading.Thread):
                 record_mode,
                 variant,
                 media_info,
+                stats_known=stats_known,
             )
         # if it doesn't overlap with an review item, go ahead and drop the segment
         # if it ends more than the configured pre_capture for the camera
         # BUT only if continuous/motion is NOT enabled (otherwise wait for processing)
         elif highest is None:
-            camera_info = self.object_recordings_info[camera]
-            most_recently_processed_frame_time = (
-                camera_info[-1][0] if len(camera_info) > 0 else 0
-            )
             retain_cutoff = datetime.datetime.fromtimestamp(
-                most_recently_processed_frame_time - record_config.event_pre_capture
+                self.processed_frame_time(camera) - record_config.event_pre_capture
             ).astimezone(datetime.timezone.utc)
             if end_time < retain_cutoff:
                 self.drop_segment(cache_path)
@@ -564,11 +770,16 @@ class RecordingMaintainer(threading.Thread):
         store_mode: RetainModeEnum,
         variant: str = DEFAULT_RECORD_VARIANT,
         media_info: Optional[dict[str, Any]] = None,
+        stats_known: bool = True,
     ) -> Optional[Recordings]:
-        segment_info = self.segment_stats(camera, start_time, end_time)
+        # stats_known=False: moved on the processing timeout; the row's activity
+        # stats are stored as unknown (NULL), never as 0, so retention keeps it
+        segment_info = (
+            self.segment_stats(camera, start_time, end_time) if stats_known else None
+        )
 
         # check if the segment shouldn't be stored
-        if segment_info.should_discard_segment(store_mode):
+        if segment_info is not None and segment_info.should_discard_segment(store_mode):
             self.drop_segment(cache_path)
             return
 
@@ -593,21 +804,22 @@ class RecordingMaintainer(threading.Thread):
                 start_frame = datetime.datetime.now().timestamp()
 
                 # add faststart to kept segments to improve metadata reading
-                p = await asyncio.create_subprocess_exec(
-                    self.config.ffmpeg.ffmpeg_path,
-                    "-hide_banner",
-                    "-y",
-                    "-i",
-                    cache_path,
-                    "-c",
-                    "copy",
-                    "-movflags",
-                    "+faststart",
-                    file_path,
-                    stderr=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.DEVNULL,
-                )
-                await p.wait()
+                async with self.move_slot():
+                    p = await asyncio.create_subprocess_exec(
+                        self.config.ffmpeg.ffmpeg_path,
+                        "-hide_banner",
+                        "-y",
+                        "-i",
+                        cache_path,
+                        "-c",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                        file_path,
+                        stderr=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.DEVNULL,
+                    )
+                    await p.wait()
 
                 if p.returncode != 0:
                     logger.error(f"Unable to convert {cache_path} to {file_path}")
@@ -622,51 +834,37 @@ class RecordingMaintainer(threading.Thread):
                     # get the segment size of the cache file
                     # file without faststart is same size
                     segment_size_bytes = os.path.getsize(cache_path)
-                    segment_size = round(
-                        float(segment_size_bytes) / pow(2, 20), 2
-                    )
                 except OSError:
                     segment_size_bytes = 0
-                    segment_size = 0
 
                 os.remove(cache_path)
+                # the cache file is gone, so its probe result is no longer needed;
+                # without this every moved segment stays in the cache for good
+                self.end_time_cache.pop(cache_path, None)
 
-                rand_id = "".join(
-                    random.choices(string.ascii_lowercase + string.digits, k=6)
+                # without segment_info the stats are left unknown (NULL)
+                stats = (
+                    {
+                        "motion": segment_info.motion_count,
+                        "objects": segment_info.active_object_count,
+                        "regions": segment_info.region_count,
+                        "dBFS": segment_info.average_dBFS,
+                    }
+                    if segment_info is not None
+                    else {}
                 )
 
-                bitrate: Optional[int] = None
-                if duration > 0 and segment_size_bytes > 0:
-                    bitrate = int((segment_size_bytes * 8) / duration)
-
-                codec_name = None
-                width = None
-                height = None
-                if media_info:
-                    codec_name = media_info.get("fourcc")
-                    width = media_info.get("width") or None
-                    height = media_info.get("height") or None
-
-                return {
-                    Recordings.id.name: f"{start_time.timestamp()}-{rand_id}",
-                    Recordings.camera.name: camera,
-                    Recordings.path.name: file_path,
-                    Recordings.start_time.name: start_time.timestamp(),
-                    Recordings.end_time.name: end_time.timestamp(),
-                    Recordings.duration.name: duration,
-                    Recordings.motion.name: segment_info.motion_count,
-                    # TODO: update this to store list of active objects at some point
-                    Recordings.objects.name: segment_info.active_object_count,
-                    Recordings.regions.name: segment_info.region_count,
-                    Recordings.dBFS.name: segment_info.average_dBFS,
-                    Recordings.segment_size.name: segment_size,
-                    Recordings.variant.name: variant,
-                    Recordings.codec_name.name: codec_name,
-                    Recordings.width.name: width,
-                    Recordings.height.name: height,
-                    Recordings.bitrate.name: bitrate,
-                    Recordings.transcoded_from_main.name: False,
-                }
+                return recording_row(
+                    camera,
+                    variant,
+                    file_path,
+                    start_time.timestamp(),
+                    end_time.timestamp(),
+                    duration,
+                    segment_size_bytes,
+                    media_info,
+                    **stats,
+                )
         except Exception as e:
             logger.error(f"Unable to store recording segment {cache_path}")
             Path(cache_path).unlink(missing_ok=True)
@@ -680,9 +878,10 @@ class RecordingMaintainer(threading.Thread):
         # Check for new files every 5 seconds
         wait_time = 0.0
         while not self.stop_event.is_set():
-            time.sleep(wait_time)
-
-            if self.stop_event.is_set():
+            # a stop ends the wait at once: the recording process must drain
+            # the writer and leave its clean-shutdown marker within Docker's
+            # stop grace (10 s unless the compose file sets stop_grace_period)
+            if self.stop_event.wait(wait_time):
                 break
 
             run_start = datetime.datetime.now().timestamp()

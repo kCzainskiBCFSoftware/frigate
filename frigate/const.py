@@ -130,6 +130,8 @@ FORK_FEATURES = [
     "recording_variants",
     "recordings_ranges",
     "recordings_hours",
+    # motion/objects in recording listings and summaries can be null (unknown)
+    "recordings_unknown_stats",
 ]
 
 # Internal Comms Topics
