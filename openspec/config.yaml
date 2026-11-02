@@ -4,7 +4,9 @@ schema: spec-driven
 context: |
   This repository is a fork of upstream Frigate NVR (blakeblackshear/frigate).
   The fork is based on upstream tag v0.17.1 (commit 416a9b76); the release
-  branch is v17.1-update-with-adaptive, which CI publishes as the `latest` image.
+  branch is dev-fork, the repo's default branch, which CI publishes as the
+  `latest` image. dev-fork replaced v17.1-update-with-adaptive on 2026-10-29;
+  `dev` only mirrors upstream.
 
   The specs under openspec/specs/ describe ONLY behavior this fork adds or
   changes on top of upstream. Do not spec unchanged upstream behavior; if a

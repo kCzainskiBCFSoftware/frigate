@@ -9,6 +9,10 @@ Python 3.13+ backend (FastAPI, OpenCV, TensorFlow/ONNX, Peewee/SQLite) plus a Re
 Vite frontend in `web/`. This is a **fork** of `blakeblackshear/frigate`; the active branch adds
 dual-stream recording (main/sub variants — see "Fork-specific work" below).
 
+**Branches:** `dev-fork` is the fork's baseline and default branch — base work on it and target PRs
+at it. `dev` only mirrors upstream; `v17.1-update-with-adaptive` is the predecessor `dev-fork`
+replaced and takes no new work.
+
 A coding-standards reference already exists at `.github/copilot-instructions.md` (Python/async/i18n
 conventions, logging, error handling). Read it before writing code; this file does not repeat it.
 
