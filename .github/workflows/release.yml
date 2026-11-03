@@ -1,25 +1,22 @@
 name: Release
 
-# Releases a build you have already tested. Run it from the Actions tab with the sha
-# of the image you tested (abc1234 from :0.17.4-abc1234), or push a v* tag yourself;
-# both take the same path:
+# Ships a build of the release branch. The runbook — the steps, how the next version is
+# chosen, and how to do a minor or major release — is ra-docs/releasing.md.
 #
-#   1. The version comes from the Makefile at that commit. The Makefile always holds
-#      the version being worked toward, so there is nothing to type.
-#   2. The tested image gets one layer that rewrites frigate/version.py to the bare
-#      version (docker/release/version-stamp.Dockerfile) and is pushed as :<version>
-#      and :stable. Every other layer is the image you tested, byte for byte.
-#   3. The v<version> tag is created, unless you pushed it yourself.
-#   4. The Makefile on the release branch moves to the next patch version, so every
-#      build after the release reports the version being worked toward next.
+# Two ways in, same result:
 #
-# For a minor or major release, run "Bump version" first (e.g. to 0.18.0).
+#   - Actions -> Release -> Run workflow, with "Use workflow from" on dev-fork. Releases
+#     the tip of dev-fork as the version its Makefile names, and creates the tag and the
+#     GitHub release. Picking a v* tag there instead releases that tag.
+#   - Publish a GitHub release with a new v<version> tag targeting dev-fork. Publishing
+#     creates the tag, which runs this; the release you wrote is kept as it is.
+#
+# Either way, the image CI built for that commit gets one layer that rewrites
+# frigate/version.py to the bare version, and is pushed as :<version> (plus :stable for
+# the newest stable release). Then the Makefile on dev-fork moves to the next patch
+# version, so later builds report the version being worked toward.
 on:
   workflow_dispatch:
-    inputs:
-      sha:
-        description: 'Commit to release: the sha of the image you tested (abc1234 from :0.17.4-abc1234)'
-        required: true
   push:
     tags:
       - 'v*'
@@ -47,63 +44,77 @@ jobs:
           ref: ${{ env.RELEASE_BRANCH }}
           fetch-depth: 1
 
-      # A tag push names the version and the Makefile has to agree with it. A manual
-      # run names only the commit, and the version is whatever its Makefile says.
+      # From the release branch, the Makefile names the version and the tag is created
+      # here. From a tag (pushed, published as a GitHub release, or picked in "Use
+      # workflow from"), the tag names the version and the Makefile has to agree.
       - name: Resolve the commit and version
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_SHA: ${{ inputs.sha }}
         run: |
-          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             TAG="${GITHUB_REF_NAME}"
-            FULL_SHA="${GITHUB_SHA}"
+            CREATE_TAG=false
             if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
               echo "::error::'${TAG}' is not a version tag (expected vX.Y.Z or vX.Y.Z-suffix)"
               exit 1
             fi
+          elif [ "${GITHUB_REF_NAME}" = "${RELEASE_BRANCH}" ]; then
+            CREATE_TAG=true
           else
-            if ! [[ "${INPUT_SHA}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-              echo "::error::'${INPUT_SHA}' is not a commit sha"
-              exit 1
-            fi
-            if ! FULL_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}" --jq .sha 2>/dev/null); then
-              echo "::error::No commit ${INPUT_SHA} in ${GITHUB_REPOSITORY}"
-              exit 1
-            fi
+            echo "::error::Run this with 'Use workflow from' set to ${RELEASE_BRANCH} or a v* tag, not ${GITHUB_REF_NAME}."
+            exit 1
           fi
 
-          git fetch --no-tags --depth 1 origin "${FULL_SHA}"
+          # A tag is resolved to its commit here rather than taken from GITHUB_SHA, so an
+          # annotated tag pushed from git behaves like one GitHub created.
+          if [ "${CREATE_TAG}" = false ]; then
+            git fetch --no-tags --depth 1 origin "refs/tags/${TAG}:refs/tags/${TAG}"
+            FULL_SHA=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          else
+            FULL_SHA="${GITHUB_SHA}"
+            git fetch --no-tags --depth 1 origin "${FULL_SHA}"
+          fi
           MAKEFILE_VERSION=$(git show "${FULL_SHA}:Makefile" | grep -m1 '^VERSION' | cut -d'=' -f2 | tr -d ' ')
           if ! [[ "${MAKEFILE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Makefile at ${FULL_SHA::7} has VERSION = '${MAKEFILE_VERSION}', not X.Y.Z"
             exit 1
           fi
 
-          if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
+          if [ "${CREATE_TAG}" = true ]; then
             TAG="v${MAKEFILE_VERSION}"
           fi
           VERSION="${TAG#v}"
           # A pre-release tag like v0.18.0-beta1 is built from the 0.18.0 source, so the
           # Makefile is checked against the base while the image gets the full tag.
           BASE_VERSION="${VERSION%%-*}"
+          BUILD_TYPE=$([[ "${VERSION}" == *-* ]] && echo beta || echo stable)
 
           if [ "${MAKEFILE_VERSION}" != "${BASE_VERSION}" ]; then
-            echo "::error::Tag ${TAG} was pushed on a commit whose Makefile says VERSION = ${MAKEFILE_VERSION}, not ${BASE_VERSION}."
+            echo "::error::Tag ${TAG} is on a commit whose Makefile says VERSION = ${MAKEFILE_VERSION}, not ${BASE_VERSION}. Delete the tag (and its GitHub release, if you published one) and release v${MAKEFILE_VERSION} instead."
             exit 1
           fi
+
+          # Only the newest stable release takes :stable and "Latest" — re-running an older
+          # release must not move them back. PREVIOUS is where its release notes start.
+          STABLE_TAGS=$(git ls-remote --tags --refs origin 'refs/tags/v*' | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          NEWEST=$({ echo "${STABLE_TAGS}"; echo "${TAG}"; } | grep . | sort -uV | tail -1)
+          PREVIOUS=$({ echo "${STABLE_TAGS}"; echo "${TAG}"; } | grep . | sort -uV | grep -Fx -B1 -- "${TAG}" | head -1)
+          [ "${PREVIOUS}" = "${TAG}" ] && PREVIOUS=""
+          IS_NEWEST=$([ "${BUILD_TYPE}" = stable ] && [ "${NEWEST}" = "${TAG}" ] && echo true || echo false)
 
           {
             echo "TAG=${TAG}"
             echo "VERSION=${VERSION}"
             echo "BASE_VERSION=${BASE_VERSION}"
-            echo "BUILD_TYPE=$([[ "${VERSION}" == *-* ]] && echo beta || echo stable)"
+            echo "BUILD_TYPE=${BUILD_TYPE}"
+            echo "CREATE_TAG=${CREATE_TAG}"
+            echo "IS_NEWEST=${IS_NEWEST}"
+            echo "PREVIOUS_TAG=${PREVIOUS}"
             echo "FULL_SHA=${FULL_SHA}"
             # The image tags use ${GITHUB_SHA::7}; git's own abbreviation is 8 chars here.
             echo "BUILD_TAG=sha-${FULL_SHA::7}"
             echo "REGISTRY=${{ secrets.ECR_REGISTRY }}"
             echo "REPOSITORY=${{ vars.ECR_REPOSITORY }}"
           } >> "$GITHUB_ENV"
-          echo "Releasing ${FULL_SHA::7} as ${VERSION}"
+          echo "Releasing ${FULL_SHA::7} as ${VERSION} (newest stable: ${IS_NEWEST}, notes from: ${PREVIOUS:-the start})"
 
       # Releases come from the baseline: a feature-branch build is not what gets merged,
       # and the version bump below would land on code that never contained it.
@@ -115,17 +126,17 @@ jobs:
           case "${STATUS}" in
             ahead|identical) echo "${FULL_SHA::7} is on ${RELEASE_BRANCH}" ;;
             *)
-              echo "::error::${FULL_SHA::7} is not on ${RELEASE_BRANCH} (compare status: ${STATUS}). Merge it, let CI build ${RELEASE_BRANCH}, and release that build."
+              echo "::error::${FULL_SHA::7} is not on ${RELEASE_BRANCH} (compare status: ${STATUS}). Tag a commit that is on ${RELEASE_BRANCH}."
               exit 1
               ;;
           esac
 
-      # Only a manual run creates the tag, so only a manual run can collide with one.
+      # Only a run from the release branch creates the tag, so only it can collide with one.
       - name: Guard - the version must not be released already
-        if: github.event_name == 'workflow_dispatch'
+        if: env.CREATE_TAG == 'true'
         run: |
           if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
-            echo "::error::${TAG} is already released, and the Makefile at ${FULL_SHA::7} still says ${VERSION}. Release a build made after the post-release version bump, or move the version with 'Bump version'."
+            echo "::error::${TAG} is already released, but the Makefile on ${RELEASE_BRANCH} still says ${VERSION}. If that release failed partway, finish it by running Release from the ${TAG} tag; otherwise run 'Bump version' with patch."
             exit 1
           fi
 
@@ -144,17 +155,17 @@ jobs:
           if ! aws ecr describe-images \
                 --repository-name "${REPOSITORY}" \
                 --image-ids imageTag="${BUILD_TAG}" >/dev/null 2>&1; then
-            echo "::error::No image tagged ${BUILD_TAG} in ${REPOSITORY}. That commit was never built by CI — let CI finish on ${RELEASE_BRANCH} before releasing."
+            echo "::error::No image tagged ${BUILD_TAG} in ${REPOSITORY}. That commit was never built by CI — wait for CI on ${RELEASE_BRANCH} to finish, then re-run."
             exit 1
           fi
 
       # The image goes out before the tag, so a failure here leaves no tag behind and
-      # the run can simply be retried.
+      # the run can simply be re-run.
       - name: Stamp the release version and push
         run: |
           SOURCE="${REGISTRY}/${REPOSITORY}:${BUILD_TAG}"
           TAGS=(--tag "${REGISTRY}/${REPOSITORY}:${VERSION}")
-          if [ "${BUILD_TYPE}" = "stable" ]; then
+          if [ "${IS_NEWEST}" = true ]; then
             TAGS+=(--tag "${REGISTRY}/${REPOSITORY}:stable")
           fi
 
@@ -177,12 +188,53 @@ jobs:
       # A tag pushed with GITHUB_TOKEN does not trigger workflows, so this does not
       # start a second release.
       - name: Create the release tag
-        if: github.event_name == 'workflow_dispatch'
+        if: env.CREATE_TAG == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${TAG}" -m "Release ${VERSION}" "${FULL_SHA}"
           git push origin "refs/tags/${TAG}"
+
+      # A GitHub release published by hand is what started this run, so it is kept. The
+      # notes are cosmetic: if GitHub cannot generate them, the release links the
+      # changelog instead of failing a release whose image and tag are already out.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "GitHub release ${TAG} already exists; left as it is"
+            exit 0
+          fi
+
+          NOTES_ARGS=(-f tag_name="${TAG}" -f target_commitish="${FULL_SHA}")
+          [ -n "${PREVIOUS_TAG}" ] && NOTES_ARGS+=(-f previous_tag_name="${PREVIOUS_TAG}")
+          if ! GENERATED=$(gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" "${NOTES_ARGS[@]}" --jq .body); then
+            echo "::warning::GitHub could not generate release notes; the release links the changelog instead"
+            GENERATED="**Full changelog**: https://github.com/${GITHUB_REPOSITORY}/commits/${TAG}"
+            [ -n "${PREVIOUS_TAG}" ] && GENERATED="**Full changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${TAG}"
+          fi
+
+          {
+            if [ "${IS_NEWEST}" = true ]; then
+              echo "Image: \`${REPOSITORY}:${VERSION}\` (also \`${REPOSITORY}:stable\`)"
+            else
+              echo "Image: \`${REPOSITORY}:${VERSION}\`"
+            fi
+            echo ""
+            echo "${GENERATED}"
+          } > "${RUNNER_TEMP}/release-notes.md"
+
+          ARGS=(--title "${TAG}" --notes-file "${RUNNER_TEMP}/release-notes.md" --verify-tag)
+          if [ "${BUILD_TYPE}" = beta ]; then
+            ARGS+=(--prerelease --latest=false)
+          elif [ "${IS_NEWEST}" = true ]; then
+            ARGS+=(--latest)
+          else
+            ARGS+=(--latest=false)
+          fi
+          gh release create "${TAG}" "${ARGS[@]}"
 
       # Pre-releases are steps toward the same version, so only a stable release moves
       # it on. If the Makefile has already moved past the release (someone ran "Bump
@@ -214,7 +266,7 @@ jobs:
             fi
             echo "Push lost a race with another change to ${RELEASE_BRANCH}, retrying (${attempt}/3)"
           done
-          echo "::error::Released ${TAG}, but could not push the bump to ${NEXT}. Run 'Bump version' with ${NEXT}."
+          echo "::error::Released ${TAG}, but could not push the bump to ${NEXT}. Run 'Bump version' with patch."
           exit 1
 
       - name: Summary
@@ -227,7 +279,8 @@ jobs:
             echo "|---|---|"
             echo "| Commit | \`${FULL_SHA::7}\` |"
             echo "| Tag | \`${TAG:-?}\` |"
-            echo "| Image | \`${REPOSITORY:-?}:${VERSION:-?}\` |"
+            echo "| Image | \`${REPOSITORY:-?}:${VERSION:-?}\`$([ "${IS_NEWEST:-}" = true ] && echo ' + `stable`') |"
             echo "| Instances report | \`${VERSION:-?}\` |"
+            echo "| GitHub release | https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG:-} |"
             echo "| ${RELEASE_BRANCH} now builds | \`${NEXT_VERSION:-unchanged}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
