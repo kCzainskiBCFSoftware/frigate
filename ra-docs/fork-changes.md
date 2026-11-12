@@ -1,4 +1,4 @@
-# Fork Changes — Dual-Stream Recording + Playback Performance + Recording Resilience
+# Fork Changes — Dual-Stream Recording + Playback Performance + Recording Resilience + Confirmed UI Restart
 
 This document is the canonical changelog for what this fork/branch adds on top of
 upstream `blakeblackshear/frigate`. It is maintained by hand — update it whenever
@@ -27,7 +27,9 @@ you change fork-specific behavior.
 ## What the fork does
 
 The fork has **three independent strands**, all documented below. The first two
-have their own client-facing guides; the third has a config reference.
+have their own client-facing guides; the third has a config reference. A fourth,
+smaller change is not a strand: the web UI's restart is confirmed before it
+reloads (see *Confirmed UI restart*).
 
 ### Strand 1 — dual-stream recording with per-variant retention
 
@@ -494,6 +496,80 @@ High rebase-conflict risk: `frigate/record/maintainer.py`,
 
 ---
 
+## Confirmed UI restart
+
+Not a recording strand: a fix to the web UI's **Restart** button. It restarted
+Frigate with a WebSocket message. `web/src/api/ws.tsx` drops a message when the
+socket is not open, and `RestartDialog` counted down 60 s and reloaded either
+way, so a restart that never reached Frigate looked successful. On field devices
+the UI is the only way to restart, because end users have no Docker access.
+Behavior specs: `openspec/specs/web-restart/` and the restart requirement in
+`openspec/specs/web-navigation/`.
+
+- **Endpoint (`frigate/api/app.py`)** — `POST /api/restart` replies first and
+  starts `restart_frigate()` on a daemon `threading.Timer(1.0, …)`. nginx is the
+  first thing s6 stops, and its fast shutdown can cut the connection before the
+  reply has left. The 200 body is unchanged, and 500 now means only that the
+  timer could not be started. An error inside the timer is logged and no longer
+  returned, so the UI finds out through its 60 s check. The handler stays sync:
+  every request first runs the sync `/auth` subrequest, so an async handler
+  would not get past a full thread pool. Still admin-only.
+- **Monitor (`web/src/utils/restart-monitor.ts`, new)** — `runRestart(deps, onPhase)`
+  holds all the logic and no React or axios code (`post`, `probe`, `sleep`, `now`
+  and an `AbortSignal` are passed in). It posts the restart, then probes
+  `GET /api/version` (public, uncached, not logged by nginx) one probe at a time.
+  Two failed probes in a row mean Frigate stopped, and the next 200 means it is
+  back. The constants sit at the top of the module:
+
+  | Constant | Value | Meaning |
+  |---|---|---|
+  | `RESTART_REQUEST_TIMEOUT_MS` | 10 s | wait for the reply to `POST /api/restart` |
+  | `PROBE_INTERVAL_MS` / `PROBE_TIMEOUT_MS` | 1 s / 5 s | pause after a probe / wait for a probe reply |
+  | `STOPPED_AFTER_FAILURES` | 2 | failed probes in a row that count as stopped |
+  | `STOP_DEADLINE_MS` | 60 s | not seen to stop by then: `notRestarted` |
+  | `SLOW_START_MS` | 6 min | down this long: `slowStart` notice, the wait goes on |
+
+  The deadline is 60 s, not the 180 s first suggested: s6 stops nginx before
+  Frigate (`nginx` depends on `frigate`), so the API goes dark within seconds of
+  the SIGTERM, and a wedged `FrigateApp.stop()` only makes the down phase longer.
+  Reading `Date.now()` for every decision keeps a throttled background tab from
+  shifting the timeouts.
+- **Reply handling** — 401 and 403 are `notAllowed`. Any other 4xx, 500 and the
+  remaining 5xx are `failed`. No reply (network error, timeout) and 502, 503 and
+  504 count as "possibly started" and go on to the probes. `notAllowed` and
+  `failed` neither wait nor reload.
+- **Dialog (`web/src/components/overlay/dialog/RestartDialog.tsx`)** — on
+  confirm it runs the monitor with an `AbortController` (aborted on unmount) and
+  shows the phase text and the elapsed time instead of a countdown. "Force
+  Reload Now" is in every phase. `notRestarted`, `notAllowed` and `failed` add
+  Retry (a new `POST /api/restart`) and Close. On `back` it sets
+  `window.location.href = redirectUrl`. The `redirectUrl` prop was already a
+  fork addition, so Save & Restart from the config editor still reloads to
+  `/config`. The `onRestart` prop is gone.
+- **Not changed** — `useRestart` stays in `web/src/api/ws.tsx` with no callers,
+  so this change does not touch that file. `POST /api/config/save?save_option=restart`
+  and the WebSocket and MQTT `restart` topics behave as before.
+- **Dev run** — when s6 is not PID 1, `restart_frigate()` sends SIGINT and nothing
+  starts Frigate again. The dialog then shows the slow-start notice and waits.
+
+### Upstream files touched (confirmed UI restart)
+
+| File | Change | Conflict risk |
+|---|---|---|
+| `web/src/components/overlay/dialog/RestartDialog.tsx` | rewritten | **High** if upstream edits it: redo the wiring by hand. The logic is in `restart-monitor.ts` and is not affected. |
+| `frigate/api/app.py` | `import threading`, one handler body and a helper above it | Low |
+| `web/src/components/menu/GeneralSettings.tsx` | 3 lines removed (`useRestart` import, hook call, `onRestart` prop) | Low |
+| `web/src/pages/ConfigEditor.tsx` | the same 3 lines removed | Low |
+| `web/public/locales/en/components/dialog.json` | new keys inside `restart.restarting`; `content` kept | Low |
+
+New fork-only files, which cannot conflict: `web/src/utils/restart-monitor.ts`,
+`web/src/utils/restart-monitor.test.ts` and `web/__test__/test-setup.ts` (an
+empty file; `web/vite.config.ts` lists it in `test.setupFiles`, but upstream
+deleted it in 2023, so vitest could not start without it). Other locales fall
+back to English for the new strings.
+
+---
+
 ## Frontend changes (`web/`)
 
 - **`src/components/player/RecordingPlaybackPreferenceSelect.tsx`** (new) — the
@@ -511,10 +587,37 @@ High rebase-conflict risk: `frigate/record/maintainer.py`,
   reads them: the timeline uses the ranges endpoints and the motion graph uses
   `/review/activity/motion`, which leaves unknown segments out.
 - **`public/locales/en/components/player.json`** — strings for the variant selector.
+- **`src/utils/restart-monitor.ts`** (new) and **`restart-monitor.test.ts`**
+  (new) — the restart request and the wait for Frigate to stop and come back.
+  See *Confirmed UI restart*.
+- **`src/components/overlay/dialog/RestartDialog.tsx`** — rewritten around the
+  monitor: phase text and elapsed time instead of a countdown, Retry and Close
+  when the restart did not happen. The `onRestart` prop is removed.
+- **`src/components/menu/GeneralSettings.tsx`, `src/pages/ConfigEditor.tsx`** —
+  no longer call `useRestart`; the dialog restarts over HTTP by itself.
+- **`public/locales/en/components/dialog.json`** — new strings under
+  `restart.restarting`.
+- **`__test__/test-setup.ts`** (new, empty) — the setup file that
+  `vite.config.ts` names for vitest.
 
 ---
 
 ## Tests
+
+### Confirmed UI restart
+
+- **`web/src/utils/restart-monitor.test.ts`** (new, vitest) — fake `post`,
+  `probe`, `sleep` and `now`, so no real timers or network. One test per
+  scenario of the `web-restart` spec: down and back, 401/403 and 4xx/500 with no
+  probe, a network error, a timeout and 502/503/504 starting the probes, a
+  single failed probe (and failures that are not in a row) not counting as
+  stopped, a 502 counting as a failed probe, a slow shutdown, no stop within
+  60 s, a stop seen just past the deadline, a slow start after 6 min down, abort.
+  Run it with `npx vitest run` in `web/`.
+- **`frigate/test/http_api/test_http_app.py`** — `POST /restart`: the reply
+  comes before `restart_frigate()` is called and the call follows about 1 s
+  later, a viewer gets 403 and nothing is scheduled, a timer that cannot start
+  gives 500, and an error inside the timer is logged and not raised.
 
 ### Strand 1 — dual-stream
 
@@ -601,7 +704,8 @@ Backend tests do not run natively on Windows (`frigate/log.py` calls
 docker run --rm --workdir=/opt/frigate --entrypoint= -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/opt/frigate" <frigate-image> python3 -u -m unittest
 ```
 
-Current state: **374 tests**, `ruff check` clean, `ruff format` clean apart from
+Current state: **403 tests** (in the minimal test image, 4 of them error on a
+missing go2rtc, see *Housekeeping*), `ruff check` clean, `ruff format` clean apart from
 the unchanged `frigate/config/camera/ffmpeg.py` (see *Housekeeping*). mypy was
 last checked for strand 2, not for strand 3. See *Housekeeping* for the
 environment-only failures to expect.

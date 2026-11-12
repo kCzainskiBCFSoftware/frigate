@@ -16,7 +16,6 @@ import { MdOutlineRestartAlt } from "react-icons/md";
 import RestartDialog from "@/components/overlay/dialog/RestartDialog";
 import { baseUrl } from "@/api/baseUrl";
 import { useTranslation } from "react-i18next";
-import { useRestart } from "@/api/ws";
 import { useResizeObserver } from "@/hooks/resize-observer";
 import { FrigateConfig } from "@/types/frigateConfig";
 
@@ -49,7 +48,6 @@ function ConfigEditor() {
   const schemaConfiguredRef = useRef(false);
 
   const [restartDialogOpen, setRestartDialogOpen] = useState(false);
-  const { send: sendRestart } = useRestart();
   const initialValidationRef = useRef(false);
 
   const onHandleSaveConfig = useCallback(
@@ -323,7 +321,6 @@ function ConfigEditor() {
       <RestartDialog
         isOpen={restartDialogOpen}
         onClose={() => setRestartDialogOpen(false)}
-        onRestart={() => sendRestart("restart")}
         redirectUrl={`${baseUrl}config`}
       />
     </div>
