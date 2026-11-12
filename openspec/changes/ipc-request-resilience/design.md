@@ -109,6 +109,16 @@ process. It is the same action the watchdog already takes for a dead detector.
 - **Restart loop:** if the database stays locked by something outside Frigate, each run
   restarts after about 11 minutes. Each restart is logged with its topic. That is still
   better than one silent permanent stop. No cap is added; the dead-detector rule has none.
+- **Exit deadline (added during implementation):** `restart_frigate()` only starts a
+  graceful stop, and `FrigateApp.stop()` joins main-process threads that may be blocked
+  in an untimed request to the dead or stuck thread: the stats emitter, the tracked
+  object processor (`UPDATE_CAMERA_ACTIVITY`), and with a stuck thread the reader's own
+  join. The watchdog therefore arms a daemon timer when it restarts for the request
+  thread. If the process is still alive `RESTART_EXIT_DEADLINE` (60 s) later, the timer
+  logs an error and calls `os._exit(1)`. 60 s is half of s6's `timeout-kill` (120 s) for
+  the frigate service. The dead-detector restart arms no timer. *Alternative:* bounded
+  joins in `stop()`. Rejected: every blocked thread is non-daemon, so interpreter exit
+  would wait on them anyway, and the stuck reader's join is one more hang.
 
 ### 4. Requestor timeout: opt-in, reconnect inside the requestor
 
@@ -210,6 +220,24 @@ names the variant.
 - [Restart loop while something outside Frigate holds the DB lock] → one restart per
   ~11 min, each logged with its topic. Recording works between restarts, and an
   operator sees the cause.
+- [A watchdog restart hangs in `FrigateApp.stop()`: a main-process thread blocked in an
+  untimed request to the dead or stuck thread is never joined. Seen on 0.17.3 as about
+  2 minutes with no API and no logs after a UI restart, until s6 killed Frigate after its
+  120 s `timeout-kill`] → the exit deadline in Decision 3 ends the process 60 s after a
+  request-thread restart. Recovery takes up to 10 s to detect, up to 60 s to exit, then
+  startup. It reproduced in a dev container with the stats emitter blocked: without the
+  deadline, `stop()` never finished; with it, recording resumed about 83 s after the
+  thread died.
+- [The restart relies on a supervisor bringing Frigate back] → under s6 the whole
+  container stops, and only the container's restart policy (`restart: always` or
+  `unless-stopped`) starts it again. The dead-detector restart has the same dependency.
+  A deployment without a restart policy stays down after any watchdog restart.
+- [The exit deadline skips the rest of `stop()`] → the writer's drain already failed,
+  since its requests go to the same thread. The next start finds no clean-shutdown
+  marker, and reconcile recovers the rows; in the dev container all 12 rows that were
+  queued at the exit were recovered. Shared memory left behind is reused at the next
+  start (`start_detectors` handles `FileExistsError`), and a restarted container
+  started cleanly.
 - [A dropped rejected row leaves a file without a row; `sync_recordings` deletes it after
   the 2 h grace if sync is on] → it is logged with its path. Such a row is a data bug
   that blocked every camera before this change.

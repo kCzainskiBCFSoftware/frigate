@@ -53,6 +53,15 @@ The main process SHALL check the thread that answers inter-process requests ever
 - **WHEN** the inter-process request thread has ended while Frigate is running
 - **THEN** within 20 seconds an error naming that thread is logged and Frigate restarts
 
+### Requirement: A restart for the request thread completes
+
+When Frigate restarts because the inter-process request thread has stopped or is stuck, and it has not exited 60 seconds later, it SHALL exit at once, so that its supervisor or the container's restart policy can start it again.
+
+#### Scenario: Shutdown waits on the dead request thread
+- **WHEN** the request thread has ended while another main-process thread waits for its reply, and Frigate restarts
+- **THEN** Frigate exits within 60 seconds of the restart, with an error saying it did not stop in time
+- **AND** with a container restart policy, Frigate is back and recording within 3 minutes of the thread ending
+
 ### Requirement: A stuck request restarts Frigate
 
 If a single request has been handled for longer than `max(600, 2 × busy timeout)` seconds, Frigate SHALL log an error with the request's topic and how long it has run, then restart. The busy timeout is the main process's database busy timeout: `max(60, 10 × cameras enabled in the config)` seconds. A request handled within that time SHALL NOT cause a restart.

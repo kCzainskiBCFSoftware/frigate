@@ -1,5 +1,6 @@
 import datetime
 import logging
+import os
 import threading
 import time
 from multiprocessing.synchronize import Event as MpEvent
@@ -17,6 +18,21 @@ logger = logging.getLogger(__name__)
 # timeout if that is longer, before Frigate restarts (fork).
 STUCK_REQUEST_FLOOR = 600.0
 
+# After a restart for the request thread, Frigate's stop can wait forever on a
+# thread blocked in an untimed request to it (the stats emitter, the tracked
+# object processor), and the reader's own join waits on a stuck one. If the
+# process is still alive this long after the restart, it exits at once, and
+# s6 or the container's restart policy starts it again. Half of s6's
+# 120 s timeout-kill for the frigate service.
+RESTART_EXIT_DEADLINE = 60.0
+
+# Lets the log listener write the exit error before the process ends.
+EXIT_LOG_GRACE = 1.0
+
+
+def _hard_exit() -> None:
+    os._exit(1)
+
 
 class FrigateWatchdog(threading.Thread):
     def __init__(
@@ -25,6 +41,7 @@ class FrigateWatchdog(threading.Thread):
         stop_event: MpEvent,
         inter_process: Optional["InterProcessCommunicator"] = None,
         busy_timeout: Optional[float] = None,
+        restart_deadline: float = RESTART_EXIT_DEADLINE,
     ):
         super().__init__(name="frigate_watchdog")
         self.detectors = detectors
@@ -33,6 +50,8 @@ class FrigateWatchdog(threading.Thread):
         # recovers it in place, so a dead or stuck one restarts Frigate.
         self.inter_process = inter_process
         self.stuck_after = max(STUCK_REQUEST_FLOOR, 2 * (busy_timeout or 0))
+        self.restart_deadline = restart_deadline
+        self.exit_timer: Optional[threading.Timer] = None
         self.restarting = False
 
     def run(self) -> None:
@@ -110,4 +129,18 @@ class FrigateWatchdog(threading.Thread):
 
     def _restart(self) -> None:
         self.restarting = True
+        # daemon: it never keeps a process that did stop in time alive
+        self.exit_timer = threading.Timer(self.restart_deadline, self._exit_now)
+        self.exit_timer.name = "restart_exit_deadline"
+        self.exit_timer.daemon = True
+        self.exit_timer.start()
         restart_frigate()
+
+    def _exit_now(self) -> None:
+        logger.error(
+            "Frigate has not stopped %.0fs after the restart: a thread is still "
+            "waiting on the inter-process request thread. Exiting now",
+            self.restart_deadline,
+        )
+        time.sleep(EXIT_LOG_GRACE)
+        _hard_exit()

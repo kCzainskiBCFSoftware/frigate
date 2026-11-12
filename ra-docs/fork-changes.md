@@ -536,6 +536,14 @@ which filled the queue and stopped every camera.
   `max(600, 2 × busy_timeout)` (640 s at 32 cameras), logs an error with the
   topic and duration and calls `restart_frigate()` once. Skipped when the app's
   or the communicator's stop event is set.
+- That restart also arms a daemon `threading.Timer`: if the process is still
+  alive `RESTART_EXIT_DEADLINE` (60 s) later, it logs an error and calls
+  `os._exit(1)`. Without it, `FrigateApp.stop()` waited forever on
+  `stats_emitter.join()` or `detected_frames_processor.join()`, threads blocked
+  in an untimed request to the dead thread, until s6's 120 s `timeout-kill`.
+  That is the 2-minute gap with no API and no logs seen after a UI restart on
+  0.17.3. The dead-detector restart arms no timer. Either restart needs the
+  container's restart policy to bring Frigate back.
 - `FrigateApp.start_watchdog()` passes the communicator and the busy timeout.
 
 ### Shared busy timeout (`frigate/db/maintenance.py`)
@@ -586,7 +594,10 @@ files in a dev container (details in the change's `tasks.md`, 9.3): a 2-minute
 `BEGIN IMMEDIATE` lock lost no row and kept segments moving; a `RAISE(ABORT)`
 trigger on one camera dropped exactly its rows, one error each, while the other
 camera's rows kept landing; 25 requests whose handler raises were all answered,
-with one traceback logged.
+with one traceback logged. With the request thread killed while the stats
+emitter was blocked on it, `stop()` hung for good without the exit deadline.
+With it, recording resumed 83 s after the thread died, and reconcile recovered
+the 12 queued rows.
 
 ### Open items
 - Other handlers' own bugs (e.g. `Event.get` for an event deleted before its
@@ -594,9 +605,10 @@ with one traceback logged.
   a bug to fix on its own.
 - The watchdog's restarts and the per-topic failure counts are not exposed in
   `/api/stats`, so fleet monitoring cannot alert on them yet.
-- A restart for a *stuck* request thread waits in `FrigateApp.stop()` on the
-  reader thread's join until s6 kills the service (`timeout-kill`, 120 s), which
-  adds up to two minutes to the recording gap.
+- Other restarts, from the UI, the API or a dead detector, can still hang in
+  `FrigateApp.stop()` while the request thread is dead or stuck, until s6's
+  120 s `timeout-kill`. The exit deadline is armed only by the request-thread
+  watchdog.
 - 9.4 (device-only): after a week on the new image, confirm no request-thread
   restart, and record the old id exposure measured with
   `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);`
@@ -714,7 +726,9 @@ with one traceback logged.
   its timeout and its next request is answered on a new connection.
 - **`frigate/test/test_watchdog.py`** (new) — dead reader → one restart, a 641 s
   request at busy timeout 320 → restart naming the topic, 300 s and the 600 s
-  floor → none, no restart while stopping, the upstream signature.
+  floor → none, no restart while stopping, the upstream signature, and the exit
+  deadline (fires after a request-thread restart, is a daemon timer, and is not
+  armed by a dead-detector restart; `_hard_exit` is always patched).
 - **`frigate/test/test_record_writer.py`** — rejected vs locked outcomes with a
   real database (a `RAISE(ABORT)` trigger, a held `BEGIN IMMEDIATE`), one bad
   row in 500 (499 written, one error, < 25 sends), two bad rows far apart, locked

@@ -9,6 +9,15 @@ from unittest.mock import MagicMock, patch
 from frigate.watchdog import FrigateWatchdog
 
 
+def wait_until(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
 def communicator(alive: bool = True, busy_for: float | None = None, topic="t"):
     reader = MagicMock()
     reader.is_alive.return_value = alive
@@ -32,15 +41,29 @@ class TestRequestThreadWatchdog(unittest.TestCase):
         patcher = patch("frigate.watchdog.restart_frigate")
         self.restart = patcher.start()
         self.addCleanup(patcher.stop)
+        # never the real os._exit: it would end the test run
+        exit_patcher = patch("frigate.watchdog._hard_exit")
+        self.hard_exit = exit_patcher.start()
+        self.addCleanup(exit_patcher.stop)
+        grace_patcher = patch("frigate.watchdog.EXIT_LOG_GRACE", 0)
+        grace_patcher.start()
+        self.addCleanup(grace_patcher.stop)
         self.stop_event = threading.Event()
 
-    def watchdog(self, inter_process, busy_timeout=320, detectors=None):
-        return FrigateWatchdog(
+    def watchdog(self, inter_process, busy_timeout=320, detectors=None, **kwargs):
+        watchdog = FrigateWatchdog(
             detectors or {},
             self.stop_event,
             inter_process=inter_process,
             busy_timeout=busy_timeout,
+            **kwargs,
         )
+        # an armed exit deadline must not outlive the test (cleanups run in
+        # reverse, so this runs while _hard_exit is still patched)
+        self.addCleanup(
+            lambda: watchdog.exit_timer is not None and watchdog.exit_timer.cancel()
+        )
+        return watchdog
 
     def test_dead_request_thread_restarts_once(self):
         watchdog = self.watchdog(communicator(alive=False))
@@ -83,6 +106,34 @@ class TestRequestThreadWatchdog(unittest.TestCase):
         self.watchdog(stopping).check()
 
         self.restart.assert_not_called()
+
+    def test_restart_exits_if_frigate_has_not_stopped_by_the_deadline(self):
+        # e.g. the stats emitter blocked in a request to the dead thread keeps
+        # FrigateApp.stop() from finishing
+        watchdog = self.watchdog(communicator(alive=False), restart_deadline=0.05)
+
+        with self.assertLogs("frigate.watchdog", "ERROR") as logs:
+            watchdog.check()
+            assert wait_until(lambda: self.hard_exit.called, 2)
+
+        assert self.restart.call_count == 1
+        assert self.hard_exit.call_count == 1
+        assert "has not stopped" in logs.output[-1], logs.output
+        # a process that does stop in time is not kept alive by the deadline
+        assert watchdog.exit_timer.daemon
+
+    def test_deadline_is_armed_only_by_a_request_thread_restart(self):
+        watchdog = self.watchdog(
+            communicator(busy_for=300), detectors={"cpu": detector(alive=False)}
+        )
+        watchdog.restart_deadline = 0.01
+        watchdog.check()
+        time.sleep(0.2)
+
+        # the upstream dead-detector restart is unchanged
+        assert self.restart.call_count == 1
+        assert watchdog.exit_timer is None
+        self.hard_exit.assert_not_called()
 
     def test_without_inter_process_only_detectors_are_checked(self):
         # the upstream signature still works

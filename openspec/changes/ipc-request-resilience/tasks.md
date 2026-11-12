@@ -41,6 +41,7 @@ check that before ticking the task.
   - `busy` 300 s old → no restart;
   - stop event set with a dead reader → no restart;
   - no `inter_process` passed → the existing detector checks only.
+- [x] 5.3 Arm an exit deadline when the watchdog restarts for the request thread (added during implementation, see design Decision 3 and Risks). `FrigateApp.stop()` can wait forever on a main-process thread blocked in an untimed request to that thread, such as the stats emitter or the tracked object processor. A daemon timer logs an error and calls `os._exit(1)` if the process is still alive `RESTART_EXIT_DEADLINE` (60 s) later. The dead-detector restart arms nothing. Verify in `test_watchdog.py` with `_hard_exit` patched: a request-thread restart exits after a short deadline and logs, the timer is a daemon, and a dead-detector restart arms no timer.
 
 ## 6. Rejected rows cannot stall the writer (`frigate/record/writer.py`)
 
@@ -73,7 +74,8 @@ check that before ticking the task.
 - [x] 9.3 Fault injection in a dev container with at least two cameras recording:
   - hold `BEGIN IMMEDIATE` on `frigate.db` for 2 min: segments keep moving, the writer warns, then recovers, and no row is lost;
   - add the `RAISE(ABORT)` trigger for one camera's paths: the other cameras' rows keep landing, one error per rejected row, and the mover never holds;
-  - patch a handler to raise: the request thread survives, and the error is logged once per 5 min.
+  - patch a handler to raise: the request thread survives, and the error is logged once per 5 min;
+  - kill the request thread in a running container with a restart policy: the watchdog logs, Frigate restarts, and the container is back and recording within 3 minutes.
 
   Run on 2026-11-12 with this worktree's Frigate in the `frigate-test-deps` image plus Debian
   ffmpeg 7.1: two cameras, each recording `main` and `sub` from looped test files. No detector
@@ -85,6 +87,15 @@ check that before ticking the task.
   no "queue is full" error, and cam1 rows landing again once dropped. 25 requests whose real
   handler raises (`update_event_description` for a missing event) all got `[]`, one traceback
   was logged, and the region-grid request after them was answered.
+
+  Killed request thread, run the same day in the same container with `--restart always`.
+  A harness-only topic held the thread busy for 20 s and then raised `SystemExit`, so the
+  stats emitter (`stats_interval: 15`) was blocked on it, as on a busy device. Without
+  5.3, `stop()` never returned from `stats_emitter.join()`: no restart and no new segment
+  in 150 s (s6 would have killed it at 120 s). With 5.3, the thread died at 10:06:28, the
+  watchdog logged at 10:06:38, the deadline exited at 10:07:38, the container restarted,
+  and the first new segment landed at 10:07:51, 83 s after the thread died. Reconcile
+  recovered the 12 rows the writer could not drain, and rows equal files afterwards.
 - [ ] 9.4 On a field device (device-only, may stay open at archive with the user's OK): after a week on the new image, confirm there is no `restart` from the request-thread watchdog. Measure the old id exposure with `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);` divided by retained days and by 36^6, and record it in `ra-docs/fork-changes.md`.
 
 ## Workflow follow-up
