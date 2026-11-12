@@ -6,7 +6,27 @@
     "restarting": {
       "title": "Frigate is Restarting",
       "content": "This page will reload in {{countdown}} seconds.",
-      "button": "Force Reload Now"
+      "button": "Force Reload Now",
+      "requesting": "Sending the restart request…",
+      "waitingForStop": "Waiting for Frigate to stop…",
+      "waitingForStart": "Frigate has stopped. Waiting for it to start…",
+      "slowStart": "Frigate is taking longer than expected to start. Still waiting…",
+      "back": "Frigate is back. Reloading…",
+      "elapsed": "Elapsed time: {{time}}",
+      "retry": "Retry",
+      "close": "Close",
+      "notRestarted": {
+        "title": "Frigate Did Not Restart",
+        "content": "Frigate kept running after the restart request. You can try again."
+      },
+      "notAllowed": {
+        "title": "Restart Not Allowed",
+        "content": "You are not allowed to restart Frigate. Ask an admin to restart it."
+      },
+      "failed": {
+        "title": "Frigate Could Not Restart",
+        "content": "Frigate answered the restart request with an error. You can try again."
+      }
     }
   },
   "explore": {
