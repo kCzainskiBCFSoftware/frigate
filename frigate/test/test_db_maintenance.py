@@ -14,11 +14,13 @@ import unittest
 from peewee import sqlite3
 from playhouse.sqlite_ext import SqliteExtDatabase
 
+from frigate.config import FrigateConfig
 from frigate.config.database import DatabaseConfig
 from frigate.db.maintenance import (
     MB,
     CleanupRunSummary,
     bounded_truncate_checkpoint,
+    busy_timeout,
     maintain_wal,
     passive_checkpoint,
     size_pragmas,
@@ -217,6 +219,35 @@ class TestCleanupRunSummary(unittest.TestCase):
             assert f"{name} " in line, line
         assert "MB before" in line and "MB after" in line, line
         assert "passive (busy=" in line, line
+
+
+def cameras_config(enabled: int, disabled: int = 0) -> FrigateConfig:
+    def camera(n: int, on: bool) -> dict:
+        return {
+            "enabled": on,
+            "ffmpeg": {
+                "inputs": [
+                    {"path": f"rtsp://10.0.0.{n}:554/video", "roles": ["detect"]}
+                ]
+            },
+            "detect": {"height": 1080, "width": 1920, "fps": 5},
+        }
+
+    cameras = {f"cam{n}": camera(n, True) for n in range(enabled)}
+    cameras.update({f"off{n}": camera(100 + n, False) for n in range(disabled)})
+    return FrigateConfig(**{"mqtt": {"host": "mqtt"}, "cameras": cameras})
+
+
+class TestBusyTimeout(unittest.TestCase):
+    def test_floor_of_60_seconds(self):
+        assert busy_timeout(cameras_config(3)) == 60
+
+    def test_ten_seconds_per_enabled_camera(self):
+        # the 32-camera target: the watchdog restarts at 2 x 320 s
+        assert busy_timeout(cameras_config(32)) == 320
+
+    def test_disabled_cameras_do_not_count(self):
+        assert busy_timeout(cameras_config(7, disabled=1)) == 70
 
 
 if __name__ == "__main__":

@@ -125,7 +125,7 @@ dimension and use the helpers in `record/variants.py` rather than filtering on t
 has one spec per capability: `recording-variants`, `variant-retention`, `variant-media-api`,
 `playback-timeline-api`, `playback-serving`, `fork-capabilities`, `web-navigation`,
 `playback-variant-preference`, `recording-segment-mover`, `recording-db-writes`,
-`recorder-watchdog` and `database-maintenance`. The changes that produced them are archived
+`recorder-watchdog`, `database-maintenance` and `inter-process-requests`. The changes that produced them are archived
 under `openspec/changes/archive/`. Fork-wide constraints and artifact rules are in `openspec/config.yaml`.
 
 Make fork behavior changes as OpenSpec changes: `/opsx:propose` → `/opsx:apply` → `/opsx:archive`.

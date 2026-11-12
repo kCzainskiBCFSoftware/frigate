@@ -794,6 +794,50 @@ class TestWriterHandOff(MoverTestBase):
         # the rows it held were handed over, so the stop counts as clean
         assert writer.stop(1)
 
+    async def test_blocking_request_without_reply_is_logged(self):
+        maintainer = self.make_maintainer()
+        # the timed request got no reply from the main process
+        maintainer.requestor = MagicMock()
+        maintainer.requestor.send_data.return_value = ""
+
+        def gone():
+            raise SystemExit
+
+        writer = RecordingsWriter(
+            maintainer.config, requestor_factory=gone, publisher_factory=MagicMock
+        )
+        writer.start()
+        writer.join(5)
+        maintainer.writer = writer
+        maintainer.writer_down_logged = True
+
+        for i in range(2):
+            self.add_segment(age=130 - i * 10)
+
+        with self.assertLogs("frigate.record.maintainer", "ERROR") as logs:
+            await maintainer.move_files()
+
+        line = logs.output[-1]
+        assert "Failed to write 2 recording rows" in line, logs.output
+        assert "no reply" in line, line
+        # the batch's first and last path: the files stay in recordings
+        moved = self.recorded_files()
+        assert len(moved) == 2
+        assert all(path in line for path in moved), line
+
+        # the next pass is not held up
+        maintainer.requestor.send_data.return_value = {"ok": True}
+        self.add_segment(age=100)
+        await maintainer.move_files()
+        assert len(self.recorded_files()) == 3
+
+    async def test_blocking_request_is_timed(self):
+        with patch("frigate.record.maintainer.InterProcessRequestor") as requestor:
+            self.make_maintainer()
+
+        # one enabled camera: the busy timeout of 60 s plus 30 s
+        requestor.assert_called_once_with(timeout=90)
+
     async def test_blocking_mode_keeps_the_upstream_request(self):
         maintainer = self.make_maintainer(async_db_writes=False)
         maintainer.requestor = MagicMock()

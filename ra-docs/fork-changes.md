@@ -494,6 +494,116 @@ High rebase-conflict risk: `frigate/record/maintainer.py`,
 
 ---
 
+## Inter-process request resilience
+
+OpenSpec change `ipc-request-resilience` (capability `inter-process-requests`,
+and changes to `recording-db-writes`). No API, config or schema change.
+
+**Incident it explains.** A v0.17.3 device logged one
+`peewee.IntegrityError: UNIQUE constraint failed: recordings.id` from the main
+process's `Thread-7 (read)`, then stopped recording with no further log line.
+Two segment rows that opened in the same second drew the same 6-character id
+suffix (with 64 streams, many rows share each start second). The exception
+ended `InterProcessCommunicator.read()`, the one thread that answers every
+inter-process request in Frigate, and `InterProcessRequestor.send_data` has no
+timeout, so the recording process and every later requester waited forever.
+v0.17.4 stopped that traceback (`ON CONFLICT DO NOTHING`, the background
+writer), but any other handler could still end the thread, the writer's
+"no reply → reconnect" could not fire without a timeout, a collision silently
+dropped the second row, and a row the database refused was retried forever,
+which filled the queue and stopped every camera.
+
+### Request thread (`frigate/comms/inter_process.py`)
+- `read()` serves each request through `_serve_one()`: a handler exception, a
+  request that is not a `(topic, payload)` pair, or one that cannot be decoded is
+  answered with `[]`; a reply that cannot be encoded (e.g. a `set`) falls back
+  to `send_json([])`. An outer catch-all logs and continues; only a ZMQ error
+  breaks the inner drain loop, as upstream. The thread is named
+  `inter_process_requests`.
+- `_log_failure()` logs one traceback per topic per `ERROR_LOG_INTERVAL` (5 min);
+  the next one reports how many failures were not logged.
+- `busy` holds `(topic, monotonic start)` while a request is handled and `None`
+  otherwise, assigned as one tuple so the watchdog reads it without a lock.
+- `InterProcessRequestor(timeout=None)`: with a timeout, `RCVTIMEO`/`SNDTIMEO`
+  are set; on `zmq.Again` the REQ socket is closed with `linger=0`, a new one is
+  connected, a warning names the topic, and `""` is returned. Without a timeout
+  nothing changes. `stop()` closes a timed socket with `linger=0`.
+
+### Watchdog (`frigate/watchdog.py`, `frigate/app.py`)
+- `FrigateWatchdog(..., inter_process=None, busy_timeout=None)`; the loop body
+  moved into `check()`, and `check_request_thread()` runs after the detector
+  checks. A dead reader thread, or `busy` older than
+  `max(600, 2 × busy_timeout)` (640 s at 32 cameras), logs an error with the
+  topic and duration and calls `restart_frigate()` once. Skipped when the app's
+  or the communicator's stop event is set.
+- `FrigateApp.start_watchdog()` passes the communicator and the busy timeout.
+
+### Shared busy timeout (`frigate/db/maintenance.py`)
+- `busy_timeout(config)` = `max(60, 10 × cameras enabled in config)`, used by
+  `FrigateApp.bind_database`, the watchdog, and the row-request timeout. The
+  recording process's own connection keeps its inline formula.
+
+### Row writes (`frigate/record/writer.py`, `frigate/record/maintainer.py`)
+- `insert_recording_rows` adds `rejected` to a failed outcome:
+  `True` for `peewee.IntegrityError`/`DataError` (NOT NULL, CHECK, a trigger's
+  `RAISE(ABORT)`, datatype), `False` for everything else (locked, busy, I/O,
+  timeout, corruption).
+- `RecordingsWriter` isolates rejected rows: a rejected batch of n > 1 rows
+  becomes the `suspect` range and the next send takes its first half, with no
+  backoff; while the range is open, each success halves the rest (a binary
+  search), and a rejected single row is popped and logged at error level with
+  its path, camera, variant and error. The batch limit then doubles back from 1
+  toward `BATCH_ROWS`. One bad row in 500 costs at most 20 sends. A rejection
+  neither starts nor advances `failing_since`. Other failures keep the
+  whole-batch retry with backoff.
+- Segment-row requests time out after `row_request_timeout(config)` =
+  busy timeout + `REPLY_MARGIN` (30 s): the writer's default requestor factory
+  (`timed_requestor_factory`) and the mover's `self.requestor`. The mover's
+  blocking request now logs an error with the batch size and its first and last
+  path on no reply, as well as on `ok: false`; it does not retry that batch.
+
+### Row ids (`frigate/record/util.py`)
+- `recording_row` uses a 12-character random suffix (upstream: 6); the longest
+  id is 25 characters. Collision odds with 64 rows in one second: ~4e-16 per
+  second. Existing ids are unchanged.
+
+### Region grid (`frigate/video.py`)
+- `process_frames` replaces `region_grid` only when the reply is a non-empty
+  list, and logs a warning otherwise. A failed request's `[]`, or the `""` of a
+  ZMQ error (an upstream bug too), used to be indexed as a grid.
+
+### Upstream files touched
+Low conflict risk: `frigate/comms/inter_process.py` and `frigate/watchdog.py`
+(small files upstream rarely changes; `watchdog.py`'s loop body moved into
+`check()`), `frigate/app.py` (`bind_database` timeout and `start_watchdog`),
+`frigate/video.py` (the region-grid refresh, a few lines). Fork files:
+`frigate/db/maintenance.py`, `frigate/record/writer.py`,
+`frigate/record/maintainer.py`, `frigate/record/util.py`.
+
+### Verification
+Fault injection on 2026-11-12, with two dual-stream cameras recording looped test
+files in a dev container (details in the change's `tasks.md`, 9.3): a 2-minute
+`BEGIN IMMEDIATE` lock lost no row and kept segments moving; a `RAISE(ABORT)`
+trigger on one camera dropped exactly its rows, one error each, while the other
+camera's rows kept landing; 25 requests whose handler raises were all answered,
+with one traceback logged.
+
+### Open items
+- Other handlers' own bugs (e.g. `Event.get` for an event deleted before its
+  description arrived) are now logged per topic instead of fatal; each is still
+  a bug to fix on its own.
+- The watchdog's restarts and the per-topic failure counts are not exposed in
+  `/api/stats`, so fleet monitoring cannot alert on them yet.
+- A restart for a *stuck* request thread waits in `FrigateApp.stop()` on the
+  reader thread's join until s6 kills the service (`timeout-kill`, 120 s), which
+  adds up to two minutes to the recording gap.
+- 9.4 (device-only): after a week on the new image, confirm no request-thread
+  restart, and record the old id exposure measured with
+  `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);`
+  divided by retained days and by 36^6.
+
+---
+
 ## Frontend changes (`web/`)
 
 - **`src/components/player/RecordingPlaybackPreferenceSelect.tsx`** (new) — the
@@ -594,6 +704,33 @@ High rebase-conflict risk: `frigate/record/maintainer.py`,
   30 minutes late, the API with `NULL` stats, the fork feature block, and the
   new settings.
 
+### Inter-process request resilience
+
+- **`frigate/test/test_inter_process.py`** (new) — over a real REP/REQ pair on a
+  temp `ipc://` endpoint: a raising handler gets `[]` and the next request on
+  another requestor is answered; an unencodable reply gets `[]`; 50 failures of
+  one topic log one traceback and the next window reports 49; `busy` during and
+  after a slow handler; malformed requests; a timed requestor returns `""` within
+  its timeout and its next request is answered on a new connection.
+- **`frigate/test/test_watchdog.py`** (new) — dead reader → one restart, a 641 s
+  request at busy timeout 320 → restart naming the topic, 300 s and the 600 s
+  floor → none, no restart while stopping, the upstream signature.
+- **`frigate/test/test_record_writer.py`** — rejected vs locked outcomes with a
+  real database (a `RAISE(ABORT)` trigger, a held `BEGIN IMMEDIATE`), one bad
+  row in 500 (499 written, one error, < 25 sends), two bad rows far apart, locked
+  batches never split, `has_room()` while isolating, the requestor timeout, an
+  integration test where the main process answers past the writer's timeout
+  (batch stored once, queue drained), and 64 distinct 12-character ids.
+- **`frigate/test/test_maintainer.py`** — the mover's timed requestor, and its
+  blocking request logging a missing reply with the batch size and paths.
+- **`frigate/test/test_video.py`** — an empty or missing region-grid reply keeps
+  the grid `process_frames` started with.
+- **`frigate/test/test_db_maintenance.py`** — `busy_timeout()` for 3, 32 and
+  7 + 1 disabled cameras.
+
+Every new test was checked to fail with its fix removed (mutations applied in
+the container copy only).
+
 Backend tests do not run natively on Windows (`frigate/log.py` calls
 `os.register_at_fork` at import). Run them in the image:
 
@@ -631,11 +768,14 @@ environment-only failures to expect.
     variant motion cutoff (`min(...)`), so on a dual-stream camera whose `sub`
     keeps footage longer, `main` segments overlapping alerts or detections
     between the two windows are expired. It likely wants `max(...)`.
-  - The `INSERT_PREVIEW`, `UPSERT_REVIEW_SEGMENT` and other inter-process
+  - ~~The `INSERT_PREVIEW`, `UPSERT_REVIEW_SEGMENT` and other inter-process
     handlers can still raise into `InterProcessCommunicator.read()` and end the
-    REP thread; only `INSERT_MANY_RECORDINGS` is hardened.
+    REP thread; only `INSERT_MANY_RECORDINGS` is hardened.~~ Fixed by
+    `ipc-request-resilience`: every handler is guarded at the transport.
   - The main REP thread still waits on the database while it is locked, so other
-    inter-process clients stall as upstream (design open question 6).
+    inter-process clients stall as upstream (design open question 6). Since
+    `ipc-request-resilience`, a request stuck past `max(600, 2 × busy timeout)`
+    restarts Frigate.
 - Test-environment notes: `ruff format --check` with a current ruff (0.17)
   flags `frigate/config/camera/ffmpeg.py`, which this fork has not changed.
   **Fixed a flaky test harness:** `BaseTestHttp.tearDown` deleted `test.db`
