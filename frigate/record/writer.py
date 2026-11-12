@@ -9,10 +9,17 @@ thread in the recording process and starts its next pass straight away.
   database error comes back as ``{"ok": false}`` instead of ending the
   inter-process request thread that every Frigate process depends on. Inserts
   ignore rows already stored, so a retried batch is harmless.
-- The writer retries failed batches with backoff and never drops a row. When
-  its queue is full, the mover holds segments in the cache (``has_room``)
-  instead of moving more; it never blocks on the writer, so it keeps applying
-  the cache limits and stops promptly.
+- The writer retries failed batches with backoff. When its queue is full, the
+  mover holds segments in the cache (``has_room``) instead of moving more; it
+  never blocks on the writer, so it keeps applying the cache limits and stops
+  promptly.
+- A batch whose values the database rejects (a constraint, a trigger, a
+  datatype) would fail the same way forever and stop every camera, so it is
+  split until each rejected row is alone; that row is logged and dropped, and
+  its file stays in recordings. Every other failure is retried whole.
+- Its requests time out after the main process's busy timeout plus a margin
+  and are retried on a new connection, so a main process that stops answering
+  does not hang the writer.
 - ``recordings/saved`` is published from here, after the rows are written, so
   it never advertises footage that has no row yet.
 - On a clean stop the writer drains its queue, and the recording process then
@@ -28,6 +35,8 @@ import time
 from collections import deque
 from typing import Any, Callable, Optional
 
+from peewee import DataError, IntegrityError
+
 from frigate.comms.inter_process import InterProcessRequestor
 from frigate.comms.recordings_updater import (
     RecordingsDataPublisher,
@@ -35,6 +44,7 @@ from frigate.comms.recordings_updater import (
 )
 from frigate.config import FrigateConfig
 from frigate.const import INSERT_MANY_RECORDINGS
+from frigate.db.maintenance import busy_timeout
 from frigate.models import Recordings
 from frigate.record.ranges import note_late_rows
 
@@ -52,6 +62,26 @@ FAILING_ERROR_AFTER = 60.0
 
 CLEAN_SHUTDOWN_MARKER = ".recordings_clean_shutdown"
 
+# A segment-row request waits this long past the main process's database busy
+# timeout for its reply, then reconnects; the insert itself may legitimately
+# wait the whole busy timeout.
+REPLY_MARGIN = 30.0
+
+# _send outcomes
+SENT = "sent"
+REJECTED = "rejected"
+FAILED = "failed"
+
+
+def row_request_timeout(config: FrigateConfig) -> float:
+    """Seconds a segment-row request waits for the main process's reply."""
+    return busy_timeout(config) + REPLY_MARGIN
+
+
+def timed_requestor_factory(config: FrigateConfig) -> Callable[[], Any]:
+    timeout = row_request_timeout(config)
+    return lambda: InterProcessRequestor(timeout=timeout)
+
 
 def insert_recording_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Store a batch of segment rows. Runs on the main inter-process thread.
@@ -66,7 +96,14 @@ def insert_recording_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         Recordings.insert_many(rows).on_conflict(action="nothing").execute()
     except Exception as e:
         logger.debug("Inserting %d recording rows failed: %s", len(rows), e)
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "error": str(e),
+            # the rows' values were refused: the same rows fail again however
+            # often they are retried. Locked, busy, I/O, timeout and
+            # corruption errors are not row-specific, and are not rejections.
+            "rejected": isinstance(e, (IntegrityError, DataError)),
+        }
 
     try:
         note_late_rows(rows)
@@ -106,14 +143,16 @@ class RecordingsWriter(threading.Thread):
     def __init__(
         self,
         config: FrigateConfig,
-        requestor_factory: Callable[[], Any] = InterProcessRequestor,
+        requestor_factory: Optional[Callable[[], Any]] = None,
         publisher_factory: Callable[[], Any] = RecordingsDataPublisher,
     ) -> None:
         # daemon: a send stuck on a locked database must not keep the
         # process alive past its flush timeout
         super().__init__(name="recordings_writer", daemon=True)
         self.capacity = config.record.pipeline.db_write_queue
-        self.requestor_factory = requestor_factory
+        # timed by default: a main process that stops answering must not hang
+        # the writer; the retry then goes over a new connection
+        self.requestor_factory = requestor_factory or timed_requestor_factory(config)
         self.publisher_factory = publisher_factory
 
         self.rows: deque[dict[str, Any]] = deque()
@@ -124,8 +163,16 @@ class RecordingsWriter(threading.Thread):
 
         self.full_logged = False
         self.reply_missing = False
+        self.rejected_error: Optional[str] = None
         self.failing_since: Optional[float] = None
         self.failing_error_logged = False
+
+        # rows per send: halved while a rejected row is isolated, then doubled
+        # back toward BATCH_ROWS by each send that succeeds
+        self.batch_limit = BATCH_ROWS
+        # how many rows at the front of the queue are known to hold a rejected
+        # row; 0 when none are
+        self.suspect = 0
 
     def queue_depth(self) -> int:
         with self.cond:
@@ -225,9 +272,16 @@ class RecordingsWriter(threading.Thread):
                     if self.stopping and not self.rows:
                         break
 
-                    batch = list(itertools.islice(self.rows, BATCH_ROWS))
+                    batch = list(itertools.islice(self.rows, self.batch_limit))
 
-                if batch and not self._send(requestor, batch):
+                outcome = self._send(requestor, batch) if batch else SENT
+
+                if outcome == REJECTED:
+                    # the database is answering, so no backoff
+                    self._isolate(batch)
+                    continue
+
+                if outcome == FAILED:
                     if self.reply_missing:
                         requestor = self._replace_requestor(requestor)
 
@@ -241,14 +295,8 @@ class RecordingsWriter(threading.Thread):
 
                 retry_delay = RETRY_INITIAL
 
-                with self.cond:
-                    for _ in batch:
-                        self.rows.popleft()
-
-                    if not self.rows:
-                        self.full_logged = False
-
-                    self.cond.notify_all()
+                if batch:
+                    self._written(len(batch))
 
                 try:
                     self._publish_saved(publisher)
@@ -258,6 +306,51 @@ class RecordingsWriter(threading.Thread):
         finally:
             requestor.stop()
             publisher.stop()
+
+    def _pop(self, count: int) -> None:
+        with self.cond:
+            for _ in range(count):
+                self.rows.popleft()
+
+            if not self.rows:
+                self.full_logged = False
+
+            self.cond.notify_all()
+
+    def _written(self, count: int) -> None:
+        self._pop(count)
+
+        if self.suspect:
+            # the rejected row is in the rest of the suspect rows: halve those
+            self.suspect -= count
+            self.batch_limit = max(1, self.suspect // 2)
+        else:
+            self.batch_limit = min(self.batch_limit * 2, BATCH_ROWS)
+
+    def _isolate(self, batch: list[dict[str, Any]]) -> None:
+        """Narrow a rejected batch down to its rejected rows, and drop those.
+
+        Each split sends the first half of the rows known to hold a rejected
+        row, so one bad row in a full batch costs about 2 x log2(BATCH_ROWS)
+        sends, and a run of bad rows about one send each.
+        """
+        if len(batch) > 1:
+            self.suspect = len(batch)
+            self.batch_limit = len(batch) // 2
+            return
+
+        row = batch[0]
+        self._pop(1)
+        self.suspect = 0
+        self.batch_limit = 1
+        logger.error(
+            "The database rejected the recording row for %s (camera %s, variant "
+            "%s): %s. The row is dropped; the segment file stays in recordings",
+            row.get(Recordings.path.name),
+            row.get(Recordings.camera.name),
+            row.get(Recordings.variant.name),
+            self.rejected_error,
+        )
 
     def _replace_requestor(self, requestor: Any) -> Any:
         """A new connection to the main process, after a send got no reply.
@@ -278,7 +371,8 @@ class RecordingsWriter(threading.Thread):
             logger.exception("Could not reconnect the recording row writer")
             return requestor
 
-    def _send(self, requestor: Any, batch: list[dict[str, Any]]) -> bool:
+    def _send(self, requestor: Any, batch: list[dict[str, Any]]) -> str:
+        """SENT, REJECTED (the database refused the rows' values) or FAILED."""
         self.reply_missing = False
 
         try:
@@ -305,9 +399,15 @@ class RecordingsWriter(threading.Thread):
                 self.failing_since = None
                 self.failing_error_logged = False
 
-            return True
+            return SENT
 
         error = result.get("error") if isinstance(result, dict) else "no reply"
+
+        # not an outage: the database answered and refused these values, so
+        # failing_since is neither started nor advanced
+        if isinstance(result, dict) and result.get("rejected"):
+            self.rejected_error = error
+            return REJECTED
 
         if self.failing_since is None:
             self.failing_since = time.monotonic()
@@ -330,7 +430,7 @@ class RecordingsWriter(threading.Thread):
                 self.queue_depth(),
             )
 
-        return False
+        return FAILED
 
     def _publish_saved(self, publisher: Any) -> None:
         with self.cond:

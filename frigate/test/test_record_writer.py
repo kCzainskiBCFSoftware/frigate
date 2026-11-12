@@ -2,6 +2,7 @@
 
 import importlib
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -20,6 +21,7 @@ from frigate.const import INSERT_MANY_RECORDINGS
 from frigate.models import RecordingRangeCoverage, RecordingRanges, Recordings
 from frigate.record import writer as writer_module
 from frigate.record.ranges import reset_late_rows
+from frigate.record.util import recording_row
 from frigate.record.writer import (
     RecordingsWriter,
     insert_recording_rows,
@@ -73,13 +75,19 @@ class FakeRequestor:
         self.open.set()
         self.fail_times = 0
         self.raise_times = 0
+        # paths whose rows the database refuses, e.g. a CHECK constraint
+        self.rejected: set[str] = set()
+        self.delay = 0.0
         self.batches: list[list[dict]] = []
+        self.sizes: list[int] = []
         self.calls = 0
 
     def send_data(self, topic, data):
         assert topic == INSERT_MANY_RECORDINGS
         self.calls += 1
+        self.sizes.append(len(data))
         self.open.wait()
+        time.sleep(self.delay)
 
         if self.raise_times > 0:
             self.raise_times -= 1
@@ -87,7 +95,14 @@ class FakeRequestor:
 
         if self.fail_times > 0:
             self.fail_times -= 1
-            return {"ok": False, "error": "database is locked"}
+            return {"ok": False, "error": "database is locked", "rejected": False}
+
+        if any(r["path"] in self.rejected for r in data):
+            return {
+                "ok": False,
+                "error": "CHECK constraint failed: recordings",
+                "rejected": True,
+            }
 
         self.batches.append(list(data))
         return {"ok": True, "count": len(data)}
@@ -333,6 +348,131 @@ class TestRecordingsWriter(unittest.TestCase):
         self.requestor.fail_times = 0
         writer.join(5)
 
+    def test_requests_time_out_after_the_busy_timeout_plus_30s(self):
+        with patch.object(writer_module, "InterProcessRequestor") as requestor_class:
+            writer = RecordingsWriter(config(), publisher_factory=FakePublisher)
+            writer.requestor_factory()
+
+        # one enabled camera: a busy timeout of 60 s
+        requestor_class.assert_called_once_with(timeout=90)
+
+
+class TestRejectedRows(unittest.TestCase):
+    """A row the database refuses is isolated and dropped, not retried forever."""
+
+    def make_writer(self, **pipeline) -> RecordingsWriter:
+        self.requestor = FakeRequestor()
+        writer = RecordingsWriter(
+            config(**pipeline),
+            requestor_factory=lambda: self.requestor,
+            publisher_factory=FakePublisher,
+        )
+        writer.start()
+        self.addCleanup(writer.stop, 1)
+        return writer
+
+    def test_one_bad_row_in_a_full_batch(self):
+        writer = self.make_writer()
+        rows = [row(n) for n in range(500)]
+        bad = rows[333]["path"]
+        self.requestor.rejected = {bad}
+
+        with self.assertLogs("frigate.record.writer", "INFO") as logs:
+            writer.submit(rows, {})
+            assert wait_until(lambda: writer.queue_depth() == 0)
+
+        written = self.requestor.written()
+        assert len(written) == 499 and bad not in written
+        # one error naming the row, and no outage warning: the database answered
+        assert [r.levelname for r in logs.records] == ["ERROR"], logs.output
+        line = logs.output[0]
+        assert bad in line and "CHECK constraint failed" in line, line
+        assert "back" in line and "main" in line, line
+        assert self.requestor.calls < 25, self.requestor.sizes
+        assert writer.stop(5)
+
+    def test_two_bad_rows_far_apart(self):
+        writer = self.make_writer()
+        rows = [row(n) for n in range(500)]
+        bad = {rows[10]["path"], rows[400]["path"]}
+        self.requestor.rejected = bad
+
+        with self.assertLogs("frigate.record.writer", "ERROR") as logs:
+            writer.submit(rows, {})
+            assert wait_until(lambda: writer.queue_depth() == 0)
+
+        written = self.requestor.written()
+        assert len(written) == 498 and not bad & set(written)
+        assert len(logs.output) == 2
+        assert all(any(p in line for line in logs.output) for p in bad)
+        assert writer.stop(5)
+
+    def test_locked_database_is_retried_whole_with_backoff(self):
+        with patch.object(writer_module, "RETRY_INITIAL", 0.05):
+            writer = self.make_writer()
+            self.requestor.fail_times = 3
+
+            start = time.monotonic()
+            with self.assertLogs("frigate.record.writer", "WARNING"):
+                writer.submit([row(n) for n in range(10)], {})
+                assert wait_until(lambda: len(self.requestor.written()) == 10)
+
+        # never split, and the retries waited 0.05 + 0.1 + 0.2 s
+        assert self.requestor.sizes == [10] * 4
+        assert time.monotonic() - start >= 0.3
+        assert writer.stop(5)
+
+    def test_mover_has_room_while_a_bad_row_is_isolated(self):
+        writer = self.make_writer(db_write_queue=520)
+        self.requestor.delay = 0.005
+        rows = [row(n) for n in range(500)]
+        self.requestor.rejected = {rows[250]["path"]}
+        held = []
+
+        def mover():
+            # a pass every 5 ms, each with one new segment
+            for n in range(60):
+                if writer.has_room():
+                    writer.submit([row(1000 + n)], {})
+                else:
+                    held.append(n)
+                time.sleep(0.005)
+
+        with self.assertLogs("frigate.record.writer", "ERROR"):
+            writer.submit(rows, {})
+            passes = threading.Thread(target=mover, daemon=True)
+            passes.start()
+            passes.join(10)
+            assert wait_until(lambda: writer.queue_depth() == 0)
+
+        assert held == []
+        assert len(self.requestor.written()) == 499 + 60
+        assert writer.stop(5)
+
+
+class TestRecordingRowIds(unittest.TestCase):
+    def test_streams_starting_in_the_same_second_get_distinct_ids(self):
+        # 32 dual-stream cameras, every segment opening in the same second
+        rows = [
+            recording_row(
+                f"cam{n // 2}",
+                ("main", "sub")[n % 2],
+                f"/media/frigate/recordings/{n}.mp4",
+                1760781080.0,
+                1760781090.0,
+                10.0,
+                1_000_000,
+                None,
+            )
+            for n in range(64)
+        ]
+        ids = [r["id"] for r in rows]
+
+        assert len(set(ids)) == 64
+        for row_id in ids:
+            assert re.fullmatch(r"\d+\.\d+-[a-z0-9]{12}", row_id), row_id
+            assert len(row_id) <= 30
+
 
 class TestCleanShutdownMarker(unittest.TestCase):
     def test_marker_round_trip(self):
@@ -404,9 +544,78 @@ class TestInsertHandler(BaseTestHttp):
 
         assert result["ok"] is False
         assert "locked" in result["error"]
+        # not the rows' fault: retried whole, never split or dropped
+        assert result["rejected"] is False
 
         holder.execute("ROLLBACK")
         assert insert_recording_rows([row(0)]) == {"ok": True, "count": 1}
+
+    def test_refused_values_are_a_rejected_outcome(self):
+        Recordings._meta.database.execute_sql(
+            "CREATE TRIGGER reject_bad BEFORE INSERT ON recordings "
+            "WHEN NEW.path LIKE '%/bad.mp4' BEGIN SELECT RAISE(ABORT, 'x'); END"
+        )
+        bad = {**row(1), "path": "/rec/back/bad.mp4"}
+
+        result = insert_recording_rows([row(0), bad])
+
+        assert result["ok"] is False and result["rejected"] is True
+        # the statement is aborted whole: the writer splits the batch
+        assert Recordings.select().count() == 0
+        assert insert_recording_rows([row(0)]) == {"ok": True, "count": 1}
+
+    def test_writer_recovers_from_a_request_with_no_reply(self):
+        inter_process = real_inter_process()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        patcher = patch.object(
+            inter_process, "SOCKET_REP_REQ", f"ipc://{os.path.join(tmp, 'comms')}"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        release = threading.Event()
+        calls: list[int] = []
+
+        def dispatch(topic, payload):
+            if topic != INSERT_MANY_RECORDINGS:
+                return None
+
+            calls.append(len(payload))
+
+            if len(calls) == 1:
+                # the main process is stuck past the writer's timeout
+                release.wait(10)
+
+            return insert_recording_rows(payload)
+
+        communicator = inter_process.InterProcessCommunicator()
+        communicator.subscribe(dispatch)
+        self.addCleanup(communicator.stop)
+        self.addCleanup(release.set)
+
+        with patch.object(writer_module, "RETRY_INITIAL", 0.05):
+            writer = RecordingsWriter(
+                config(),
+                requestor_factory=lambda: inter_process.InterProcessRequestor(
+                    timeout=0.5
+                ),
+                publisher_factory=FakePublisher,
+            )
+            writer.start()
+            self.addCleanup(writer.stop, 1)
+
+            with self.assertLogs(level="WARNING"):
+                writer.submit([row(n) for n in range(3)], {})
+                assert wait_until(lambda: writer.failing_since is not None)
+                # it answers again
+                release.set()
+                assert wait_until(lambda: writer.queue_depth() == 0, 10)
+
+        # sent again on a new connection, and each segment stored once
+        assert len(calls) >= 2
+        assert Recordings.select().count() == 3
+        assert writer.stop(5)
 
     def test_request_thread_keeps_serving_after_a_failed_insert(self):
         inter_process = real_inter_process()

@@ -910,7 +910,19 @@ def process_frames(
             continue
 
         if datetime.now().astimezone(timezone.utc) > next_region_update:
-            region_grid = requestor.send_data(REQUEST_REGION_GRID, camera_config.name)
+            new_grid = requestor.send_data(REQUEST_REGION_GRID, camera_config.name)
+
+            # fork: a failed request is answered with [] (or "" on a ZMQ
+            # error); indexing that as a grid would end this camera's
+            # detection, so keep the current grid until the next refresh
+            if isinstance(new_grid, list) and new_grid:
+                region_grid = new_grid
+            else:
+                logger.warning(
+                    f"{camera_config.name}: no region grid in reply, "
+                    "keeping the current one"
+                )
+
             next_region_update = get_tomorrow_at_time(2)
 
         try:

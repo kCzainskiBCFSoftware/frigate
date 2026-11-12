@@ -41,7 +41,11 @@ def recording_row(
     are stored as unknown (NULL), never as 0.
     """
     media_info = media_info or {}
-    rand_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    # 12 characters (upstream: 6): every stream whose segment opens in the
+    # same second shares the time prefix, and with 64 streams a 6-character
+    # suffix collided often enough across a fleet to drop a row. The id stays
+    # under the column's 30 characters.
+    rand_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
 
     return {
         Recordings.id.name: f"{start_time}-{rand_id}",

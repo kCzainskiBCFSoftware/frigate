@@ -43,7 +43,7 @@ from frigate.record.cache_watch import (
     reserve_discards,
 )
 from frigate.record.util import recording_row
-from frigate.record.writer import BATCH_ROWS, RecordingsWriter
+from frigate.record.writer import BATCH_ROWS, RecordingsWriter, row_request_timeout
 from frigate.review.types import SeverityEnum
 from frigate.util.services import get_video_properties
 
@@ -109,8 +109,10 @@ class RecordingMaintainer(threading.Thread):
         self.writer = writer
         self.writer_down_logged = False
 
-        # create communication for retained recordings
-        self.requestor = InterProcessRequestor()
+        # create communication for retained recordings. Used only for the
+        # blocking row request; timed, so a main process that stops answering
+        # costs one pass's rows instead of stopping the mover
+        self.requestor = InterProcessRequestor(timeout=row_request_timeout(config))
         self.config_subscriber = CameraConfigUpdateSubscriber(
             self.config,
             self.config.cameras,
@@ -337,10 +339,26 @@ class RecordingMaintainer(threading.Thread):
             batch = rows[i : i + BATCH_ROWS]
             result = self.requestor.send_data(INSERT_MANY_RECORDINGS, batch)
 
-            if isinstance(result, dict) and not result.get("ok", True):
-                logger.error(
-                    f"Failed to write {len(batch)} recording rows: {result.get('error')}"
-                )
+            if not batch:
+                continue
+
+            if not isinstance(result, dict):
+                # timed out, a ZMQ error (""), or a failed request ([]); the
+                # rows are not retried, and the files stay in recordings, where
+                # reconcile and sync find them
+                error = "no reply from the main process"
+            elif not result.get("ok", True):
+                error = result.get("error")
+            else:
+                continue
+
+            logger.error(
+                "Failed to write %d recording rows (%s to %s): %s",
+                len(batch),
+                batch[0].get(Recordings.path.name),
+                batch[-1].get(Recordings.path.name),
+                error,
+            )
 
     def writer_available(self) -> bool:
         """Whether this pass hands its rows to the background writer.
