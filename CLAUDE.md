@@ -13,6 +13,9 @@ dual-stream recording (main/sub variants — see "Fork-specific work" below).
 at it. `dev` only mirrors upstream; `v17.1-update-with-adaptive` is the predecessor `dev-fork`
 replaced and takes no new work.
 
+**Releasing:** the Makefile `VERSION` is the version being worked toward, and the Release and Bump
+version workflows move it — don't edit it by hand. Steps and failure fixes: `ra-docs/releasing.md`.
+
 A coding-standards reference already exists at `.github/copilot-instructions.md` (Python/async/i18n
 conventions, logging, error handling). Read it before writing code; this file does not repeat it.
 

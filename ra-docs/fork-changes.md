@@ -189,12 +189,12 @@ documents the **code** changes.
   `docker/release/version-stamp.Dockerfile`** — releases were a pure retag, so the
   `<Makefile VERSION>-<sha>` baked in at build time shipped unchanged and a device
   pulling `:0.17.3` reported `0.17.2-7246a15`. `Makefile` `VERSION` now always holds
-  the version being worked toward (`0.17.4` from here). **Release** (run with the
-  tested sha, or on a pushed `v*` tag) adds one layer on top of the tested image that
-  rewrites `frigate/version.py` to the bare version, pushes `:<version>` + `:stable`,
-  creates the tag, and moves the Makefile on `dev-fork` to the next patch version.
-  Guards refuse a commit not on `dev-fork`, a version already tagged, and a tag that
-  disagrees with the Makefile. `bump_version.yml` is only for minor/major jumps.
+  the version being worked toward. **Release** — run from `dev-fork`, or started by
+  publishing a GitHub release or pushing a `v*` tag — adds one layer on top of the
+  tested image that rewrites `frigate/version.py` to the bare version, pushes
+  `:<version>` (plus `:stable` for the newest stable release), creates the tag and the
+  GitHub release, and moves the Makefile on `dev-fork` to the next patch version.
+  **Bump version** steps minor or major. Steps and failure fixes: `ra-docs/releasing.md`.
 - **`.github/workflows/ci.yml`** — `RELEASE_BRANCH` moved from
   `v17.1-update-with-adaptive` to `dev-fork`. Only pushes to `dev-fork` publish
   `<version>-<sha>` and move `latest`.
