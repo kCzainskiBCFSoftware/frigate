@@ -35,7 +35,6 @@ import {
 } from "@/context/theme-provider";
 import { IoColorPalette } from "react-icons/io5";
 import { useMemo, useState } from "react";
-import { useRestart } from "@/api/ws";
 import {
   Tooltip,
   TooltipContent,
@@ -111,7 +110,6 @@ export default function GeneralSettings({ className }: GeneralSettingsProps) {
   const { theme, colorScheme, setTheme, setColorScheme } = useTheme();
   const [restartDialogOpen, setRestartDialogOpen] = useState(false);
   const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
-  const { send: sendRestart } = useRestart();
 
   const isAdmin = useIsAdmin();
 
@@ -605,7 +603,6 @@ export default function GeneralSettings({ className }: GeneralSettingsProps) {
       <RestartDialog
         isOpen={restartDialogOpen}
         onClose={() => setRestartDialogOpen(false)}
-        onRestart={() => sendRestart("restart")}
       />
       <SetPasswordDialog
         show={passwordDialogOpen}
