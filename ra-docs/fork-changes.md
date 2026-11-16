@@ -185,18 +185,58 @@ documents the **code** changes.
 ### Infra
 - **`docker/main/rootfs/usr/local/nginx/conf/nginx.conf`** — `vod_upstream_extra_args`
   so query args reach the vod upstream (path-form variant remains canonical).
+- **`docker/main/build_nginx.sh`, `docker/main/rootfs/usr/local/nginx/conf/nginx.conf`,
+  `web/src/components/player/GenericVideoPlayer.tsx`** — nginx modules built from a
+  new source (2026-11-16). Kaltura deleted `kaltura/nginx-vod-module` and
+  `kaltura/nginx-secure-token-module` from GitHub, so every image build died with a
+  404 in `build_nginx.sh`. This is a hand-merge of two upstream commits into the
+  fork's own `nginx.conf`, not an overwrite:
+  - `169341537` — `VOD_MODULE_VERSION="v1.9.1"` fetched from `dio-az/nginx-vod-module`,
+    the `avc_hevc_parser.c` patch hunk rewritten for that code, `vod_hls_version 6;`
+    added to `location /vod/`, and the `error_page 502 =404` + `location =
+    /vod-not-found` pair removed (the module now answers 404 for missing media itself).
+  - `d9ce4b061` — the secure-token module is gone (download, `SECURE_TOKEN_MODULE_VERSION`
+    and `--add-module`). Its job, appending the request's query string to every URL in
+    a playlist, is now `sub_filter` on `.m3u8`, `.m4s` and `.mp4"`.
+  - `GenericVideoPlayer.tsx`: comment only; the check still treats 404 and 502 as
+    "no source".
+
+  All the fork's `vod_*` tuning (`vod_upstream_extra_args`, `vod_bootstrap_segment_durations`,
+  the caches, `gzip_types`) is unchanged. **Behavior differences, checked
+  against upstream's `0.17.1` image (Kaltura 1.31 + secure-token 1.5) with the same mapping
+  and media:** playlists, segments and init segment are the same shape (media segment
+  sizes identical; init segment 4 bytes larger); the new module adds `#EXT-X-INDEPENDENT-SEGMENTS`
+  and an `-x3` suffix to segment names, and drops `#EXT-X-ALLOW-CACHE`; the 2 s + 2 s + 10 s
+  bootstrap layout, query-arg propagation (to the mapping subrequest and into the playlist),
+  and gzip of playlists over 1 KB (sub_filter runs before gzip) all still hold; a mapping
+  request that fails outright (API down) now reaches the browser as 502, where it used to
+  be rewritten to 404.
+  **Lineage:** the module is no longer Kaltura's. `dio-az/nginx-vod-module` is a
+  single-maintainer personal repository (AGPL-3.0, not a GitHub fork, tags up to
+  v1.11.2). `v1.9.1` is an annotated tag that resolves to commit
+  `e4413508583e5623c79d0baf68918b5cf7d6c802`; the build pins the tag, as upstream does.
+  A tag in a personal repo can be moved or deleted, so mirroring the source into a
+  repository we control, or pinning that commit SHA, remains open.
+
+  *Upstream files touched, with rebase-conflict risk:* `nginx.conf` — **medium**: the
+  fork edits many other hunks of it, and upstream keeps editing `location /vod/` (it
+  has since added `include security_headers.conf;` there), so expect to resolve that
+  block by hand on the next sync and keep the fork's directives. `build_nginx.sh` — **low**:
+  the vod/secure-token hunks are upstream's verbatim, so a sync sees them as already
+  applied; the only remaining drift is `--with-http_v2_module`, which the fork has not
+  pulled yet. `GenericVideoPlayer.tsx` — **low**: comment only, identical to upstream.
 - **`.github/workflows/*` and `.github/actions/setup`** — CI workflows trimmed for
   the fork. *(Not feature-related; review before merging upstream.)*
 - **`.github/workflows/release.yml`, `.github/workflows/bump_version.yml`,
   `docker/release/version-stamp.Dockerfile`** — releases were a pure retag, so the
   `<Makefile VERSION>-<sha>` baked in at build time shipped unchanged and a device
   pulling `:0.17.3` reported `0.17.2-7246a15`. `Makefile` `VERSION` now always holds
-  the version being worked toward (`0.17.4` from here). **Release** (run with the
-  tested sha, or on a pushed `v*` tag) adds one layer on top of the tested image that
-  rewrites `frigate/version.py` to the bare version, pushes `:<version>` + `:stable`,
-  creates the tag, and moves the Makefile on `dev-fork` to the next patch version.
-  Guards refuse a commit not on `dev-fork`, a version already tagged, and a tag that
-  disagrees with the Makefile. `bump_version.yml` is only for minor/major jumps.
+  the version being worked toward. **Release** — run from `dev-fork`, or started by
+  publishing a GitHub release or pushing a `v*` tag — adds one layer on top of the
+  tested image that rewrites `frigate/version.py` to the bare version, pushes
+  `:<version>` (plus `:stable` for the newest stable release), creates the tag and the
+  GitHub release, and moves the Makefile on `dev-fork` to the next patch version.
+  **Bump version** steps minor or major. Steps and failure fixes: `ra-docs/releasing.md`.
 - **`.github/workflows/ci.yml`** — `RELEASE_BRANCH` moved from
   `v17.1-update-with-adaptive` to `dev-fork`. Only pushes to `dev-fork` publish
   `<version>-<sha>` and move `latest`.

@@ -1,18 +1,19 @@
 name: Bump version
 
-# The Makefile VERSION on the release branch is the version being worked toward: CI
-# bakes it into every build as <version>-<sha>, and "Release" ships it, then moves it
-# to the next patch version on its own. So this is only needed to jump further — a
-# minor or major release (0.17.5 -> 0.18.0):
-#
-#   1. run this on the release branch with the new version
-#   2. CI builds and publishes <version>-<sha> — test that image
-#   3. run "Release" with that sha
+# Moves the version the release branch is working toward. Patch steps need no action:
+# every stable release moves the Makefile from 0.17.5 to 0.17.6 on its own. Run this
+# for a minor or major release, before releasing. See ra-docs/releasing.md.
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'New version, e.g. 0.18.0 (no leading v)'
+      bump:
+        description: 'minor: 0.17.5 -> 0.18.0 | major: 0.17.5 -> 1.0.0 | patch: only if a release failed to bump'
+        type: choice
+        options:
+          - minor
+          - major
+          - patch
+        default: minor
         required: true
 
 env:
@@ -32,7 +33,7 @@ jobs:
       - name: Guard - run on the release branch
         run: |
           if [ "${GITHUB_REF_NAME}" != "${RELEASE_BRANCH}" ]; then
-            echo "::error::Run this on ${RELEASE_BRANCH}, not ${GITHUB_REF_NAME}"
+            echo "::error::Run this with 'Use workflow from' set to ${RELEASE_BRANCH}, not ${GITHUB_REF_NAME}"
             exit 1
           fi
 
@@ -45,29 +46,25 @@ jobs:
 
       - name: Bump the Makefile
         env:
-          VERSION: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
         run: |
-          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::'${VERSION}' is not X.Y.Z (no leading v, no suffix)"
-            exit 1
-          fi
-
           CURRENT=$(grep -m1 '^VERSION' Makefile | cut -d'=' -f2 | tr -d ' ')
-          if [ "${CURRENT}" = "${VERSION}" ]; then
-            echo "::error::The Makefile on ${GITHUB_REF_NAME} already says ${VERSION}"
+          if ! [[ "${CURRENT}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Makefile VERSION is '${CURRENT}', not X.Y.Z"
             exit 1
           fi
-          # Going backwards would make builds claim a version older than one already
-          # being worked toward, and could reuse a version number.
-          if [ "$(printf '%s\n%s\n' "${CURRENT}" "${VERSION}" | sort -V | tail -1)" != "${VERSION}" ]; then
-            echo "::error::${VERSION} is lower than the current ${CURRENT}"
-            exit 1
-          fi
+          IFS=. read -r MAJOR MINOR PATCH <<< "${CURRENT}"
+          case "${BUMP}" in
+            major) VERSION="$((MAJOR + 1)).0.0" ;;
+            minor) VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
+            patch) VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+            *) echo "::error::Unknown bump '${BUMP}' (expected major, minor or patch)"; exit 1 ;;
+          esac
 
           # Releasing a version twice would move the :${VERSION} image tag to different
           # bytes on devices that already pulled it.
           if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
-            echo "::error::v${VERSION} is already tagged — pick a new version"
+            echo "::error::v${VERSION} is already tagged, so ${BUMP} from ${CURRENT} has nowhere to go. Bump a larger step."
             exit 1
           fi
 
@@ -108,5 +105,5 @@ jobs:
             echo "| Commit | \`${BUMP_SHA}\` |"
             echo "| CI will publish | \`${VERSION}-${BUMP_SHA}\` |"
             echo ""
-            echo "Test that image, then run **Release** with sha \`${BUMP_SHA}\`."
+            echo "Test that image, then run **Release** from \`${GITHUB_REF_NAME}\`."
           } >> "$GITHUB_STEP_SUMMARY"
