@@ -228,6 +228,14 @@ names the variant.
   startup. It reproduced in a dev container with the stats emitter blocked: without the
   deadline, `stop()` never finished; with it, recording resumed about 83 s after the
   thread died.
+- [A restart from the UI, the API, MQTT or a dead detector while the request thread is
+  dead or stuck] → it ends in the same `restart_frigate()`, but only the watchdog arms the
+  exit deadline, so its stop can still hang until s6's 120 s kill. Since
+  `confirmed-ui-restart`, the UI's Restart sends `POST /api/restart`, which calls
+  `restart_frigate()` 1 s later, and the dialog waits for Frigate to answer again. It
+  shows a slow-start notice only after 6 minutes down, which covers the hang. Arming the
+  deadline for every restart would shorten that path too. It is not done here because it
+  would cut short any slow but healthy stop.
 - [The restart relies on a supervisor bringing Frigate back] → under s6 the whole
   container stops, and only the container's restart policy (`restart: always` or
   `unless-stopped`) starts it again. The dead-detector restart has the same dependency.
