@@ -18,12 +18,12 @@ logger = logging.getLogger(__name__)
 # timeout if that is longer, before Frigate restarts (fork).
 STUCK_REQUEST_FLOOR = 600.0
 
-# After a restart for the request thread, Frigate's stop can wait forever on a
-# thread blocked in an untimed request to it (the stats emitter, the tracked
+# While the request thread is dead or stuck, Frigate's stop can wait forever on
+# a thread blocked in an untimed request to it (the stats emitter, the tracked
 # object processor), and the reader's own join waits on a stuck one. If the
-# process is still alive this long after the restart, it exits at once, and
-# s6 or the container's restart policy starts it again. Half of s6's
-# 120 s timeout-kill for the frigate service.
+# process is still alive this long after the restart (or after a stop began),
+# it exits at once, and s6 or the container's restart policy starts it again.
+# Half of s6's 120 s timeout-kill for the frigate service.
 RESTART_EXIT_DEADLINE = 60.0
 
 # Lets the log listener write the exit error before the process ends.
@@ -50,8 +50,12 @@ class FrigateWatchdog(threading.Thread):
         # recovers it in place, so a dead or stuck one restarts Frigate.
         self.inter_process = inter_process
         self.stuck_after = max(STUCK_REQUEST_FLOOR, 2 * (busy_timeout or 0))
+        # a request that waits on the database gives up after the busy timeout,
+        # so one running longer at stop time is not going to answer soon
+        self.busy_timeout = busy_timeout or 0.0
         self.restart_deadline = restart_deadline
         self.exit_timer: Optional[threading.Timer] = None
+        self.exit_timer_lock = threading.Lock()
         self.restarting = False
 
     def run(self) -> None:
@@ -127,19 +131,78 @@ class FrigateWatchdog(threading.Thread):
             )
             self._restart()
 
+    def arm_stop_deadline(self) -> None:
+        """Bound a stop that begins while the request thread is dead or stuck.
+
+        Called first in FrigateApp.stop(). Every restart (the UI, the API, MQTT,
+        a dead detector) and a plain stop end there, and the rest of stop() can
+        wait forever on threads blocked behind that thread. A stop that begins
+        otherwise is left alone, however slow.
+        """
+        communicator = self.inter_process
+
+        if (
+            communicator is None
+            or self.exit_timer is not None  # the watchdog's restart armed it
+            or communicator.stop_event.is_set()
+        ):
+            return
+
+        reader = getattr(communicator, "reader_thread", None)
+
+        if reader is None:
+            return
+
+        if not reader.is_alive():
+            logger.warning(
+                "Frigate is stopping while the inter-process request thread has "
+                "stopped; it exits if it has not stopped within %.0fs",
+                self.restart_deadline,
+            )
+            self._arm_exit_deadline()
+            return
+
+        busy = communicator.busy
+
+        if busy is None:
+            return
+
+        topic, started = busy
+        running = time.monotonic() - started
+
+        if running > self.busy_timeout:
+            logger.warning(
+                "Frigate is stopping while inter-process request %s has been "
+                "running for %.0fs (busy timeout %.0fs); it exits if it has not "
+                "stopped within %.0fs",
+                topic,
+                running,
+                self.busy_timeout,
+                self.restart_deadline,
+            )
+            self._arm_exit_deadline()
+
     def _restart(self) -> None:
         self.restarting = True
-        # daemon: it never keeps a process that did stop in time alive
-        self.exit_timer = threading.Timer(self.restart_deadline, self._exit_now)
-        self.exit_timer.name = "restart_exit_deadline"
-        self.exit_timer.daemon = True
-        self.exit_timer.start()
+        self._arm_exit_deadline()
         restart_frigate()
+
+    def _arm_exit_deadline(self) -> None:
+        # once: the watchdog's restart and the stop that follows may both arm it
+        with self.exit_timer_lock:
+            if self.exit_timer is not None:
+                return
+
+            # daemon: it never keeps a process that did stop in time alive
+            self.exit_timer = threading.Timer(self.restart_deadline, self._exit_now)
+            self.exit_timer.name = "restart_exit_deadline"
+            self.exit_timer.daemon = True
+            self.exit_timer.start()
 
     def _exit_now(self) -> None:
         logger.error(
-            "Frigate has not stopped %.0fs after the restart: a thread is still "
-            "waiting on the inter-process request thread. Exiting now",
+            "Frigate has not stopped within %.0fs: a thread is still waiting on "
+            "the inter-process request thread. Exiting now",
             self.restart_deadline,
         )
         time.sleep(EXIT_LOG_GRACE)

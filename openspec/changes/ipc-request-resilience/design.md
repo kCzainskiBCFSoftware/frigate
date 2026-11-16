@@ -116,9 +116,19 @@ process. It is the same action the watchdog already takes for a dead detector.
   join. The watchdog therefore arms a daemon timer when it restarts for the request
   thread. If the process is still alive `RESTART_EXIT_DEADLINE` (60 s) later, the timer
   logs an error and calls `os._exit(1)`. 60 s is half of s6's `timeout-kill` (120 s) for
-  the frigate service. The dead-detector restart arms no timer. *Alternative:* bounded
-  joins in `stop()`. Rejected: every blocked thread is non-daemon, so interpreter exit
-  would wait on them anyway, and the stuck reader's join is one more hang.
+  the frigate service. The dead-detector restart arms no timer itself. *Alternative:*
+  bounded joins in `stop()`. Rejected: every blocked thread is non-daemon, so interpreter
+  exit would wait on them anyway, and the stuck reader's join is one more hang.
+- **Every other restart (added after `confirmed-ui-restart`):** `FrigateApp.stop()`
+  first calls `FrigateWatchdog.arm_stop_deadline()`. It arms the same timer if the reader
+  thread is dead, or if one request has run longer than the busy timeout. The UI, the
+  API, MQTT, a dead detector and a plain stop all end in `stop()`, so one call covers them.
+  The threshold is the busy timeout, not the watchdog's `max(600, 2 × busy_timeout)`.
+  Frigate is already stopping, and a request that waits on the database gives up after
+  the busy timeout, so one running longer is not about to answer. A stop that begins
+  with the thread idle, or within the busy timeout, arms nothing, so a slow but healthy
+  stop is never cut short. The timer is armed once: a watchdog restart has already
+  armed it before its own stop begins.
 
 ### 4. Requestor timeout: opt-in, reconnect inside the requestor
 
@@ -229,13 +239,19 @@ names the variant.
   deadline, `stop()` never finished; with it, recording resumed about 83 s after the
   thread died.
 - [A restart from the UI, the API, MQTT or a dead detector while the request thread is
-  dead or stuck] → it ends in the same `restart_frigate()`, but only the watchdog arms the
-  exit deadline, so its stop can still hang until s6's 120 s kill. Since
+  dead or stuck] → its `stop()` arms the exit deadline when the thread is dead or one
+  request has run longer than the busy timeout (Decision 3). Since
   `confirmed-ui-restart`, the UI's Restart sends `POST /api/restart`, which calls
-  `restart_frigate()` 1 s later, and the dialog waits for Frigate to answer again. It
-  shows a slow-start notice only after 6 minutes down, which covers the hang. Arming the
-  deadline for every restart would shorten that path too. It is not done here because it
-  would cut short any slow but healthy stop.
+  `restart_frigate()` 1 s later, and the dialog waits for Frigate to answer again.
+  In the dev container, a UI restart 75 s into a stuck request was back and recording
+  73 s later. Without the call in `stop()`, the process was still alive after 150 s.
+  Arming the deadline on every restart was rejected because it would cut short a slow
+  but healthy stop.
+- [A stuck request younger than the busy timeout when a restart begins arms nothing] →
+  that stop can still hang until s6's 120 s `timeout-kill`, as upstream. The watchdog
+  catches such a request itself once it passes `max(600, 2 × busy_timeout)`, if Frigate
+  is not already stopping. The UI shows its slow-start notice only after 6 minutes down,
+  which covers either path.
 - [The restart relies on a supervisor bringing Frigate back] → under s6 the whole
   container stops, and only the container's restart policy (`restart: always` or
   `unless-stopped`) starts it again. The dead-detector restart has the same dependency.

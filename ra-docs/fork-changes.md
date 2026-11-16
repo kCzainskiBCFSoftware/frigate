@@ -584,8 +584,15 @@ which filled the queue and stopped every camera.
   `stats_emitter.join()` or `detected_frames_processor.join()`, threads blocked
   in an untimed request to the dead thread, until s6's 120 s `timeout-kill`.
   That is the 2-minute gap with no API and no logs seen after a UI restart on
-  0.17.3. The dead-detector restart arms no timer. Either restart needs the
-  container's restart policy to bring Frigate back.
+  0.17.3. The dead-detector restart arms no timer itself. Either restart needs
+  the container's restart policy to bring Frigate back.
+- `FrigateApp.stop()` first calls `FrigateWatchdog.arm_stop_deadline()`. It
+  logs a warning and arms the same timer when the reader thread is dead, or one
+  request has run longer than the busy timeout (not the restart limit). Every
+  restart ends in `stop()`: the UI's `POST /api/restart`, the API, MQTT, a dead
+  detector, and a plain stop. A stop that begins with the thread idle, or
+  within the busy timeout, arms nothing, so a slow but healthy stop is not cut
+  short. A timer a watchdog restart already armed is kept.
 - `FrigateApp.start_watchdog()` passes the communicator and the busy timeout.
 
 ### Shared busy timeout (`frigate/db/maintenance.py`)
@@ -625,8 +632,9 @@ which filled the queue and stopped every camera.
 ### Upstream files touched
 Low conflict risk: `frigate/comms/inter_process.py` and `frigate/watchdog.py`
 (small files upstream rarely changes; `watchdog.py`'s loop body moved into
-`check()`), `frigate/app.py` (`bind_database` timeout and `start_watchdog`),
-`frigate/video.py` (the region-grid refresh, a few lines). Fork files:
+`check()`), `frigate/app.py` (`bind_database` timeout, `start_watchdog`, and
+one call at the top of `stop()`), `frigate/video.py` (the region-grid refresh,
+a few lines). Fork files:
 `frigate/db/maintenance.py`, `frigate/record/writer.py`,
 `frigate/record/maintainer.py`, `frigate/record/util.py`.
 
@@ -639,7 +647,10 @@ camera's rows kept landing; 25 requests whose handler raises were all answered,
 with one traceback logged. With the request thread killed while the stats
 emitter was blocked on it, `stop()` hung for good without the exit deadline.
 With it, recording resumed 83 s after the thread died, and reconcile recovered
-the 12 queued rows.
+the 12 queued rows. On 2026-11-16, a UI restart (`POST /api/restart`) 75 s into
+a request held past the 60 s busy timeout exited on the stop deadline 60 s
+after `stop()` began, and recording resumed 73 s after the restart. Without
+the stop deadline, the process was still alive 150 s after the restart.
 
 ### Open items
 - Other handlers' own bugs (e.g. `Event.get` for an event deleted before its
@@ -647,13 +658,10 @@ the 12 queued rows.
   a bug to fix on its own.
 - The watchdog's restarts and the per-topic failure counts are not exposed in
   `/api/stats`, so fleet monitoring cannot alert on them yet.
-- Other restarts can still hang in `FrigateApp.stop()` while the request
-  thread is dead or stuck, until s6's 120 s `timeout-kill`: the UI's Restart
-  (since *Confirmed UI restart*, `POST /api/restart`, which calls the same
-  `restart_frigate()` 1 s later), the API, MQTT and a dead detector. The exit
-  deadline is armed only by the request-thread watchdog. The UI copes: it
-  waits for Frigate to come back, and shows its slow-start notice only after
-  6 minutes down.
+- A restart that begins while a stuck request is still younger than the busy
+  timeout arms no exit deadline, so its stop can still hang until s6's 120 s
+  `timeout-kill`, as upstream. The UI copes: it waits for Frigate to come
+  back, and shows its slow-start notice only after 6 minutes down.
 - 9.4 (device-only): after a week on the new image, confirm no request-thread
   restart, and record the old id exposure measured with
   `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);`
@@ -873,7 +881,12 @@ back to English for the new strings.
   request at busy timeout 320 → restart naming the topic, 300 s and the 600 s
   floor → none, no restart while stopping, the upstream signature, and the exit
   deadline (fires after a request-thread restart, is a daemon timer, and is not
-  armed by a dead-detector restart; `_hard_exit` is always patched).
+  armed by a dead-detector restart; `_hard_exit` is always patched). The stop
+  deadline: a dead reader or a 300 s request at busy timeout 60 arms it, and
+  the deadline exits without a second restart. Idle, 30 s, a stopped
+  communicator or no `inter_process` arm nothing. A watchdog restart's timer is
+  kept with no second warning, and `FrigateApp.stop()` arms it before it sets
+  the stop event.
 - **`frigate/test/test_record_writer.py`** — rejected vs locked outcomes with a
   real database (a `RAISE(ABORT)` trigger, a held `BEGIN IMMEDIATE`), one bad
   row in 500 (499 written, one error, < 25 sends), two bad rows far apart, locked

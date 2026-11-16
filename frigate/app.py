@@ -621,6 +621,10 @@ class FrigateApp:
     def stop(self) -> None:
         logger.info("Stopping...")
 
+        # fork: before anything below can block on a dead or stuck
+        # inter-process request thread, arm the watchdog's exit deadline
+        self.frigate_watchdog.arm_stop_deadline()
+
         # used by the docker healthcheck
         Path("/dev/shm/.frigate-is-stopping").touch()
 

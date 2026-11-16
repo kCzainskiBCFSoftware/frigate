@@ -135,6 +135,67 @@ class TestRequestThreadWatchdog(unittest.TestCase):
         assert watchdog.exit_timer is None
         self.hard_exit.assert_not_called()
 
+    def test_stop_with_dead_request_thread_exits_by_the_deadline(self):
+        # e.g. a restart from the UI, which ends in FrigateApp.stop() like any
+        # other restart, and that stop waits on threads blocked behind the thread
+        watchdog = self.watchdog(communicator(alive=False), restart_deadline=0.05)
+
+        with self.assertLogs("frigate.watchdog", "WARNING") as logs:
+            watchdog.arm_stop_deadline()
+            assert wait_until(lambda: self.hard_exit.called, 2)
+
+        assert "request thread has stopped" in logs.output[0], logs.output
+        assert "has not stopped within" in logs.output[-1], logs.output
+        assert self.hard_exit.call_count == 1
+        assert watchdog.exit_timer.daemon
+        # Frigate is already stopping: nothing restarts it a second time
+        self.restart.assert_not_called()
+
+    def test_stop_with_a_request_past_the_busy_timeout_arms_the_deadline(self):
+        # 4 cameras: busy timeout 60 s, while the watchdog itself waits 600 s
+        watchdog = self.watchdog(
+            communicator(busy_for=300, topic="insert_many_recordings"),
+            busy_timeout=60,
+        )
+
+        with self.assertLogs("frigate.watchdog", "WARNING") as logs:
+            watchdog.arm_stop_deadline()
+
+        assert watchdog.exit_timer is not None
+        assert "insert_many_recordings" in logs.output[0], logs.output
+        assert "300s" in logs.output[0], logs.output
+        self.restart.assert_not_called()
+
+    def test_healthy_stop_arms_no_deadline(self):
+        # idle, or a request still within the busy timeout
+        for inter_process in (communicator(), communicator(busy_for=30)):
+            watchdog = self.watchdog(inter_process, busy_timeout=60)
+            watchdog.arm_stop_deadline()
+            assert watchdog.exit_timer is None
+
+        # a communicator already stopped ends its reader on purpose
+        stopped = communicator(alive=False)
+        stopped.stop_event.set()
+        watchdog = self.watchdog(stopped)
+        watchdog.arm_stop_deadline()
+        assert watchdog.exit_timer is None
+
+        # the upstream signature
+        FrigateWatchdog({}, self.stop_event).arm_stop_deadline()
+
+    def test_stop_after_a_watchdog_restart_keeps_its_deadline(self):
+        watchdog = self.watchdog(communicator(alive=False))
+
+        with self.assertLogs("frigate.watchdog", "ERROR"):
+            watchdog.check()
+
+        timer = watchdog.exit_timer
+
+        with self.assertNoLogs("frigate.watchdog", "WARNING"):
+            watchdog.arm_stop_deadline()
+
+        assert watchdog.exit_timer is timer
+
     def test_without_inter_process_only_detectors_are_checked(self):
         # the upstream signature still works
         watchdog = FrigateWatchdog({"cpu": detector(alive=True)}, self.stop_event)
@@ -144,6 +205,27 @@ class TestRequestThreadWatchdog(unittest.TestCase):
         watchdog = FrigateWatchdog({"cpu": detector(alive=False)}, self.stop_event)
         watchdog.check()
         assert self.restart.call_count == 1
+
+
+class TestAppStopArmsDeadline(unittest.TestCase):
+    def test_stop_arms_the_deadline_before_anything_can_block(self):
+        from frigate.app import FrigateApp
+
+        class Armed(Exception):
+            pass
+
+        app = FrigateApp.__new__(FrigateApp)
+        app.stop_event = MagicMock()
+        app.frigate_watchdog = MagicMock()
+        app.frigate_watchdog.arm_stop_deadline.side_effect = Armed
+
+        with patch("frigate.app.Path") as path, self.assertRaises(Armed):
+            app.stop()
+
+        app.frigate_watchdog.arm_stop_deadline.assert_called_once_with()
+        # nothing of the stop ran before it
+        app.stop_event.set.assert_not_called()
+        path.assert_not_called()
 
 
 if __name__ == "__main__":

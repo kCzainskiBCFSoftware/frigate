@@ -53,14 +53,22 @@ The main process SHALL check the thread that answers inter-process requests ever
 - **WHEN** the inter-process request thread has ended while Frigate is running
 - **THEN** within 20 seconds an error naming that thread is logged and Frigate restarts
 
-### Requirement: A restart for the request thread completes
+### Requirement: A restart completes while the request thread is dead or stuck
 
-When Frigate restarts because the inter-process request thread has stopped or is stuck, and it has not exited 60 seconds later, it SHALL exit at once, so that its supervisor or the container's restart policy can start it again.
+When Frigate restarts or stops while the inter-process request thread has stopped, or while one request has run longer than the busy timeout, and it has not exited 60 seconds later, it SHALL exit at once, so that its supervisor or the container's restart policy can start it again. This SHALL hold for every restart, including one from the UI. A restart or stop that begins otherwise SHALL NOT be cut short.
 
 #### Scenario: Shutdown waits on the dead request thread
 - **WHEN** the request thread has ended while another main-process thread waits for its reply, and Frigate restarts
 - **THEN** Frigate exits within 60 seconds of the restart, with an error saying it did not stop in time
 - **AND** with a container restart policy, Frigate is back and recording within 3 minutes of the thread ending
+
+#### Scenario: UI restart while a request is stuck
+- **WHEN** one request has run for 75 s on a device with 2 enabled cameras (busy timeout 60 s) while another main-process thread waits for a reply, and the user restarts Frigate from the UI
+- **THEN** Frigate exits within 60 seconds of starting to stop, with an error saying it did not stop in time
+
+#### Scenario: Healthy restart
+- **WHEN** the request thread is idle, or its current request has run for less than the busy timeout, and the user restarts Frigate
+- **THEN** Frigate stops as it does upstream, and nothing ends it early
 
 ### Requirement: A stuck request restarts Frigate
 
