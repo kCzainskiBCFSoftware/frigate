@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import os
+import threading
 import traceback
 import urllib
 from datetime import datetime, timedelta
@@ -581,12 +582,23 @@ async def logs(
         )
 
 
-@router.post("/restart", dependencies=[Depends(require_role(["admin"]))])
-def restart():
+def _restart_after_reply() -> None:
     try:
         restart_frigate()
     except Exception as e:
-        logging.error(f"Error restarting Frigate: {e}")
+        logger.error(f"Error restarting Frigate: {e}")
+
+
+@router.post("/restart", dependencies=[Depends(require_role(["admin"]))])
+def restart():
+    # Reply first: the shutdown stops nginx at once, which can cut the
+    # connection before the reply has reached the browser.
+    try:
+        restart_timer = threading.Timer(1.0, _restart_after_reply)
+        restart_timer.daemon = True
+        restart_timer.start()
+    except Exception as e:
+        logger.error(f"Error scheduling Frigate restart: {e}")
         return JSONResponse(
             content=(
                 {
