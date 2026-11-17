@@ -7,7 +7,7 @@ from playhouse.sqliteq import SqliteQueueDatabase
 
 from frigate.config import FrigateConfig
 from frigate.const import PROCESS_PRIORITY_HIGH
-from frigate.db.maintenance import size_pragmas
+from frigate.db.maintenance import busy_timeout, size_pragmas
 from frigate.models import Recordings, ReviewSegment
 from frigate.record.maintainer import RecordingMaintainer
 from frigate.record.writer import RecordingsWriter, write_clean_shutdown_marker
@@ -47,9 +47,7 @@ class RecordProcess(FrigateProcess):
                 "journal_mode": "wal",  # required for synchronous=NORMAL to be crash-safe
                 "synchronous": "NORMAL",  # Safe when using WAL https://www.sqlite.org/pragma.html#pragma_synchronous
             },
-            timeout=max(
-                60, 10 * len([c for c in self.config.cameras.values() if c.enabled])
-            ),
+            timeout=busy_timeout(self.config),
         )
         models = [ReviewSegment, Recordings]
         db.bind(models)
@@ -71,6 +69,8 @@ class RecordProcess(FrigateProcess):
         # the mover has stopped: write what it queued, then record a clean stop
         # so the next start skips the recovery scan
         drained = writer is None or writer.stop(pipeline.db_flush_timeout)
+        # rows the blocking request could not write are recovered the same way
+        drained = maintainer.report_unsent_rows() and drained
 
         if self.stop_event.is_set() and drained:
             write_clean_shutdown_marker(self.config.database.path)

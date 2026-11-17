@@ -1,6 +1,7 @@
 import datetime
 import logging
 import os
+import queue
 import shutil
 import tempfile
 import time
@@ -363,6 +364,104 @@ class TestRegionGrid(unittest.TestCase):
 
         region = get_region_from_grid(frame_shape, box, 320, region_grid)
         assert region[2] - region[0] > 320
+
+
+class TestRegionGridRefresh(unittest.TestCase):
+    """A failed region-grid request keeps the camera's current grid."""
+
+    def test_empty_or_missing_reply_keeps_the_current_grid(self):
+        from frigate.const import REQUEST_REGION_GRID
+        from frigate.video import process_frames
+
+        config = FrigateConfig(
+            **{
+                "mqtt": {"host": "mqtt"},
+                "cameras": {
+                    "front": {
+                        "ffmpeg": {
+                            "inputs": [
+                                {"path": "rtsp://10.0.0.1:554/v", "roles": ["detect"]}
+                            ]
+                        },
+                        "detect": {
+                            "enabled": True,
+                            "height": 720,
+                            "width": 1280,
+                            "fps": 5,
+                        },
+                    }
+                },
+            }
+        )
+        camera_config = config.cameras["front"]
+        frame_shape = (720, 1280)
+        initial_grid = [[{"sizes": [0.25], "mean": 0.26, "std_dev": 0.01}]]
+
+        # a failed request is answered with [], a ZMQ error returns ""
+        replies = iter([[], ""])
+        requestor = MagicMock()
+        requestor.send_data.side_effect = lambda *args: next(replies, "")
+
+        frame_queue = queue.Queue()
+        for n in range(2):
+            frame_queue.put((f"front_frame{n}", 1700000000.0 + n))
+
+        frame_manager = MagicMock()
+        frame_manager.get.return_value = np.zeros(
+            (frame_shape[0] * 3 // 2, frame_shape[1]), np.uint8
+        )
+        motion_detector = MagicMock()
+        motion_detector.detect.return_value = [(100, 100, 200, 200)]
+        motion_detector.is_calibrating.return_value = False
+        object_tracker = MagicMock()
+        object_tracker.tracked_objects = {}
+        object_tracker.untracked_object_boxes = []
+        detected_objects_queue = MagicMock()
+        detected_objects_queue.full.return_value = False
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = False
+
+        past = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+        startup_regions = MagicMock(return_value=[])
+        motion_region = MagicMock(return_value=(0, 0, 320, 320))
+
+        with (
+            # every frame is past the next refresh, so each one requests a grid
+            patch("frigate.video.get_tomorrow_at_time", return_value=past),
+            patch("frigate.video.CameraConfigUpdateSubscriber") as subscriber,
+            patch("frigate.video.get_startup_regions", startup_regions),
+            patch("frigate.video.get_cluster_region_from_grid", motion_region),
+            patch("frigate.video.ptz_moving_at_frame_time", return_value=False),
+            patch("frigate.video.detect", return_value=[]),
+        ):
+            subscriber.return_value.check_for_updates.return_value = {}
+            process_frames(
+                requestor,
+                frame_queue,
+                frame_shape,
+                config.model,
+                camera_config,
+                frame_manager,
+                motion_detector,
+                MagicMock(),
+                object_tracker,
+                detected_objects_queue,
+                MagicMock(),
+                stop_event,
+                MagicMock(),
+                initial_grid,
+                exit_on_empty=True,
+            )
+
+        # one request per loop, including the one that finds the queue empty
+        calls = [c.args for c in requestor.send_data.call_args_list]
+        assert len(calls) >= 2
+        assert set(calls) == {(REQUEST_REGION_GRID, "front")}
+        # both frames were detected with the grid the camera started with
+        assert detected_objects_queue.put.call_count == 2
+        assert startup_regions.call_args.args[2] is initial_grid
+        assert motion_region.call_count == 2
+        assert all(c.args[4] is initial_grid for c in motion_region.call_args_list)
 
 
 TIMEOUT = 120

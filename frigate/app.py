@@ -42,7 +42,7 @@ from frigate.const import (
     TRIGGER_DIR,
 )
 from frigate.data_processing.types import DataProcessorMetrics
-from frigate.db.maintenance import size_pragmas
+from frigate.db.maintenance import busy_timeout, size_pragmas
 from frigate.db.sqlitevecq import SqliteVecQueueDatabase
 from frigate.embeddings import EmbeddingProcess, EmbeddingsContext
 from frigate.events.audio import AudioProcessor
@@ -302,11 +302,7 @@ class FrigateApp:
                 "journal_mode": "wal",  # required for synchronous=NORMAL to be crash-safe
                 "synchronous": "NORMAL",  # Safe when using WAL https://www.sqlite.org/pragma.html#pragma_synchronous
             },
-            timeout=max(
-                60,
-                10
-                * len([c for c in self.config.cameras.values() if c.enabled_in_config]),
-            ),
+            timeout=busy_timeout(self.config),
             load_vec_extension=self.config.semantic_search.enabled,
         )
         models = [
@@ -510,7 +506,12 @@ class FrigateApp:
         self.stats_emitter.start()
 
     def start_watchdog(self) -> None:
-        self.frigate_watchdog = FrigateWatchdog(self.detectors, self.stop_event)
+        self.frigate_watchdog = FrigateWatchdog(
+            self.detectors,
+            self.stop_event,
+            inter_process=self.inter_process_communicator,
+            busy_timeout=busy_timeout(self.config),
+        )
         self.frigate_watchdog.start()
 
     def init_auth(self) -> None:
@@ -619,6 +620,10 @@ class FrigateApp:
 
     def stop(self) -> None:
         logger.info("Stopping...")
+
+        # fork: before anything below can block on a dead or stuck
+        # inter-process request thread, arm the watchdog's exit deadline
+        self.frigate_watchdog.arm_stop_deadline()
 
         # used by the docker healthcheck
         Path("/dev/shm/.frigate-is-stopping").touch()

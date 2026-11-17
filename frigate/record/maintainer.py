@@ -5,6 +5,7 @@ import datetime
 import logging
 import os
 import threading
+import time
 from collections import Counter, defaultdict
 from contextlib import AbstractAsyncContextManager, nullcontext
 from multiprocessing.synchronize import Event as MpEvent
@@ -43,7 +44,13 @@ from frigate.record.cache_watch import (
     reserve_discards,
 )
 from frigate.record.util import recording_row
-from frigate.record.writer import BATCH_ROWS, RecordingsWriter
+from frigate.record.writer import (
+    BATCH_ROWS,
+    FAILING_ERROR_AFTER,
+    RecordingsWriter,
+    RejectedRowsLog,
+    row_request_timeout,
+)
 from frigate.review.types import SeverityEnum
 from frigate.util.services import get_video_properties
 
@@ -109,8 +116,16 @@ class RecordingMaintainer(threading.Thread):
         self.writer = writer
         self.writer_down_logged = False
 
-        # create communication for retained recordings
-        self.requestor = InterProcessRequestor()
+        # create communication for retained recordings. Used only for the
+        # blocking row request; timed, so a main process that stops answering
+        # holds up each pass by at most one timeout instead of stopping the
+        # mover. Rows it does not write are kept and sent again next pass
+        self.requestor = InterProcessRequestor(timeout=row_request_timeout(config))
+        self.unsent_rows: list[dict[str, Any]] = []
+        self.unsent_since: Optional[float] = None
+        self.unsent_error_logged = False
+        self.unsent_dropped_logged = False
+        self.rejected_rows = RejectedRowsLog()
         self.config_subscriber = CameraConfigUpdateSubscriber(
             self.config,
             self.config.cameras,
@@ -331,16 +346,109 @@ class RecordingMaintainer(threading.Thread):
             # the writer thread has stopped: send what it still held as well
             rows = self.writer.take_rows() + rows
 
-        # fire and forget recordings entries; batched so rows a stopped writer
-        # held stay under SQLite's bound-variable limit
-        for i in range(0, max(len(rows), 1), BATCH_ROWS):
+        self.send_rows(rows)
+
+    def send_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Write rows with the blocking request, after those still unsent.
+
+        Batched so a backlog stays under SQLite's bound-variable limit. The
+        first batch that is not written (no reply, or a database failure) ends
+        the sends: it and every later row are kept for the next pass, so a main
+        process that stops answering costs one request timeout per pass. Rows
+        the database rejects are logged and dropped by the main process's reply.
+        """
+        rows = self.unsent_rows + rows
+        self.unsent_rows = []
+
+        for i in range(0, len(rows), BATCH_ROWS):
             batch = rows[i : i + BATCH_ROWS]
             result = self.requestor.send_data(INSERT_MANY_RECORDINGS, batch)
 
-            if isinstance(result, dict) and not result.get("ok", True):
-                logger.error(
-                    f"Failed to write {len(batch)} recording rows: {result.get('error')}"
-                )
+            if isinstance(result, dict) and result.get("ok", True):
+                self.rejected_rows.report(result.get("rejected"))
+                continue
+
+            # timed out or a ZMQ error (""), a failed request ([]), or a
+            # database failure ({"ok": false})
+            self.keep_unsent(
+                rows[i:],
+                result.get("error")
+                if isinstance(result, dict)
+                else "no reply from the main process",
+            )
+            return
+
+        if rows and self.unsent_since is not None:
+            logger.info(
+                "Recording rows are being written again after %.0fs of failures",
+                time.monotonic() - self.unsent_since,
+            )
+            self.unsent_since = None
+            self.unsent_error_logged = False
+            self.unsent_dropped_logged = False
+
+    def keep_unsent(self, rows: list[dict[str, Any]], error: Any) -> None:
+        """Keep rows for the next pass, at most record.pipeline.db_write_queue.
+
+        Past that the oldest are dropped: their files stay in recordings, where
+        the next start's recovery finds them after an unclean shutdown.
+        """
+        capacity = self.config.record.pipeline.db_write_queue
+
+        if len(rows) > capacity:
+            dropped = rows[: len(rows) - capacity]
+            rows = rows[len(dropped) :]
+            log = logger.debug if self.unsent_dropped_logged else logger.error
+            log(
+                "Dropped %d recording rows the database has not taken (%s to "
+                "%s): more than record.pipeline.db_write_queue are waiting. "
+                "Their segment files stay in recordings",
+                len(dropped),
+                dropped[0].get(Recordings.path.name),
+                dropped[-1].get(Recordings.path.name),
+            )
+            self.unsent_dropped_logged = True
+
+        self.unsent_rows = rows
+        now = time.monotonic()
+
+        if self.unsent_since is None:
+            self.unsent_since = now
+            logger.warning(
+                "Writing recording rows failed (%s); %d rows are sent again on "
+                "the next pass",
+                error,
+                len(rows),
+            )
+        elif (
+            not self.unsent_error_logged
+            and now - self.unsent_since >= FAILING_ERROR_AFTER
+        ):
+            self.unsent_error_logged = True
+            logger.error(
+                "Recording rows have not been written for %.0fs (%s); %d rows "
+                "waiting, from %s. Footage keeps moving to disk and is listed "
+                "once the database takes writes again",
+                now - self.unsent_since,
+                error,
+                len(rows),
+                rows[0].get(Recordings.path.name),
+            )
+
+    def report_unsent_rows(self) -> bool:
+        """At shutdown: log the rows never written. True if there are none."""
+        if not self.unsent_rows:
+            return True
+
+        logger.error(
+            "%d recording rows were not written before shutdown (oldest %s, "
+            "newest %s). The next start recovers them when "
+            "record.pipeline.reconcile_on_unclean_shutdown is on",
+            len(self.unsent_rows),
+            self.unsent_rows[0].get(Recordings.path.name),
+            self.unsent_rows[-1].get(Recordings.path.name),
+        )
+        return False
 
     def writer_available(self) -> bool:
         """Whether this pass hands its rows to the background writer.

@@ -13,13 +13,16 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from peewee import OperationalError
 from playhouse.sqlite_ext import SqliteExtDatabase
 
 from frigate.config.database import DatabaseConfig, WalCheckpointEnum
 from frigate.const import MAX_WAL_SIZE
+
+if TYPE_CHECKING:
+    from frigate.config import FrigateConfig
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,19 @@ TRUNCATE_FALLBACK_FACTOR = 4
 
 # (busy, log, checkpointed) as returned by PRAGMA wal_checkpoint
 CheckpointRow = tuple[int, int, int]
+
+
+def busy_timeout(config: "FrigateConfig") -> int:
+    """Seconds a database connection waits on a lock.
+
+    One place for the formula: the main, recording and embeddings processes'
+    connections use it, and so do the requests that wait on the main
+    process's connection (the recording writer's timeout, the request-thread
+    watchdog), so they cannot drift from it. Counts the cameras enabled in
+    the config, which do not change while Frigate runs.
+    """
+    enabled = len([c for c in config.cameras.values() if c.enabled_in_config])
+    return max(60, 10 * enabled)
 
 
 def size_pragmas(database: DatabaseConfig) -> dict[str, int]:

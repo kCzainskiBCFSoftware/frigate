@@ -57,6 +57,7 @@ from frigate.data_processing.real_time.license_plate import (
     LicensePlateRealTimeProcessor,
 )
 from frigate.data_processing.types import DataProcessorMetrics, PostProcessDataEnum
+from frigate.db.maintenance import busy_timeout
 from frigate.db.sqlitevecq import SqliteVecQueueDatabase
 from frigate.events.types import EventTypeEnum, RegenerateDescriptionEnum
 from frigate.genai import get_genai_client
@@ -118,9 +119,7 @@ class EmbeddingMaintainer(threading.Thread):
                 "journal_mode": "wal",  # required for synchronous=NORMAL to be crash-safe
                 "synchronous": "NORMAL",  # Safe when using WAL https://www.sqlite.org/pragma.html#pragma_synchronous
             },
-            timeout=max(
-                60, 10 * len([c for c in config.cameras.values() if c.enabled])
-            ),
+            timeout=busy_timeout(config),
             load_vec_extension=True,
         )
         models = [Event, Recordings, ReviewSegment, Trigger]
