@@ -112,7 +112,7 @@ check that before ticking the task.
   segment landed at 14:37:19, 73 s after the restart. Without 5.4 (the call removed from
   `stop()`), `stop()` began at 14:39:59 and the process was still alive 150 s later, with
   no new segment.
-- [ ] 9.4 On a field device (device-only, may stay open at archive with the user's OK): after a week on the new image, confirm there is no `restart` from the request-thread watchdog. Measure the old id exposure with `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);` divided by retained days and by 36^6, and record it in `ra-docs/fork-changes.md`.
+- [ ] 9.4 (Left open at archive on 2026-11-17 with the user's OK; done on the device.) On a field device (device-only, may stay open at archive with the user's OK): after a week on the new image, confirm there is no `restart` from the request-thread watchdog. Measure the old id exposure with `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);` divided by retained days and by 36^6, and record it in `ra-docs/fork-changes.md`.
 
 ## 10. Code-review fixes (2026-11-17)
 
@@ -126,7 +126,23 @@ code review").
 - [x] 10.5 `busy_timeout(config)` replaces the inline formulas in `frigate/record/record.py` and `frigate/embeddings/maintainer.py`.
 - [x] 10.6 The region-grid warning in `frigate/video.py` uses lazy `%s` logging.
 - [x] 10.7 Full backend suite in Docker with `pysqlite3-binary`: 450 tests, only the four `TestGo2rtcStreamAccess` errors. `ruff check --select E4,E7,E9,F,I --ignore E501,E711,E712 frigate/` and `ruff format --check` on the touched files are clean; mypy reports nothing in them. `openspec validate ipc-request-resilience --strict` passes.
-- [ ] 10.8 Re-run two 9.3 cases on this code in the dev container: the `RAISE(ABORT)` trigger for one camera's paths (expect its rows dropped, the other camera's rows landing, and one error per 5 minutes with a count rather than one per row), and a UI restart 20 s into a request held for 400 s on a 2-camera device (expect an exit about 60 s after the request passes the 60 s busy timeout, then recording again).
+- [x] 10.8 Re-run two 9.3 cases on this code in the dev container: the `RAISE(ABORT)` trigger for one camera's paths (expect its rows dropped, the other camera's rows landing, and one error per 5 minutes with a count rather than one per row), and a UI restart 20 s into a request held for 400 s on a 2-camera device (expect an exit about 60 s after the request passes the 60 s busy timeout, then recording again).
+
+  Run on 2026-11-17 at `ae2d0d7d1`, with the 9.3 harness (same image, two dual-stream
+  cameras, stubbed detector). Trigger held 330 s: cam1's rows stayed at 5 while its files
+  grew to 38 per stream (66 files without a row, all cam1), cam2's rows matched its files
+  throughout (20/20, 38/38), and cam1's rows landed again once the trigger was dropped.
+  Two errors in total: at 10:24:25, 8 s after the trigger ("1 more rows in the same
+  batch"), and at 10:29:35 ("1 more rows in the same batch and 60 more since the last
+  report"). No "queue is full" error and no write-failure warning.
+
+  UI restart: the hold began at 10:31:32 and `POST /restart` came at 10:31:52; `stop()`
+  began at 10:31:54. At 10:32:33 the stop monitor warned that the request had run 61 s
+  and armed the deadline; at 10:33:33 Frigate exited ("running for 121s"). The container
+  restarted 102 s after the UI restart, Frigate started at 10:33:45, and new segments
+  landed from 10:33:46. The same run at `323423a5b` (before the review fixes) armed
+  nothing at stop, since the request had run only 20 s: the process was still alive 201 s
+  after the UI restart, with no new segment.
 
 ## Workflow follow-up
 

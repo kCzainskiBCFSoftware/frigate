@@ -22,7 +22,7 @@ The writer SHALL hold `record.pipeline.db_write_queue` rows, plus at most the ro
 
 ### Requirement: Row writes are acknowledged and idempotent
 
-The main process SHALL acknowledge each batch of rows with its outcome. When the database rejects some rows' values, as a constraint, a trigger or a datatype failure does, the main process SHALL store the batch's other rows and SHALL return a successful outcome that lists each rejected row with its path and the database error. It SHALL return any other database error as a failed outcome. A database error SHALL NOT stop the main process from answering other processes' requests. Writing the same batch twice SHALL store each segment once.
+The main process SHALL acknowledge each batch of rows with its outcome. When the database rejects some rows' values, it SHALL store the other rows and return a successful outcome that lists each rejected row with its path and error. It SHALL return any other database error as a failed outcome. A database error SHALL NOT stop the main process from answering other processes' requests. Writing the same batch twice SHALL store each segment once.
 
 #### Scenario: Insert fails while the database is locked
 - **WHEN** an insert fails with "database is locked"

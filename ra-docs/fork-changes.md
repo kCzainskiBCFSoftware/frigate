@@ -684,9 +684,15 @@ the stop deadline, the process was still alive 150 s after the restart.
 The code-review fixes of 2026-11-17 (rejected rows isolated by the main
 process, throttled rejection and timeout logs, the fallback mover keeping
 unsent rows, the stop deadline watched for the whole stop and re-checked
-before it exits) are covered by unit tests only: the full suite (450 tests)
-passes in Docker apart from the four `TestGo2rtcStreamAccess` errors. The
-fault injection above ran on the earlier code.
+before it exits) pass the full suite (450 tests) in Docker apart from the four
+`TestGo2rtcStreamAccess` errors, and were fault-injected the same day (tasks
+10.8). A `RAISE(ABORT)` trigger on cam1 held for 330 s left 66 cam1 files
+without rows, kept cam2's rows equal to its files, and logged two errors: one
+8 s after the trigger and one 310 s later with "60 more since the last
+report"; no queue-full error. A UI restart 20 s into a request held for 400 s
+armed the stop deadline when the request reached 61 s and exited 60 s later;
+recording resumed 114 s after the restart. The same restart before the review
+fixes was still hung 201 s later.
 
 ### Open items
 - Other handlers' own bugs (e.g. `Event.get` for an event deleted before its

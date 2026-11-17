@@ -329,8 +329,10 @@ the log line names the variant.
 - [`[]` for a failed request reaches a caller that treats it as success] → only the
   three callers that read replies matter, and each is covered: writer, mover fallback,
   region grid.
-- [The review fixes have unit tests but no fault injection yet] → the 9.3 runs
-  exercised the earlier code. Task 10.8 re-runs the two cases whose behavior changed.
+- [The 9.3 fault injection exercised the code before the review fixes] → task 10.8
+  re-ran the two cases whose behavior changed, in the same dev container: a rejecting
+  trigger logged two errors in 5.5 min, the second with the count, and a UI restart 20 s
+  into a stuck request exited 60 s after the request passed the busy timeout.
 
 ## Migration Plan
 
