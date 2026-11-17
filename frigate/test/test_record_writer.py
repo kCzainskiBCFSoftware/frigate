@@ -417,7 +417,8 @@ class TestRejectedRows(unittest.TestCase):
         written = self.requestor.written()
         assert len(written) == 600 and not bad & set(written)
         assert len(logs.output) == 1, logs.output
-        assert "rejected 250 recording rows" in logs.output[0], logs.output
+        assert "rejected the recording row for" in logs.output[0], logs.output
+        assert "249 more rows in the same batch" in logs.output[0], logs.output
 
         # the next window: one error, with the count it did not log
         with (
@@ -429,7 +430,7 @@ class TestRejectedRows(unittest.TestCase):
             assert wait_until(lambda: writer.queue_depth() == 0)
 
         assert len(logs.output) == 1, logs.output
-        assert "350 more rows were rejected" in logs.output[0], logs.output
+        assert "350 more since the last report" in logs.output[0], logs.output
         assert writer.stop(5)
 
     def test_locked_database_is_retried_whole_with_backoff(self):

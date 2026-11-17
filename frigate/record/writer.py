@@ -184,20 +184,23 @@ class RejectedRowsLog:
             return
 
         first = rejected[0]
+        others = []
+
+        if len(rejected) > 1:
+            others.append(f"{len(rejected) - 1} more rows in the same batch")
+
+        if self.unlogged:
+            others.append(f"{self.unlogged} more since the last report")
+
         logger.error(
-            "The database rejected %d recording rows, the first for %s (camera "
-            "%s, variant %s): %s. They are dropped; their segment files stay in "
+            "The database rejected the recording row for %s (camera %s, variant "
+            "%s): %s. Rejected rows are dropped; their segment files stay in "
             "recordings%s",
-            len(rejected),
             first.get("path"),
             first.get("camera"),
             first.get("variant"),
             first.get("error"),
-            (
-                f" ({self.unlogged} more rows were rejected since the last report)"
-                if self.unlogged
-                else ""
-            ),
+            f" ({' and '.join(others)} were rejected too)" if others else "",
         )
         self.logged_at = now
         self.unlogged = 0
