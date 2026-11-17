@@ -172,6 +172,42 @@ class TestTimedRequestor(InterProcessTestBase):
         assert requestor.send_data("ping", 3) == {"pong": 3}
         assert communicator.reader_thread.is_alive()
 
+    def test_repeated_timeouts_log_one_warning_per_window(self):
+        self.communicator()
+        requestor = self.requestor(timeout=0.1)
+
+        with self.assertLogs(self.ipc.logger, "WARNING") as logs:
+            for n in range(3):
+                assert requestor.send_data("slow", n) == ""
+
+        assert len(logs.records) == 1, logs.output
+        assert "got no reply within 0.1s" in logs.output[0], logs.output
+
+        # the next window: one warning, with the count it did not log
+        with (
+            patch.object(self.ipc, "ERROR_LOG_INTERVAL", 0),
+            self.assertLogs(self.ipc.logger, "WARNING") as logs,
+        ):
+            assert requestor.send_data("slow", 3) == ""
+
+        assert len(logs.records) == 1
+        assert "2 more failed requests" in logs.output[0], logs.output
+
+        self.release.set()
+
+    def test_zmq_error_reconnects_too(self):
+        communicator = self.communicator()
+        requestor = self.requestor(timeout=1.0)
+        # e.g. a socket left closed by a reconnect that failed
+        requestor.socket.close(linger=0)
+
+        with self.assertLogs(self.ipc.logger, "WARNING") as logs:
+            assert requestor.send_data("ping", 1) == ""
+
+        assert "failed" in logs.output[0], logs.output
+        assert requestor.send_data("ping", 2) == {"pong": 2}
+        assert communicator.reader_thread.is_alive()
+
     def test_untimed_requestor_waits_for_its_reply(self):
         self.communicator()
         requestor = self.requestor(timeout=None)

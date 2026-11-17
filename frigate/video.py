@@ -919,8 +919,8 @@ def process_frames(
                 region_grid = new_grid
             else:
                 logger.warning(
-                    f"{camera_config.name}: no region grid in reply, "
-                    "keeping the current one"
+                    "%s: no region grid in reply, keeping the current one",
+                    camera_config.name,
                 )
 
             next_region_update = get_tomorrow_at_time(2)

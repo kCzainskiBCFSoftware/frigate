@@ -162,9 +162,10 @@ class InterProcessCommunicator(Communicator):
 class InterProcessRequestor:
     """Simplifies sending data to InterProcessCommunicator and getting a reply.
 
-    With ``timeout`` (seconds, fork), a request that gets no reply in time
-    returns ``""`` and the requestor reconnects, so its next request is sent
-    and answered normally. Without one, a request waits for its reply as
+    With ``timeout`` (seconds, fork), a request that gets no reply in time, or
+    fails on a ZMQ error, returns ``""`` and the requestor reconnects, so its
+    next request is sent and answered normally; it logs one warning per
+    ``ERROR_LOG_INTERVAL``. Without one, a request waits for its reply as
     upstream does.
     """
 
@@ -172,6 +173,9 @@ class InterProcessRequestor:
         self.timeout = timeout
         self.context = zmq.Context()
         self.socket = self._connect()
+        # monotonic time of the last logged failure, and failures since
+        self._failure_logged_at: Optional[float] = None
+        self._failures_unlogged = 0
 
     def _connect(self) -> zmq.Socket:
         socket = self.context.socket(zmq.REQ)
@@ -189,18 +193,41 @@ class InterProcessRequestor:
         try:
             self.socket.send_json((topic, data))
             return self.socket.recv_json()
-        except zmq.Again:
+        except zmq.ZMQError as e:
             if self.timeout is not None:
-                logger.warning(
-                    "No reply to inter-process request %s within %ss; reconnecting",
-                    topic,
-                    self.timeout,
-                )
+                # a REQ socket that missed its reply, or failed mid-request,
+                # refuses every later send: the next request needs a new one
+                self._log_failure(topic, e)
                 self._reconnect()
 
             return ""
-        except zmq.ZMQError:
-            return ""
+
+    def _log_failure(self, topic: str, error: zmq.ZMQError) -> None:
+        now = time.monotonic()
+
+        if (
+            self._failure_logged_at is not None
+            and now - self._failure_logged_at < ERROR_LOG_INTERVAL
+        ):
+            self._failures_unlogged += 1
+            return
+
+        logger.warning(
+            "Inter-process request %s %s; reconnecting%s",
+            topic,
+            (
+                f"got no reply within {self.timeout}s"
+                if isinstance(error, zmq.Again)
+                else f"failed ({error})"
+            ),
+            (
+                f" ({self._failures_unlogged} more failed requests were not logged)"
+                if self._failures_unlogged
+                else ""
+            ),
+        )
+        self._failure_logged_at = now
+        self._failures_unlogged = 0
 
     def _reconnect(self) -> None:
         """A new REQ socket: one that missed its reply refuses every later send."""
@@ -212,8 +239,8 @@ class InterProcessRequestor:
         try:
             self.socket = self._connect()
         except zmq.ZMQError:
-            # the closed socket fails each send with "", so callers that
-            # replace their requestor on "no reply" still recover
+            # the closed socket fails the next send with a ZMQ error, which
+            # tries again
             logger.exception("Could not reconnect an inter-process requestor")
 
     def stop(self) -> None:

@@ -64,8 +64,8 @@ breaks; the existing `zmq.ZMQError → break` of the inner drain loop stays as i
 
 **Reply value on failure: `[]`**, the value the server already sends for every handler
 that returns `None`. Fire-and-forget callers ignore it. The writer and the mover fallback
-see a non-dict, which they already treat as "no reply": they reconnect and retry, and the
-retry is idempotent. The region-grid caller is the only one that indexes the reply, so it
+see a non-dict, which they treat as "no reply": the writer retries the batch and the
+mover keeps it for its next pass, and the retry is idempotent. The region-grid caller is the only one that indexes the reply, so it
 gets the guard in Decision 6. *Alternative:* an `{"ok": false, "error": …}` dict. It is
 more informative, but `video.py` would index a dict as a grid, and every fire-and-forget
 caller would need auditing for a new reply shape. Rejected.
@@ -125,22 +125,43 @@ process. It is the same action the watchdog already takes for a dead detector.
   API, MQTT, a dead detector and a plain stop all end in `stop()`, so one call covers them.
   The threshold is the busy timeout, not the watchdog's `max(600, 2 × busy_timeout)`.
   Frigate is already stopping, and a request that waits on the database gives up after
-  the busy timeout, so one running longer is not about to answer. A stop that begins
-  with the thread idle, or within the busy timeout, arms nothing, so a slow but healthy
-  stop is never cut short. The timer is armed once: a watchdog restart has already
-  armed it before its own stop begins.
+  the busy timeout, so one running longer is not about to answer. The timer is armed
+  once: a watchdog restart has already armed it before its own stop begins.
+- **The whole stop is watched (refined after code review):** a single check when
+  `stop()` begins missed a request that was still within the busy timeout then and never
+  finished, and a reader that died during the stop; both hung until s6's kill. So
+  `arm_stop_deadline()` checks at once, then a daemon `stop_deadline_monitor` thread
+  checks every `STOP_CHECK_INTERVAL` (1 s) until `stop()` has stopped the reader itself
+  (the communicator's stop event is set and the reader has ended). A stop whose thread
+  never meets either condition arms nothing, so a slow but healthy stop is never cut
+  short.
+- **The timer checks again before it exits:** `_exit_now()` exits only if the thread is
+  still dead or still busy past the busy timeout (`request_thread_problem()`). If the
+  request finished, or `stop()` has stopped the thread, nothing waits on it any more:
+  the timer logs that and stands down, and a later wedge can arm it again. This keeps a
+  slow request that finishes just after the busy timeout from ending a healthy stop, and
+  a stop that completed from ending with `os._exit(1)` during interpreter teardown.
+  *Alternative:* cancel the timer at the end of `stop()`. Rejected: it leaves the race
+  with a timer firing just before, and does nothing for a request that finished
+  mid-stop.
 
 ### 4. Requestor timeout: opt-in, reconnect inside the requestor
 
 The constructor becomes `InterProcessRequestor(timeout: Optional[float] = None)`. With a
 timeout:
 - set `RCVTIMEO` and `SNDTIMEO` (in ms) on the REQ socket;
-- on `zmq.Again`, close it with `linger=0`, open and connect a fresh REQ socket, log a
-  warning with the topic, and return `""`.
+- on any `zmq.ZMQError` (a timeout raises `zmq.Again`), close it with `linger=0`, open
+  and connect a fresh REQ socket, and return `""`;
+- log a warning with the topic at most once per `ERROR_LOG_INTERVAL` (5 min) per
+  requestor, with the number of failures not logged since. A writer retrying through a
+  long outage would otherwise log one warning per retry.
 
-A REQ socket that missed its reply refuses every later send (EFSM), which is why the
-socket is recreated inside the requestor. The writer's `_replace_requestor` stays as a
-second line of defence.
+A REQ socket that missed its reply, or failed mid-request, refuses every later send
+(EFSM), which is why the socket is recreated inside the requestor. A reconnect that
+fails leaves a closed socket, whose next send fails with a ZMQ error and reconnects
+again. *Refined after code review:* the writer's `_replace_requestor`, which built a
+second requestor after the first had already reconnected, is removed; reconnecting is
+the requestor's job alone.
 
 *Alternative:* `ZMQ_REQ_RELAXED` with `ZMQ_REQ_CORRELATE`. It avoids the new socket, but
 it changes how stale replies are matched, and every reconnect path already exists.
@@ -152,20 +173,35 @@ Rejected.
 blocking fallback. When the timeout is shorter than a real stall, the batch is sent twice,
 and `DO NOTHING` makes the second send a no-op. The busy-timeout formula moves from
 inline `frigate/app.py` code into `frigate/db/maintenance.py` as
-`busy_timeout(config) -> int`, used by `bind_database`, the recording process, and the
-watchdog, so the three values cannot drift apart.
+`busy_timeout(config) -> int`. It is used by `bind_database`, by the recording and
+embeddings processes' own connections (which had their own inline copies counting
+`enabled` cameras, the same set at start), by the row-request timeout, and by the
+watchdog, so the values cannot drift apart.
 
-**Mover fallback (`maintainer.py`, blocking path):** a non-dict reply is now logged as an
-error with the batch size and its first and last path. Rows of that batch are not
-retried; this is the degraded path, used only when the writer thread has died. The files
-stay on disk and the existing reconcile and sync rules apply to them.
+**Mover fallback (`maintainer.py`, blocking path, refined after code review):** this path
+runs when `async_db_writes` is off, upstream's mode, or when the writer thread has died.
+The first draft logged and dropped a batch that got no reply. That lost rows upstream
+would have written, since upstream waits for the reply: the files stayed on disk with no
+row, never listed, and never expired by retention while `sync_recordings` is off (its
+default). It also kept sending the pass's later batches, each waiting a full timeout. Now
+`send_rows()` keeps every row of the first batch that is not written (no reply, a ZMQ
+error, `[]` or `ok: false`) and every later row in `unsent_rows`, stops that pass's
+requests, and sends the kept rows first on the next pass. A main process that stops
+answering therefore costs one request timeout per pass. The kept rows are capped at
+`record.pipeline.db_write_queue`; past it the oldest are dropped with one error per
+outage naming their paths. Logging follows the writer: a warning when failures start, an
+error after `FAILING_ERROR_AFTER` (60 s), an info message on recovery. A pass with no
+rows sends no request; upstream sent an empty one. At shutdown, `report_unsent_rows()`
+logs what is still kept, and `RecordProcess` then writes no clean-shutdown marker, so
+reconcile finds those files at the next start. *Alternative:* hold segments in the cache
+while rows are unsent, as the writer's full queue does. Rejected: the blocking path has
+no queue to measure, and moving the files keeps them safe from the cache limits.
 
-### 5. Rejected vs. retried failures; splitting in the writer
+### 5. Rejected vs. retried failures; rejected rows found by the handler
 
-`insert_recording_rows` returns `{"ok": False, "error": str, "rejected": bool}`, where
-`rejected` is `isinstance(e, (peewee.IntegrityError, peewee.DataError))`. That covers
-NOT NULL, CHECK, a trigger's `RAISE(ABORT)`, and datatype errors: failures caused by the
-rows' values. Everything else is retried whole, as today:
+A failure caused by the rows' values is a `peewee.IntegrityError` or `peewee.DataError`:
+NOT NULL, CHECK, a trigger's `RAISE(ABORT)`, and datatype errors. Everything else is
+retried whole, as today:
 - `OperationalError`: locked, busy, I/O error, disk full, or a missing column after a
   bad migration;
 - `ResultTimeout`;
@@ -174,26 +210,36 @@ rows' values. Everything else is retried whole, as today:
 
 These are not row-specific. Splitting would drop every row one by one while the files
 keep accumulating with no rows. Holding them in the queue keeps them recoverable once the
-cause is fixed. A reply without `rejected` (an older main process, or the `[]` from
-Decision 1) is treated as not rejected.
+cause is fixed.
 
-**Writer:** on a rejected batch of n > 1 rows, the next send takes the first `n // 2`
-rows, with no backoff because the database is healthy. A rejected batch of one row is
-popped and logged at error level with `path`, `camera`, `variant` and the error.
-`failing_since` and its warning and error logs are not triggered by a rejection, which is
-not an outage.
+**Handler (refined after code review):** when the batch insert raises `IntegrityError` or
+`DataError`, `insert_recording_rows` inserts the same rows one at a time in the same
+request (`_insert_each()`), each with `ON CONFLICT DO NOTHING`. It replies
+`{"ok": True, "count": <stored>, "rejected": [{path, camera, variant, error}, ...]}`, with
+`rejected` present only when a row was refused, and calls `note_late_rows` with the stored
+rows only. If a row fails for any other reason during that pass, the reply is
+`{"ok": False, "error": ...}` and the caller retries the whole batch; rows already stored
+are ignored then. Any other failure of the batch insert is `{"ok": False, "error": ...}`
+too. The per-row pass runs only on a rejection, so a real outage is never split.
 
-*Refined during implementation:* the writer remembers how many rows at the front of the
-queue are known to hold the rejected row (`suspect`). While that range is open, a
-successful send does not double the limit; the next send takes half of the rest of the
-range, which is a plain binary search. Once the row is dropped, the limit starts at 1 and
-doubles back toward `BATCH_ROWS` on each success. Doubling on every success, as first
-drafted, re-sends the known-bad range and costs up to 33 requests for one bad row in 500,
-over the spec test's bound of 25. The refined rule costs at most 20 for one bad row, and
-about one request per row when every row is bad.
+**Writer and mover fallback:** a successful reply's `rejected` rows are dropped, since
+the rest of the batch is stored, and their files stay in recordings. `RejectedRowsLog`
+logs them at error level at most once per `REJECTED_LOG_INTERVAL` (5 min): the first
+row's `path`, `camera`, `variant` and error, plus how many rows were rejected since the
+previous report (each row also at debug). A constraint that refuses every row therefore
+logs a line per 5 minutes, not one per segment. `failing_since` and its warning and error
+logs are not triggered by a rejection, which is not an outage. The writer sends
+`BATCH_ROWS` at a time as in v0.17.4.
 
-*Alternative:* insert row by row after any failure. That is simpler, but it costs 500
-requests per bad batch, and it would split and drop rows during real outages. Rejected.
+*Alternative:* split rejected batches in the writer, a binary search over the rows known
+to hold the bad one. That was the first implementation. Rejected after code review: it
+cost up to 20 requests for one bad row in 500, kept a state machine (`suspect`,
+`batch_limit`) across writer iterations, and did nothing for the mover's blocking path,
+which dropped the whole batch. Isolating in the handler costs one request, and up to one
+single-row insert per row of that batch on the main process's request thread.
+
+*Alternative:* insert row by row after any failure. It would split and drop rows during
+real outages. Rejected.
 
 ### 6. Region grid keeps the current grid
 
@@ -219,8 +265,8 @@ Both are rejected. `DO NOTHING` stays untargeted, because it still absorbs re-se
 batches.
 
 The variant dimension does not otherwise touch this design. Rows of both variants share
-one queue and one batch, and splitting, logging and dropping are per row, so the log line
-names the variant.
+one queue and one batch, and finding, logging and dropping a rejected row are per row, so
+the log line names the variant.
 
 ## Risks / Trade-offs
 
@@ -239,19 +285,32 @@ names the variant.
   deadline, `stop()` never finished; with it, recording resumed about 83 s after the
   thread died.
 - [A restart from the UI, the API, MQTT or a dead detector while the request thread is
-  dead or stuck] → its `stop()` arms the exit deadline when the thread is dead or one
-  request has run longer than the busy timeout (Decision 3). Since
+  dead or stuck] → its `stop()` arms the exit deadline once the thread is dead or one
+  request has run longer than the busy timeout, whether at the start of the stop or
+  during it (Decision 3). Since
   `confirmed-ui-restart`, the UI's Restart sends `POST /api/restart`, which calls
   `restart_frigate()` 1 s later, and the dialog waits for Frigate to answer again.
   In the dev container, a UI restart 75 s into a stuck request was back and recording
   73 s later. Without the call in `stop()`, the process was still alive after 150 s.
   Arming the deadline on every restart was rejected because it would cut short a slow
   but healthy stop.
-- [A stuck request younger than the busy timeout when a restart begins arms nothing] →
-  that stop can still hang until s6's 120 s `timeout-kill`, as upstream. The watchdog
-  catches such a request itself once it passes `max(600, 2 × busy_timeout)`, if Frigate
-  is not already stopping. The UI shows its slow-start notice only after 6 minutes down,
-  which covers either path.
+- [A request that gets stuck early in a stop arms the deadline only once it passes the
+  busy timeout] → that stop exits up to busy timeout + 60 s after the request began,
+  which can still exceed s6's 120 s `timeout-kill` on a large device; s6 then ends it, as
+  upstream. A stop that hangs for a reason other than the request thread is not bounded
+  here either. The UI shows its slow-start notice only after 6 minutes down, which
+  covers both.
+- [A slow request that finishes after the deadline is armed] → the timer checks again
+  before it exits and stands down, so the stop goes on. A stop whose request thread
+  keeps answering slowly, each request past the busy timeout, re-arms after each one,
+  and s6's kill remains the bound.
+- [The handler's row-by-row pass holds the request thread] → it runs only for a batch
+  the database rejects: up to `BATCH_ROWS` single-row inserts, each through the write
+  queue, typically well under a few seconds. Other processes' requests wait that long.
+- [Rows the blocking request keeps live only in the recording process's memory] → a
+  crash loses them, but the shutdown is then unclean and reconcile recovers their files
+  within `reconcile_window` (2 h). A clean stop with kept rows is treated as unclean for
+  the same reason.
 - [The restart relies on a supervisor bringing Frigate back] → under s6 the whole
   container stops, and only the container's restart policy (`restart: always` or
   `unless-stopped`) starts it again. The dead-detector restart has the same dependency.
@@ -270,6 +329,8 @@ names the variant.
 - [`[]` for a failed request reaches a caller that treats it as success] → only the
   three callers that read replies matter, and each is covered: writer, mover fallback,
   region grid.
+- [The review fixes have unit tests but no fault injection yet] → the 9.3 runs
+  exercised the earlier code. Task 10.8 re-runs the two cases whose behavior changed.
 
 ## Migration Plan
 

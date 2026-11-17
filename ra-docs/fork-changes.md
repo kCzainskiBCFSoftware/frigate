@@ -567,9 +567,11 @@ which filled the queue and stopped every camera.
 - `busy` holds `(topic, monotonic start)` while a request is handled and `None`
   otherwise, assigned as one tuple so the watchdog reads it without a lock.
 - `InterProcessRequestor(timeout=None)`: with a timeout, `RCVTIMEO`/`SNDTIMEO`
-  are set; on `zmq.Again` the REQ socket is closed with `linger=0`, a new one is
-  connected, a warning names the topic, and `""` is returned. Without a timeout
-  nothing changes. `stop()` closes a timed socket with `linger=0`.
+  are set; on any ZMQ error (a timeout is `zmq.Again`) the REQ socket is closed
+  with `linger=0`, a new one is connected, and `""` is returned. A warning names
+  the topic at most once per `ERROR_LOG_INTERVAL`, with the count of failures
+  not logged since. Without a timeout nothing changes. `stop()` closes a timed
+  socket with `linger=0`.
 
 ### Watchdog (`frigate/watchdog.py`, `frigate/app.py`)
 - `FrigateWatchdog(..., inter_process=None, busy_timeout=None)`; the loop body
@@ -579,45 +581,70 @@ which filled the queue and stopped every camera.
   topic and duration and calls `restart_frigate()` once. Skipped when the app's
   or the communicator's stop event is set.
 - That restart also arms a daemon `threading.Timer`: if the process is still
-  alive `RESTART_EXIT_DEADLINE` (60 s) later, it logs an error and calls
-  `os._exit(1)`. Without it, `FrigateApp.stop()` waited forever on
+  alive `RESTART_EXIT_DEADLINE` (60 s) later and the request thread is still
+  dead or stuck (`request_thread_problem()`), it logs an error and calls
+  `os._exit(1)`. If the thread answers again, or `stop()` has stopped it, the
+  timer logs that and lets the stop go on, and a later wedge can arm it again;
+  so a stop that completed never exits 1. Without the timer,
+  `FrigateApp.stop()` waited forever on
   `stats_emitter.join()` or `detected_frames_processor.join()`, threads blocked
   in an untimed request to the dead thread, until s6's 120 s `timeout-kill`.
   That is the 2-minute gap with no API and no logs seen after a UI restart on
   0.17.3. The dead-detector restart arms no timer itself. Either restart needs
   the container's restart policy to bring Frigate back.
 - `FrigateApp.stop()` first calls `FrigateWatchdog.arm_stop_deadline()`. It
-  logs a warning and arms the same timer when the reader thread is dead, or one
-  request has run longer than the busy timeout (not the restart limit). Every
-  restart ends in `stop()`: the UI's `POST /api/restart`, the API, MQTT, a dead
-  detector, and a plain stop. A stop that begins with the thread idle, or
-  within the busy timeout, arms nothing, so a slow but healthy stop is not cut
-  short. A timer a watchdog restart already armed is kept.
+  checks the request thread at once, then every `STOP_CHECK_INTERVAL` (1 s) on
+  a daemon `stop_deadline_monitor` thread until `stop()` has stopped the
+  reader. It logs a warning and arms the same timer once the reader thread is
+  dead, or one request has run longer than the busy timeout (not the restart
+  limit), including a request that crosses it, or a reader that dies, while the
+  stop is under way. Every restart ends in `stop()`: the UI's
+  `POST /api/restart`, the API, MQTT, a dead detector, and a plain stop. A stop
+  whose thread never meets either condition arms nothing, so a slow but healthy
+  stop is not cut short. A timer a watchdog restart already armed is kept.
 - `FrigateApp.start_watchdog()` passes the communicator and the busy timeout.
 
 ### Shared busy timeout (`frigate/db/maintenance.py`)
 - `busy_timeout(config)` = `max(60, 10 × cameras enabled in config)`, used by
-  `FrigateApp.bind_database`, the watchdog, and the row-request timeout. The
-  recording process's own connection keeps its inline formula.
+  `FrigateApp.bind_database`, the recording and embeddings processes' own
+  connections (`frigate/record/record.py`, `frigate/embeddings/maintainer.py`),
+  the watchdog, and the row-request timeout. Those two processes used to count
+  `enabled` cameras inline; it is the same set when they start.
 
 ### Row writes (`frigate/record/writer.py`, `frigate/record/maintainer.py`)
-- `insert_recording_rows` adds `rejected` to a failed outcome:
-  `True` for `peewee.IntegrityError`/`DataError` (NOT NULL, CHECK, a trigger's
-  `RAISE(ABORT)`, datatype), `False` for everything else (locked, busy, I/O,
-  timeout, corruption).
-- `RecordingsWriter` isolates rejected rows: a rejected batch of n > 1 rows
-  becomes the `suspect` range and the next send takes its first half, with no
-  backoff; while the range is open, each success halves the rest (a binary
-  search), and a rejected single row is popped and logged at error level with
-  its path, camera, variant and error. The batch limit then doubles back from 1
-  toward `BATCH_ROWS`. One bad row in 500 costs at most 20 sends. A rejection
-  neither starts nor advances `failing_since`. Other failures keep the
-  whole-batch retry with backoff.
+- `insert_recording_rows` isolates rejected rows itself, in the same request:
+  when the batch insert raises `peewee.IntegrityError`/`DataError` (NOT NULL,
+  CHECK, a trigger's `RAISE(ABORT)`, datatype), `_insert_each()` inserts the
+  rows one at a time. The reply is `{"ok": true, "count": <stored>}`, plus
+  `rejected: [{path, camera, variant, error}]` when any row was refused. Any
+  other failure, of the batch or during the row-by-row pass (locked, busy, I/O,
+  timeout, corruption), is `{"ok": false, "error"}` and the caller retries the
+  whole batch; rows already stored are ignored then. `note_late_rows` gets only
+  the stored rows.
+- `RejectedRowsLog` logs rejected rows at error level at most once per
+  `REJECTED_LOG_INTERVAL` (5 min): the first row's path, camera, variant and
+  error, and how many more were rejected since the last report (each at debug).
+  The writer and the mover's blocking request each keep one. A rejection is
+  not an outage: it neither starts nor advances `failing_since`.
+- `RecordingsWriter` sends `BATCH_ROWS` at a time and retries every failure
+  whole with backoff, as in v0.17.4. It no longer replaces its requestor after
+  a missing reply: the timed requestor reconnects by itself.
 - Segment-row requests time out after `row_request_timeout(config)` =
   busy timeout + `REPLY_MARGIN` (30 s): the writer's default requestor factory
-  (`timed_requestor_factory`) and the mover's `self.requestor`. The mover's
-  blocking request now logs an error with the batch size and its first and last
-  path on no reply, as well as on `ok: false`; it does not retry that batch.
+  (`timed_requestor_factory`) and the mover's `self.requestor`.
+- The mover's blocking request (`async_db_writes: false`, or a writer thread
+  that has died) keeps the rows it could not write in `unsent_rows` and sends
+  them first on the next pass (`send_rows()`). The first batch that gets no
+  reply, a ZMQ error, `[]` or `ok: false` ends the pass's sends, so an
+  unresponsive main process costs one request timeout per pass, not one per
+  batch. At most `record.pipeline.db_write_queue` rows are kept; past that the
+  oldest are dropped with one error per outage naming their paths, and their
+  files stay in recordings. It logs a warning when writes start failing, an
+  error after `FAILING_ERROR_AFTER` (60 s), and an info message when they
+  succeed again. A pass with no rows sends no request. At shutdown,
+  `report_unsent_rows()` logs any rows still unsent, and the recording process
+  then leaves no clean-shutdown marker, so the next start's reconcile finds
+  their files.
 
 ### Row ids (`frigate/record/util.py`)
 - `recording_row` uses a 12-character random suffix (upstream: 6); the longest
@@ -634,9 +661,11 @@ Low conflict risk: `frigate/comms/inter_process.py` and `frigate/watchdog.py`
 (small files upstream rarely changes; `watchdog.py`'s loop body moved into
 `check()`), `frigate/app.py` (`bind_database` timeout, `start_watchdog`, and
 one call at the top of `stop()`), `frigate/video.py` (the region-grid refresh,
-a few lines). Fork files:
+a few lines), `frigate/embeddings/maintainer.py` (its database timeout, one
+call). Fork files:
 `frigate/db/maintenance.py`, `frigate/record/writer.py`,
-`frigate/record/maintainer.py`, `frigate/record/util.py`.
+`frigate/record/maintainer.py`, `frigate/record/record.py`,
+`frigate/record/util.py`.
 
 ### Verification
 Fault injection on 2026-11-12, with two dual-stream cameras recording looped test
@@ -652,16 +681,24 @@ a request held past the 60 s busy timeout exited on the stop deadline 60 s
 after `stop()` began, and recording resumed 73 s after the restart. Without
 the stop deadline, the process was still alive 150 s after the restart.
 
+The code-review fixes of 2026-11-17 (rejected rows isolated by the main
+process, throttled rejection and timeout logs, the fallback mover keeping
+unsent rows, the stop deadline watched for the whole stop and re-checked
+before it exits) are covered by unit tests only: the full suite (450 tests)
+passes in Docker apart from the four `TestGo2rtcStreamAccess` errors. The
+fault injection above ran on the earlier code.
+
 ### Open items
 - Other handlers' own bugs (e.g. `Event.get` for an event deleted before its
   description arrived) are now logged per topic instead of fatal; each is still
   a bug to fix on its own.
 - The watchdog's restarts and the per-topic failure counts are not exposed in
   `/api/stats`, so fleet monitoring cannot alert on them yet.
-- A restart that begins while a stuck request is still younger than the busy
-  timeout arms no exit deadline, so its stop can still hang until s6's 120 s
-  `timeout-kill`, as upstream. The UI copes: it waits for Frigate to come
-  back, and shows its slow-start notice only after 6 minutes down.
+- A stop that hangs for a reason other than the request thread still ends only
+  at s6's 120 s `timeout-kill`, as upstream; so does a stuck request in the
+  first busy timeout of a stop, until it crosses it. The UI copes: it waits
+  for Frigate to come back, and shows its slow-start notice only after 6
+  minutes down.
 - 9.4 (device-only): after a week on the new image, confirm no request-thread
   restart, and record the old id exposure measured with
   `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);`
@@ -876,7 +913,9 @@ back to English for the new strings.
   another requestor is answered; an unencodable reply gets `[]`; 50 failures of
   one topic log one traceback and the next window reports 49; `busy` during and
   after a slow handler; malformed requests; a timed requestor returns `""` within
-  its timeout and its next request is answered on a new connection.
+  its timeout and its next request is answered on a new connection; repeated
+  timeouts log one warning per window with the count; a ZMQ error other than a
+  timeout (a closed socket) reconnects too.
 - **`frigate/test/test_watchdog.py`** (new) — dead reader → one restart, a 641 s
   request at busy timeout 320 → restart naming the topic, 300 s and the 600 s
   floor → none, no restart while stopping, the upstream signature, and the exit
@@ -886,15 +925,25 @@ back to English for the new strings.
   the deadline exits without a second restart. Idle, 30 s, a stopped
   communicator or no `inter_process` arm nothing. A watchdog restart's timer is
   kept with no second warning, and `FrigateApp.stop()` arms it before it sets
-  the stop event.
-- **`frigate/test/test_record_writer.py`** — rejected vs locked outcomes with a
-  real database (a `RAISE(ABORT)` trigger, a held `BEGIN IMMEDIATE`), one bad
-  row in 500 (499 written, one error, < 25 sends), two bad rows far apart, locked
-  batches never split, `has_room()` while isolating, the requestor timeout, an
+  the stop event. During a stop, a request that crosses the busy timeout or a
+  reader that dies arms it; a thread that answers again, or one `stop()` has
+  stopped, makes the timer stand down instead of exiting.
+- **`frigate/test/test_record_writer.py`** — with a real database, a held
+  `BEGIN IMMEDIATE` gives a failed outcome, and a `RAISE(ABORT)` trigger stores
+  the other rows of the batch and lists the refused one (late rows noted for
+  the stored rows only); one bad row in 500 (499 written, one error, one
+  request); rejections log one error per window with the count; locked batches
+  retried whole with backoff; `has_room()` while a bad row is dropped; a
+  missing reply retried on the same requestor; the requestor timeout; an
   integration test where the main process answers past the writer's timeout
-  (batch stored once, queue drained), and 64 distinct 12-character ids.
-- **`frigate/test/test_maintainer.py`** — the mover's timed requestor, and its
-  blocking request logging a missing reply with the batch size and paths.
+  (batch stored once, queue drained); and 64 distinct 12-character ids.
+- **`frigate/test/test_maintainer.py`** — the mover's timed requestor; its
+  blocking request keeping rows with no reply for the next pass, ending a pass
+  at the first failed batch, keeping only the rest after a later batch fails,
+  capping kept rows at `db_write_queue`, reporting unsent rows at shutdown,
+  logging nothing on success, sending nothing without rows, and logging
+  rejected rows from the reply. The mover tests' requestor answers like the
+  main process, so they no longer log spurious write failures.
 - **`frigate/test/test_video.py`** — an empty or missing region-grid reply keeps
   the grid `process_frames` started with.
 - **`frigate/test/test_db_maintenance.py`** — `busy_timeout()` for 3, 32 and

@@ -191,7 +191,15 @@ class MoverTestBase(unittest.IsolatedAsyncioTestCase):
                 },
             }
         )
-        return RecordingMaintainer(config, MagicMock())
+        maintainer = RecordingMaintainer(config, MagicMock())
+        # the blocking row request answers like the main process: without
+        # this, the mocked module's reply reads as "no reply" on every pass
+        maintainer.requestor = MagicMock()
+        maintainer.requestor.send_data.side_effect = lambda topic, rows: {
+            "ok": True,
+            "count": len(rows),
+        }
+        return maintainer
 
     def add_segment(
         self, age: float, variant: str = "main", size: int = 1000
@@ -794,42 +802,142 @@ class TestWriterHandOff(MoverTestBase):
         # the rows it held were handed over, so the stop counts as clean
         assert writer.stop(1)
 
-    async def test_blocking_request_without_reply_is_logged(self):
-        maintainer = self.make_maintainer()
+    async def test_rows_without_reply_are_sent_again_next_pass(self):
+        maintainer = self.make_maintainer(async_db_writes=False)
         # the timed request got no reply from the main process
-        maintainer.requestor = MagicMock()
+        maintainer.requestor.send_data.side_effect = None
         maintainer.requestor.send_data.return_value = ""
-
-        def gone():
-            raise SystemExit
-
-        writer = RecordingsWriter(
-            maintainer.config, requestor_factory=gone, publisher_factory=MagicMock
-        )
-        writer.start()
-        writer.join(5)
-        maintainer.writer = writer
-        maintainer.writer_down_logged = True
 
         for i in range(2):
             self.add_segment(age=130 - i * 10)
 
-        with self.assertLogs("frigate.record.maintainer", "ERROR") as logs:
+        with self.assertLogs("frigate.record.maintainer", "WARNING") as logs:
             await maintainer.move_files()
 
-        line = logs.output[-1]
-        assert "Failed to write 2 recording rows" in line, logs.output
-        assert "no reply" in line, line
-        # the batch's first and last path: the files stay in recordings
-        moved = self.recorded_files()
-        assert len(moved) == 2
-        assert all(path in line for path in moved), line
+        assert "no reply" in logs.output[-1], logs.output
+        assert "sent again on the next pass" in logs.output[-1], logs.output
+        # the files are in recordings, and their rows wait for the next pass
+        assert len(self.recorded_files()) == 2
+        assert len(maintainer.unsent_rows) == 2
 
-        # the next pass is not held up
+        # it answers again: the next pass sends the kept rows first
         maintainer.requestor.send_data.return_value = {"ok": True}
         self.add_segment(age=100)
+
+        with self.assertLogs("frigate.record.maintainer", "INFO") as logs:
+            await maintainer.move_files()
+
+        assert "written again" in logs.output[-1], logs.output
+        topic, rows = maintainer.requestor.send_data.call_args.args
+        assert topic == INSERT_MANY_RECORDINGS
+        assert len(rows) == 3
+        assert maintainer.unsent_rows == []
+        assert maintainer.report_unsent_rows()
+
+    async def test_first_failed_batch_ends_the_pass(self):
+        # e.g. the rows a dead writer held: three batches of up to 500
+        maintainer = self.make_maintainer()
+        maintainer.requestor.send_data.side_effect = None
+        maintainer.requestor.send_data.return_value = ""
+        rows = [{"path": f"/r/{n}.mp4"} for n in range(1200)]
+
+        with self.assertLogs("frigate.record.maintainer", "WARNING"):
+            maintainer.send_rows(rows)
+
+        # one request timeout per pass, not one per batch
+        assert maintainer.requestor.send_data.call_count == 1
+        assert maintainer.unsent_rows == rows
+
+    async def test_failure_after_written_batches_keeps_only_the_rest(self):
+        maintainer = self.make_maintainer()
+        replies = iter([{"ok": True, "count": 500}, {"ok": False, "error": "locked"}])
+        maintainer.requestor.send_data.side_effect = lambda topic, rows: next(replies)
+        rows = [{"path": f"/r/{n}.mp4"} for n in range(1200)]
+
+        with self.assertLogs("frigate.record.maintainer", "WARNING") as logs:
+            maintainer.send_rows(rows)
+
+        assert "locked" in logs.output[-1], logs.output
+        assert maintainer.unsent_rows == rows[500:]
+
+    async def test_unsent_rows_are_capped_at_the_write_queue(self):
+        maintainer = self.make_maintainer(db_write_queue=3)
+        maintainer.requestor.send_data.side_effect = None
+        maintainer.requestor.send_data.return_value = ""
+        rows = [{"path": f"/r/{n}.mp4"} for n in range(5)]
+
+        with self.assertLogs("frigate.record.maintainer", "WARNING") as logs:
+            maintainer.send_rows(rows)
+
+        # the oldest are dropped, and their files named
+        errors = [line for line in logs.output if line.startswith("ERROR")]
+        assert len(errors) == 1 and "Dropped 2 recording rows" in errors[0], errors
+        assert "/r/0.mp4" in errors[0] and "/r/1.mp4" in errors[0]
+        assert maintainer.unsent_rows == rows[2:]
+
+        # still failing: the next drop is not logged again
+        with self.assertNoLogs("frigate.record.maintainer", "ERROR"):
+            maintainer.send_rows([{"path": "/r/5.mp4"}])
+
+        assert [r["path"] for r in maintainer.unsent_rows] == [
+            "/r/3.mp4",
+            "/r/4.mp4",
+            "/r/5.mp4",
+        ]
+
+    async def test_unsent_rows_at_shutdown_are_reported(self):
+        maintainer = self.make_maintainer()
+        maintainer.unsent_rows = [{"path": "/r/0.mp4"}, {"path": "/r/1.mp4"}]
+
+        with self.assertLogs("frigate.record.maintainer", "ERROR") as logs:
+            # the recording process then leaves no clean-shutdown marker
+            assert not maintainer.report_unsent_rows()
+
+        assert "2 recording rows were not written" in logs.output[0]
+        assert "/r/0.mp4" in logs.output[0] and "/r/1.mp4" in logs.output[0]
+
+    async def test_successful_blocking_request_logs_nothing(self):
+        maintainer = self.make_maintainer(async_db_writes=False)
+        # frames processed past the segments: no processing-lag warning either
+        self.process_frames_until(maintainer, time.time())
+
+        for i in range(2):
+            self.add_segment(age=120 + i * 10)
+
+        with self.assertNoLogs("frigate.record.maintainer", "WARNING"):
+            await maintainer.move_files()
+
+        assert maintainer.requestor.send_data.call_count == 1
+        assert maintainer.unsent_rows == []
+
+    async def test_no_request_without_rows(self):
+        maintainer = self.make_maintainer(async_db_writes=False)
+
         await maintainer.move_files()
-        assert len(self.recorded_files()) == 3
+
+        maintainer.requestor.send_data.assert_not_called()
+
+    async def test_rejected_rows_in_the_reply_are_logged_not_kept(self):
+        maintainer = self.make_maintainer()
+        maintainer.requestor.send_data.side_effect = None
+        maintainer.requestor.send_data.return_value = {
+            "ok": True,
+            "count": 1,
+            "rejected": [
+                {
+                    "path": "/r/1.mp4",
+                    "camera": self.CAMERA,
+                    "variant": "main",
+                    "error": "CHECK constraint failed: recordings",
+                }
+            ],
+        }
+
+        with self.assertLogs("frigate.record.writer", "ERROR") as logs:
+            maintainer.send_rows([{"path": "/r/0.mp4"}, {"path": "/r/1.mp4"}])
+
+        assert "/r/1.mp4" in logs.output[0] and "CHECK" in logs.output[0]
+        assert maintainer.unsent_rows == []
 
     async def test_blocking_request_is_timed(self):
         with patch("frigate.record.maintainer.InterProcessRequestor") as requestor:

@@ -38,12 +38,16 @@ Each request that fails as described in "Every request is answered" SHALL be log
 
 ### Requirement: Timed requests recover from a missing reply
 
-A process sending a request with a timeout SHALL get the "no reply" result when no reply arrives in time. Its next request SHALL be sent on a new connection to the main process and answered normally. A request sent without a timeout SHALL wait for its reply, as upstream does.
+A process sending a request with a timeout SHALL get the "no reply" result when no reply arrives in time, or when the request fails on its connection. Its next request SHALL be sent on a new connection to the main process and answered normally. Each sender SHALL log such a failure as a warning with its topic at most once every 5 minutes, and the next warning SHALL include the number of failures since the last one. A request sent without a timeout SHALL wait for its reply, as upstream does.
 
 #### Scenario: Main process busy past the timeout
 - **WHEN** a request with a 30 s timeout gets no reply for 30 s
 - **THEN** the sender gets the "no reply" result
 - **AND** once the main process answers again, the sender's next request on the same requester is answered
+
+#### Scenario: Repeated timeouts
+- **WHEN** a sender's requests get no reply 10 times within 5 minutes
+- **THEN** one warning with the topic is logged for that sender in that period
 
 ### Requirement: A stopped request thread restarts Frigate
 
@@ -55,7 +59,7 @@ The main process SHALL check the thread that answers inter-process requests ever
 
 ### Requirement: A restart completes while the request thread is dead or stuck
 
-When Frigate restarts or stops while the inter-process request thread has stopped, or while one request has run longer than the busy timeout, and it has not exited 60 seconds later, it SHALL exit at once, so that its supervisor or the container's restart policy can start it again. This SHALL hold for every restart, including one from the UI. A restart or stop that begins otherwise SHALL NOT be cut short.
+While Frigate restarts or stops, until it has stopped the inter-process request thread itself, it SHALL watch whether that thread has stopped or one request has run longer than the busy timeout. If either still holds 60 seconds after it was first seen, Frigate SHALL exit at once, so that its supervisor or the container's restart policy can start it again. This SHALL hold for every restart, including one from the UI.
 
 #### Scenario: Shutdown waits on the dead request thread
 - **WHEN** the request thread has ended while another main-process thread waits for its reply, and Frigate restarts
@@ -66,8 +70,20 @@ When Frigate restarts or stops while the inter-process request thread has stoppe
 - **WHEN** one request has run for 75 s on a device with 2 enabled cameras (busy timeout 60 s) while another main-process thread waits for a reply, and the user restarts Frigate from the UI
 - **THEN** Frigate exits within 60 seconds of starting to stop, with an error saying it did not stop in time
 
+#### Scenario: Request gets stuck during the stop
+- **WHEN** one request has run for 20 s on a device with 2 enabled cameras (busy timeout 60 s) and never finishes, another main-process thread waits for a reply, and the user restarts Frigate from the UI
+- **THEN** Frigate exits within 60 seconds of that request passing the busy timeout, with an error saying it did not stop in time
+
+### Requirement: A healthy restart is not cut short
+
+A restart or stop during which the request thread neither stops nor runs one request past the busy timeout SHALL NOT be cut short. Neither SHALL one whose request thread answers again before the 60 seconds end.
+
+#### Scenario: Slow request finishes during the stop
+- **WHEN** one request has run for 70 s on the same device when the user restarts Frigate, and it finishes 5 s later
+- **THEN** Frigate stops as it does upstream, and nothing ends it early
+
 #### Scenario: Healthy restart
-- **WHEN** the request thread is idle, or its current request has run for less than the busy timeout, and the user restarts Frigate
+- **WHEN** the request thread is idle, or its current request finishes within the busy timeout, and the user restarts Frigate
 - **THEN** Frigate stops as it does upstream, and nothing ends it early
 
 ### Requirement: A stuck request restarts Frigate

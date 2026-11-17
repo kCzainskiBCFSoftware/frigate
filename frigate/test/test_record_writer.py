@@ -95,17 +95,27 @@ class FakeRequestor:
 
         if self.fail_times > 0:
             self.fail_times -= 1
-            return {"ok": False, "error": "database is locked", "rejected": False}
+            return {"ok": False, "error": "database is locked"}
 
-        if any(r["path"] in self.rejected for r in data):
-            return {
-                "ok": False,
+        # like insert_recording_rows: the rest stored, the refused ones listed
+        stored = [r for r in data if r["path"] not in self.rejected]
+        refused = [
+            {
+                "path": r["path"],
+                "camera": r["camera"],
+                "variant": r["variant"],
                 "error": "CHECK constraint failed: recordings",
-                "rejected": True,
             }
+            for r in data
+            if r["path"] in self.rejected
+        ]
+        self.batches.append(stored)
+        result = {"ok": True, "count": len(stored)}
 
-        self.batches.append(list(data))
-        return {"ok": True, "count": len(data)}
+        if refused:
+            result["rejected"] = refused
+
+        return result
 
     def stop(self) -> None:
         pass
@@ -187,8 +197,9 @@ class TestRecordingsWriter(unittest.TestCase):
         assert writer.has_room()
         assert writer.stop(5)
 
-    def test_missing_reply_reconnects(self):
-        # a REQ socket that missed its reply refuses every later send
+    def test_missing_reply_is_retried_on_the_same_requestor(self):
+        # the timed requestor reconnects by itself after a missing reply, so
+        # the writer keeps it instead of building another one
         with patch.object(writer_module, "RETRY_INITIAL", 0.02):
             requestor = FakeRequestor()
             factory = MagicMock(return_value=requestor)
@@ -207,12 +218,12 @@ class TestRecordingsWriter(unittest.TestCase):
             )
             writer.start()
 
-            with self.assertLogs("frigate.record.writer", "WARNING"):
+            with self.assertLogs("frigate.record.writer", "WARNING") as logs:
                 writer.submit([row(0)], {})
                 assert wait_until(lambda: len(requestor.written()) == 1)
 
-        # the first connection, then a fresh one after the missing reply
-        assert factory.call_count == 2
+        assert "no reply" in logs.output[0], logs.output
+        assert factory.call_count == 1
         assert writer.stop(5)
 
     def test_failed_batch_is_retried_and_outage_is_logged(self):
@@ -358,7 +369,7 @@ class TestRecordingsWriter(unittest.TestCase):
 
 
 class TestRejectedRows(unittest.TestCase):
-    """A row the database refuses is isolated and dropped, not retried forever."""
+    """Rows the database refuses are left out by the main process and dropped."""
 
     def make_writer(self, **pipeline) -> RecordingsWriter:
         self.requestor = FakeRequestor()
@@ -388,13 +399,15 @@ class TestRejectedRows(unittest.TestCase):
         line = logs.output[0]
         assert bad in line and "CHECK constraint failed" in line, line
         assert "back" in line and "main" in line, line
-        assert self.requestor.calls < 25, self.requestor.sizes
+        # one request: the main process isolates the row
+        assert self.requestor.calls == 1, self.requestor.sizes
         assert writer.stop(5)
 
-    def test_two_bad_rows_far_apart(self):
+    def test_rejections_log_one_error_per_window(self):
+        # e.g. a constraint that refuses every row: not a line per segment
         writer = self.make_writer()
-        rows = [row(n) for n in range(500)]
-        bad = {rows[10]["path"], rows[400]["path"]}
+        rows = [row(n) for n in range(1200)]
+        bad = {r["path"] for r in rows[::2]}
         self.requestor.rejected = bad
 
         with self.assertLogs("frigate.record.writer", "ERROR") as logs:
@@ -402,9 +415,21 @@ class TestRejectedRows(unittest.TestCase):
             assert wait_until(lambda: writer.queue_depth() == 0)
 
         written = self.requestor.written()
-        assert len(written) == 498 and not bad & set(written)
-        assert len(logs.output) == 2
-        assert all(any(p in line for line in logs.output) for p in bad)
+        assert len(written) == 600 and not bad & set(written)
+        assert len(logs.output) == 1, logs.output
+        assert "rejected 250 recording rows" in logs.output[0], logs.output
+
+        # the next window: one error, with the count it did not log
+        with (
+            patch.object(writer_module, "REJECTED_LOG_INTERVAL", 0),
+            self.assertLogs("frigate.record.writer", "ERROR") as logs,
+        ):
+            self.requestor.rejected.add(row(2000)["path"])
+            writer.submit([row(2000)], {})
+            assert wait_until(lambda: writer.queue_depth() == 0)
+
+        assert len(logs.output) == 1, logs.output
+        assert "350 more rows were rejected" in logs.output[0], logs.output
         assert writer.stop(5)
 
     def test_locked_database_is_retried_whole_with_backoff(self):
@@ -545,24 +570,50 @@ class TestInsertHandler(BaseTestHttp):
         assert result["ok"] is False
         assert "locked" in result["error"]
         # not the rows' fault: retried whole, never split or dropped
-        assert result["rejected"] is False
+        assert "rejected" not in result
 
         holder.execute("ROLLBACK")
         assert insert_recording_rows([row(0)]) == {"ok": True, "count": 1}
 
-    def test_refused_values_are_a_rejected_outcome(self):
+    def test_refused_values_are_left_out_and_listed(self):
         Recordings._meta.database.execute_sql(
             "CREATE TRIGGER reject_bad BEFORE INSERT ON recordings "
             "WHEN NEW.path LIKE '%/bad.mp4' BEGIN SELECT RAISE(ABORT, 'x'); END"
         )
         bad = {**row(1), "path": "/rec/back/bad.mp4"}
 
-        result = insert_recording_rows([row(0), bad])
+        result = insert_recording_rows([row(0), bad, row(2)])
 
-        assert result["ok"] is False and result["rejected"] is True
-        # the statement is aborted whole: the writer splits the batch
-        assert Recordings.select().count() == 0
-        assert insert_recording_rows([row(0)]) == {"ok": True, "count": 1}
+        # the statement is aborted whole; the handler then stores the others
+        # in the same request
+        assert result["ok"] is True and result["count"] == 2, result
+        assert result["rejected"] == [
+            {
+                "path": "/rec/back/bad.mp4",
+                "camera": "back",
+                "variant": "main",
+                "error": "x",
+            }
+        ]
+        assert sorted(r.path for r in Recordings.select()) == [
+            row(0)["path"],
+            row(2)["path"],
+        ]
+        # resent: stored rows are ignored, and the bad one is refused again
+        assert insert_recording_rows([row(0), bad])["count"] == 1
+        assert Recordings.select().count() == 2
+
+    def test_rows_stored_in_a_split_batch_are_noted_as_late(self):
+        Recordings._meta.database.execute_sql(
+            "CREATE TRIGGER reject_bad BEFORE INSERT ON recordings "
+            "WHEN NEW.path LIKE '%/bad.mp4' BEGIN SELECT RAISE(ABORT, 'x'); END"
+        )
+        bad = {**row(1), "path": "/rec/back/bad.mp4"}
+
+        with patch.object(writer_module, "note_late_rows") as note:
+            insert_recording_rows([row(0), bad])
+
+        assert [r["path"] for r in note.call_args.args[0]] == [row(0)["path"]]
 
     def test_writer_recovers_from_a_request_with_no_reply(self):
         inter_process = real_inter_process()
