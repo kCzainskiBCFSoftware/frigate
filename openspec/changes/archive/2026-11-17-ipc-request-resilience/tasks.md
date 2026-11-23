@@ -112,7 +112,13 @@ check that before ticking the task.
   segment landed at 14:37:19, 73 s after the restart. Without 5.4 (the call removed from
   `stop()`), `stop()` began at 14:39:59 and the process was still alive 150 s later, with
   no new segment.
-- [ ] 9.4 (Left open at archive on 2026-11-17 with the user's OK; done on the device.) On a field device (device-only, may stay open at archive with the user's OK): after a week on the new image, confirm there is no `restart` from the request-thread watchdog. Measure the old id exposure with `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);` divided by retained days and by 36^6, and record it in `ra-docs/fork-changes.md`.
+- [x] 9.4 (Left open at archive on 2026-11-17 with the user's OK; done on the device.) On a field device (device-only, may stay open at archive with the user's OK): after a week on the new image, confirm there is no `restart` from the request-thread watchdog. Measure the old id exposure with `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);` divided by retained days and by 36^6, and record it in `ra-docs/fork-changes.md`.
+
+  Checked by the user on 2026-11-23 on a field device running the review-fix image: no
+  container restart, and no log line from a request-thread restart or an exit deadline.
+  Old id exposure over 29.1 retained days: 17,577,527 pairs of rows sharing a start second,
+  604,657 per day, so 2.78e-04 expected collisions per day with the 6-character suffix
+  (one every 3,600 days on this device) and 1.28e-13 with the 12-character suffix.
 
 ## 10. Code-review fixes (2026-11-17)
 

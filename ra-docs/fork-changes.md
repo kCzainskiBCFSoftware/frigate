@@ -694,6 +694,13 @@ armed the stop deadline when the request reached 61 s and exited 60 s later;
 recording resumed 114 s after the restart. The same restart before the review
 fixes was still hung 201 s later.
 
+On a field device (task 9.4, checked 2026-11-23), the review-fix image ran
+without a container restart and without any request-thread restart or exit
+deadline in its log. The old id exposure there, over 29.1 retained days:
+17,577,527 pairs of rows sharing a start second, 604,657 per day. With the
+6-character suffix that is 2.78e-04 expected collisions per day, about one
+every 3,600 days on that device; with 12 characters, 1.28e-13 per day.
+
 ### Open items
 - Other handlers' own bugs (e.g. `Event.get` for an event deleted before its
   description arrived) are now logged per topic instead of fatal; each is still
@@ -705,10 +712,6 @@ fixes was still hung 201 s later.
   first busy timeout of a stop, until it crosses it. The UI copes: it waits
   for Frigate to come back, and shows its slow-start notice only after 6
   minutes down.
-- 9.4 (device-only): after a week on the new image, confirm no request-thread
-  restart, and record the old id exposure measured with
-  `SELECT SUM(c*(c-1)/2.0) FROM (SELECT COUNT(*) c FROM recordings GROUP BY start_time);`
-  divided by retained days and by 36^6.
 ---
 
 ## Confirmed UI restart
